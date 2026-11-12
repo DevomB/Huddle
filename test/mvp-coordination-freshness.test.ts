@@ -5,12 +5,13 @@
 // which puts a space and a non-ASCII letter in every directory name.
 
 import assert from "node:assert/strict";
-import { writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { openContext } from "../src/core/context.ts";
 import { actorRef } from "../src/core/types.ts";
 import type { ActorDoc } from "../src/core/types.ts";
+import { freshnessWarnings } from "../src/core/render.ts";
 import { classifyFreshness, staleAfterSeconds } from "../src/core/view.ts";
 import { BUNDLE, createHarness } from "./harness.ts";
 import type { Clone, Harness, RunResult } from "./harness.ts";
@@ -170,6 +171,24 @@ describe("check: overlap, clear or unknown", () => {
     assert.match(text.stdout, /has 250 files in flight, more than it lists, and lib\/\*\* covers the rest \(conservative/);
   });
 
+  test("with no path, every file in flight is checked, not only the ones that fit a published document", async () => {
+    const ivan = await h.clone("ivan");
+    const jane = await h.clone("jane");
+    const ctx = await openContext({ cwd: ivan.dir, env: { ...(process.env as Record<string, string>), HUDDLE_NOW: at(60) }, self: BUNDLE, out() {}, err() {}, readStdin: async () => "" });
+    const session = { id: "ivan-1", agent: "manual", branch: "main", intent: "Tail", intentSource: "manual" as const, files: ["zz/last.ts"], claims: [], startedAt: at(60), seenAt: at(60) };
+    const doc: ActorDoc = { v: 0, kind: "actor", actor: ctx.identity.actor, user: "ivan", host: "h", updatedAt: at(60), sessions: [session] };
+    assert.equal((await ctx.transport.publish(actorRef(ctx.identity.actor), doc, "own")).ok, true);
+    // More files in flight than LIMITS.files (200); the one that overlaps sorts last, past the cut.
+    mkdirSync(join(jane.dir, "a"), { recursive: true });
+    mkdirSync(join(jane.dir, "zz"), { recursive: true });
+    for (let i = 0; i < 200; i++) writeFileSync(join(jane.dir, "a", `${String(i).padStart(4, "0")}.ts`), "x\n");
+    writeFileSync(join(jane.dir, "zz", "last.ts"), "x\n");
+    const { result, data } = await check(jane, ["--refresh"], at(61));
+    assert.equal(data.checked, 201);
+    assert.equal(result.code, 3, result.stdout + result.stderr);
+    assert.equal(data.overlaps[0]?.path, "zz/last.ts");
+  });
+
   test("a path given in the platform's own absolute form maps to the repository path, case kept", async () => {
     const hank = await h.clone("hank");
     const native = join(hank.dir, "src", "Auth.ts"); // backslashes and a drive letter on Windows
@@ -254,5 +273,15 @@ describe("classifyFreshness (pure)", () => {
     assert.equal(classifyFreshness({ ...base, fetchedAt: at(0), refresh: "ok" }).freshness, "fresh");
     assert.equal(classifyFreshness({ ...base, fetchedAt: at(3600), refresh: "none" }).freshness, "stale", "a fetch stamped an hour ahead says nothing");
     assert.equal(classifyFreshness({ ...base, fetchedAt: at(-90) }).ageSeconds, 90);
+  });
+
+  test("the warning for a fetch stamped ahead of this clock does not call it recent", () => {
+    const complete = { complete: true, unreadableActors: 0, uncovered: 0 };
+    const ahead = freshnessWarnings(classifyFreshness({ ...base, fetchedAt: at(3600) }), complete, "origin");
+    assert.equal(ahead.length, 1, ahead.join("\n"));
+    assert.doesNotMatch(ahead[0]!, /just now|older than/);
+    assert.match(ahead[0]!, /later than this machine's clock.*huddle sync/);
+    const old = freshnessWarnings(classifyFreshness({ ...base, fetchedAt: at(-90) }), complete, "origin");
+    assert.match(old[0] ?? "", /older than 60s/);
   });
 });
