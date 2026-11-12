@@ -1344,7 +1344,7 @@ test("an event that cannot finish gives up at its deadline with nothing to say, 
   }
 });
 
-test("HUDDLE_HOOK_PATIENCE makes every deadline that many times longer, and counts as 1 when it is not a number from 1 to 100", async (t) => {
+test("HUDDLE_HOOK_PATIENCE makes every deadline that many times longer, and counts as 1 when it is not a number from 1 to 20", async (t) => {
   const { alice } = await team(t);
   record(t, never);
   // No actor id yet, and the lock that minting one needs is held: every edit here is stuck until its deadline.
@@ -1356,6 +1356,7 @@ test("HUDDLE_HOOK_PATIENCE makes every deadline that many times longer, and coun
     ["0", 150],
     ["0.5", 150],
     ["-2", 150],
+    ["20.5", 150],
     ["101", 150],
     ["ten", 150],
     ["2x", 150],
@@ -1373,7 +1374,7 @@ test("HUDDLE_HOOK_PATIENCE makes every deadline that many times longer, and coun
     }
     // What the log says is the deadline each event really had: none of them had more than it should.
     const log = await logOf(alice);
-    for (const [deadline, times] of [[150, 8], [225, 1], [300, 1]] as const) {
+    for (const [deadline, times] of [[150, 9], [225, 1], [300, 1]] as const) {
       assert.equal(log.split(`[hook] pre-edit: gave up at its deadline of ${deadline} ms`).length - 1, times, `${deadline} ms`);
     }
   } finally {

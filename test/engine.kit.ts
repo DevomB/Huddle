@@ -318,7 +318,7 @@ export const moreNote = (count: number): string =>
   `[huddle] ${count} more of the paths in this edit overlap teammates' work as well: run \`huddle check\` with those paths.`;
 /** The line after the block of a path that has `count` more sessions on it than the block names. */
 export const unnamedNote = (count: number, path: string): string =>
-  `[huddle] ${count} more ${count === 1 ? "session overlaps" : "sessions overlap"} ${path} as well: run \`huddle check\` with that path to see them all.`;
+  `[huddle] ${count} more ${count === 1 ? "session overlaps" : "sessions overlap"} ${path} as well: run \`huddle check\` with the path as it is in the repository to see them all.`;
 
 /** Joins the lines of an expected text. */
 export const text = (...lines: string[]): string => lines.join("\n");
