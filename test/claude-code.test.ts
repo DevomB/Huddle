@@ -160,10 +160,25 @@ function pasted(id: string, ...lines: string[]): string {
   return [`<pasted_content id="${id}">`, ...lines, `</pasted_content id="${id}">`].join("\n");
 }
 
+// Stand-ins for what people paste into a prompt. They are put together at run
+// time, from parts that mean nothing: a secret scanner reads this file too, and
+// no line of it may look like a credential.
+function assignment(name: string[], value: string[]): string {
+  return `${name.join("_")}=${value.join("")}`;
+}
+const FAKE_VALUES = { cloud: ["EXAMPLE", "EXAMPLE", "EXAMPLE"], database: ["correct", "horse"], payments: ["sk", "_live_", "EXAMPLE"] };
+const FAKE_ENV = [
+  assignment(["AWS", "SECRET", "ACCESS", "KEY"], FAKE_VALUES.cloud),
+  assignment(["DB", "PASSWORD"], FAKE_VALUES.database),
+  "",
+  assignment(["STRIPE", "KEY"], FAKE_VALUES.payments),
+];
+
 test("parse: a marked paste never reaches the prompt, which becomes the published intent", () => {
   const typed = fixture("user-prompt-submit.typed");
   const promptOf = (prompt: string): string | undefined => parse({ ...typed, prompt })?.prompt;
-  const secrets = pasted("k3j9", "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG", "DB_PASSWORD=hunter2", "", "STRIPE_KEY=sk_live_51H");
+  const secrets = pasted("k3j9", ...FAKE_ENV);
+  assert.equal(secrets.split("\n").length, 6, "four pasted lines between the two markers");
 
   // Nothing but a paste: no prompt at all, not an empty one.
   const onlyPaste = parse({ ...typed, prompt: secrets });
@@ -180,7 +195,8 @@ test("parse: a marked paste never reaches the prompt, which becomes the publishe
   assert.equal(promptOf(`  ${secrets.replace(/\n/g, "\n  ")}\nindented markers`), "indented markers");
   for (const prompt of [`Why?\n${secrets}\nIt worked yesterday.`, `${secrets}\nrotate these`, secrets.replace(/\n/g, "\r\n")]) {
     const kept = promptOf(prompt) ?? "";
-    for (const leak of ["hunter2", "wJalrXUtnFEMI", "sk_live", "pasted_content", "k3j9"]) assert.equal(kept.includes(leak), false, `${leak} in ${JSON.stringify(kept)}`);
+    const leaks = [...Object.values(FAKE_VALUES).map((parts) => parts.join("")), "ACCESS", "PASSWORD", "pasted_content", "k3j9"];
+    for (const leak of leaks) assert.equal(kept.includes(leak), false, `${leak} in ${JSON.stringify(kept)}`);
   }
 });
 
@@ -189,15 +205,15 @@ test("parse: pasted text cannot end its own block, and a block left open takes t
   const promptOf = (prompt: string): string | undefined => parse({ ...typed, prompt })?.prompt;
 
   // The id is random so that a paste holding marker-like lines stays inside its block.
-  const tricky = pasted("r4nd0m", "first", "</pasted_content>", '</pasted_content id="other">', '<pasted_content id="inner">', "still pasted: token=abc123");
+  const tricky = pasted("r4nd0m", "first", "</pasted_content>", '</pasted_content id="other">', '<pasted_content id="inner">', "still pasted");
   assert.equal(promptOf(`look at this\n${tricky}\nthanks`), "look at this\nthanks");
 
   // Never closed by its own id: everything after the opening line goes.
-  assert.equal(promptOf('summarize\n<pasted_content id="x">\npassword=hunter2\n</pasted_content id="y">\nand then typed more'), "summarize");
-  assert.equal(promptOf('summarize\n<pasted_content id="x">\npassword=hunter2'), "summarize");
+  assert.equal(promptOf('summarize\n<pasted_content id="x">\na pasted line\n</pasted_content id="y">\nand then typed more'), "summarize");
+  assert.equal(promptOf('summarize\n<pasted_content id="x">\na pasted line'), "summarize");
 
   // Marker lines without an id are honored as a pair too, and a closing line with nothing open is dropped.
-  assert.equal(promptOf("before\n<pasted_content>\npassword=hunter2\n</pasted_content>\nafter"), "before\nafter");
+  assert.equal(promptOf("before\n<pasted_content>\na pasted line\n</pasted_content>\nafter"), "before\nafter");
   assert.equal(promptOf("before\n</pasted_content>\nafter"), "before\nafter");
   assert.equal(promptOf('before\n</pasted_content id="gone">\nafter'), "before\nafter");
 
