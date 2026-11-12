@@ -8,10 +8,9 @@ import { test } from "node:test";
 import { agentsMdBlock } from "../src/adapters/agents-md.ts";
 import { redactUrl } from "../src/commands/doctor.ts";
 import { REF_PATTERN } from "../src/core/types.ts";
-import { createHarness } from "./harness.ts";
+import { createHarness, posixOnly } from "./harness.ts";
 import type { Clone, Harness } from "./harness.ts";
 
-const posixOnly = process.platform === "win32" ? "uses sh scripts as server-side hooks" : false;
 
 interface Report {
   ok: boolean;
@@ -82,7 +81,7 @@ test("a healthy repo passes, and says what it checked", async (t) => {
   assert.doesNotMatch(r.stdout, /FAIL/);
 });
 
-test("hooks that are installed and cannot work are a warning that says what to do; hooks nobody installed are not", { skip: process.platform === "win32" ? "file modes" : false }, async (t) => {
+test("hooks that are installed and cannot work are a warning that says what to do; hooks nobody installed are not", posixOnly("file modes"), async (t) => {
   const { alice } = await setUp(t);
   const gitHooks = async () => find((await doctorJson(alice)).report, "hooks: git hooks");
   assert.equal((await gitHooks()).level, "ok", "a default init installs the git hooks");
@@ -157,7 +156,7 @@ test("hooks that work here and are not committed are a warning: teammates would 
   assert.equal((await hooksOf("Codex")).level, "warn");
 });
 
-test("hooks the team commits next to its own git hooks are checked the same way; hooks under .git are nobody's to commit", { skip: process.platform === "win32" ? "file modes" : false }, async (t) => {
+test("hooks the team commits next to its own git hooks are checked the same way; hooks under .git are nobody's to commit", posixOnly("file modes"), async (t) => {
   const { h, alice } = await setUp(t);
   const gitHooks = async () => find((await doctorJson(alice, ["--offline"])).report, "hooks: git hooks");
   assert.deepEqual({ level: (await gitHooks()).level }, { level: "ok" }, "under .git/hooks: never committed, and no warning for that");
@@ -172,7 +171,7 @@ test("hooks the team commits next to its own git hooks are checked the same way;
   assert.equal((await gitHooks()).level, "ok");
 });
 
-test("AGENTS.md that is a link: the file it points at is the one that has to be committed", { skip: process.platform === "win32" ? "symbolic links" : false }, async (t) => {
+test("AGENTS.md that is a link: the file it points at is the one that has to be committed", posixOnly("symbolic links"), async (t) => {
   const h = await createHarness(t);
   const alice = await h.clone("alice");
   await alice.write("CLAUDE.md", "# Project rules\n");
@@ -192,7 +191,7 @@ test("AGENTS.md that is a link: the file it points at is the one that has to be 
   assert.deepEqual({ level: (await agentsMd()).level, notes: (await agentsMd()).notes }, { level: "ok", notes: [] });
 });
 
-test("AGENTS.md that is a link out of the checkout: init does not write the block there, and doctor says why", { skip: process.platform === "win32" ? "symbolic links" : false }, async (t) => {
+test("AGENTS.md that is a link out of the checkout: init does not write the block there, and doctor says why", posixOnly("symbolic links"), async (t) => {
   const h = await createHarness(t);
   const alice = await h.clone("alice");
   // A personal rules file kept in one place and linked into several repositories.
@@ -319,7 +318,7 @@ test("the push test never touches this clone's own document, so no sync can take
   assert.equal(after.report.checks.some((c) => c.name === "actor id"), false, "doctor now warns about a second writer that does not exist");
 });
 
-test("a remote that does not let refs be deleted: a warning that names the ref left behind", { skip: posixOnly }, async (t) => {
+test("a remote that does not let refs be deleted: a warning that names the ref left behind", posixOnly("sh scripts as server-side hooks"), async (t) => {
   const { h, alice } = await setUp(t);
   const zero = "0000000000000000000000000000000000000000";
   await serverHook(h, `case "$1" in refs/huddle/*) if [ "$3" = ${zero} ]; then echo "no deletions" >&2; exit 1; fi;; esac`);
@@ -360,7 +359,7 @@ test("a missing remote fails and says what a remote is for", async (t) => {
   assert.match(remote.notes.join(" "), /set `remote` in \.huddle\/config\.json/);
 });
 
-test("a remote that refuses refs/huddle/* fails the push test with the usual causes", { skip: posixOnly }, async (t) => {
+test("a remote that refuses refs/huddle/* fails the push test with the usual causes", posixOnly("sh scripts as server-side hooks"), async (t) => {
   const { h, alice } = await setUp(t);
   await serverHook(h, 'case "$1" in refs/huddle/*) echo "huddle refs are not allowed here" >&2; exit 1;; esac');
   const { code, report } = await doctorJson(alice);
@@ -374,7 +373,7 @@ test("a remote that refuses refs/huddle/* fails the push test with the usual cau
   assert.equal(await huddleRefs(h), "");
 });
 
-test("a remote that takes new refs but not replacements fails the push test", { skip: posixOnly }, async (t) => {
+test("a remote that takes new refs but not replacements fails the push test", posixOnly("sh scripts as server-side hooks"), async (t) => {
   // Creating a ref and replacing one are separate permissions on some servers (a hook, or Gerrit's
   // Force Push). huddle replaces every document with a forced push, so creating alone is not enough.
   const { h, alice } = await setUp(t);
@@ -591,7 +590,7 @@ test("credentials in a remote URL never reach the output", async (t) => {
   assert.doesNotMatch(json.stdout + json.stderr, /s3cr3t-token|deploy:/);
 });
 
-test("git's own error text is shown without its unhelpful ending and without credentials", { skip: posixOnly }, async (t) => {
+test("git's own error text is shown without its unhelpful ending and without credentials", posixOnly("a sh script as core.sshCommand"), async (t) => {
   const { h, alice } = await setUp(t);
   // A stand-in for ssh that fails the way a proxy or a wrapper might: with a URL that carries a token.
   const fakeSsh = join(h.root, "fake-ssh.sh");

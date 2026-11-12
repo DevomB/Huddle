@@ -70,8 +70,8 @@ function expect(condition, name, seen) {
   return false;
 }
 
-function onPath(names, env = process.env) {
-  for (const dir of (env.PATH ?? env.Path ?? "").split(delimiter)) {
+function onPath(names, path = process.env.PATH ?? "") {
+  for (const dir of path.split(delimiter)) {
     for (const name of names) if (dir && existsSync(join(dir, name))) return join(dir, name);
   }
   return null;
@@ -136,7 +136,12 @@ writeFileSync(
     "",
   ].join("\n"),
 );
+// A copy of process.env is a plain object: on Windows it loses the case-insensitive lookup, and PATH may be
+// spelled "Path". Keep exactly one key, PATH, with process.env's own (case-insensitive) value.
+const PATH = process.env.PATH ?? "";
 const env = { ...process.env, HOME: home, USERPROFILE: home, GIT_CONFIG_GLOBAL: gitconfig, GIT_CONFIG_NOSYSTEM: "1", GIT_TERMINAL_PROMPT: "0" };
+for (const name of Object.keys(env)) if (name.toUpperCase() === "PATH") delete env[name];
+env.PATH = PATH;
 for (const name of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_CEILING_DIRECTORIES", "HUDDLE_SESSION", "HUDDLE_NOW", "HUDDLE_DEBUG", "CLAUDE_PROJECT_DIR"]) delete env[name];
 
 const remote = join(base, "remote.git");
@@ -173,7 +178,7 @@ async function claudeHook(who, event, fixture, change = () => {}, { bundleDir = 
   // ${CLAUDE_PROJECT_DIR} is replaced as text with the native project directory: mixed separators on Windows.
   const args = (handler.args ?? []).map((arg) => arg.replaceAll("${CLAUDE_PROJECT_DIR}", bundleDir));
   // Exec form: the command is a program on PATH, never a shell line.
-  const program = onPath(WINDOWS ? [`${handler.command}.exe`, handler.command] : [handler.command], { PATH: path });
+  const program = onPath(WINDOWS ? [`${handler.command}.exe`, handler.command] : [handler.command], path);
   const payload = JSON.parse(readFileSync(join(fixtures, `${fixture}.json`), "utf8"));
   payload.cwd = who.dir;
   if (typeof payload.transcript_path === "string") payload.transcript_path = join(home, ".claude", "projects", "demo", `${payload.session_id}.jsonl`);
