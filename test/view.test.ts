@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { normalizeDoc } from "../src/core/docs.ts";
+import { LIMITS, normalizeDoc } from "../src/core/docs.ts";
 import type { Cache, DecisionDoc, TaskDoc } from "../src/core/types.ts";
 import { buildView, countTasks, overlaps, taskState } from "../src/core/view.ts";
 import { ME, NOW, cacheOf, loadTeam, makeSession } from "./fixtures/cache/team.ts";
@@ -330,6 +330,34 @@ test("overlaps: a teammate's file entry need not be in git's form to be recogniz
   assert.deepEqual(overlaps(view, "abs/like.ts").map((overlap) => overlap.match), ["/abs/like.ts"]);
   assert.deepEqual(overlaps(view, "dir").map((overlap) => overlap.match), ["dir/"]);
   assert.deepEqual(overlaps(view, "src/other.ts"), []);
+});
+
+test("overlaps: one actor at every cap, checked against a deep path, stays inside the pre-edit budget", () => {
+  // The worst a single teammate's doc can be after the doc gate: 50 sessions,
+  // each with 50 claims of nearly 400 characters, every claim a chain of
+  // globstars and wildcards that the path's segments keep half-matching.
+  const unit = "**/*a*a*/";
+  const chain = unit.repeat(Math.floor(380 / unit.length));
+  const sessions = Array.from({ length: LIMITS.sessions }, (_, s) =>
+    makeSession({ id: `s${s}`, claims: Array.from({ length: LIMITS.claims }, (_, c) => `${chain}zz${s}x${c}`) }),
+  );
+  assert.ok(sessions[0]!.claims[0]!.length > 380 && sessions[0]!.claims[0]!.length <= LIMITS.path);
+  const view = buildView(cacheOf([{ actor: "maxx2222", user: "max", sessions }]), ME, NOW);
+  const deep = `${Array.from({ length: 60 }, (_, i) => `xa${i}ya${i}z`).join("/")}/file.ts`;
+
+  const started = performance.now();
+  assert.deepEqual(overlaps(view, deep), []);
+  const elapsed = performance.now() - started;
+  // About 60 ms in a fresh process, 25 ms warm. Matching once per path prefix
+  // instead of once per claim took about 600 ms.
+  assert.ok(elapsed < 250, `2500 claims against a 61-segment path took ${elapsed.toFixed(0)} ms`);
+
+  // The same claims do match where they should.
+  const hit = `${Array.from({ length: 42 }, (_, i) => `xa${i}ya${i}z`).join("/")}/zz7x3/src/file.ts`;
+  assert.deepEqual(
+    overlaps(view, hit).map((overlap) => [overlap.session.id, overlap.via, overlap.match]),
+    [["s7", "claim", `${chain}zz7x3`]],
+  );
 });
 
 test("view: building a view neither changes the cache nor depends on anything but its arguments", () => {
