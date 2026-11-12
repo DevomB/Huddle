@@ -96,9 +96,9 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { asRecord, asText, checkHooks, clip, exists, fileNamesHook, installHooks, isVersion, plainCommand, twiceNote } from "./json-hooks.ts";
-import type { Check, HookFile, Installed, Json, Registration } from "./json-hooks.ts";
+import type { HookFile, Json, Registration } from "./json-hooks.ts";
 import { SILENT } from "./types.ts";
-import type { Adapter, HookEvent, HookInput, HookOutcome, HookOutput, InstallOptions } from "./types.ts";
+import type { Adapter, CheckResult, HookEvent, HookInput, HookOutcome, HookOutput, InstallOptions, InstallResult } from "./types.ts";
 
 const NAME = "cursor";
 const HOOKS = ".cursor/hooks.json";
@@ -348,7 +348,7 @@ const LAST_WINS_NOTE =
   "If another hook answers the same Cursor event with an additional_context of its own, Cursor keeps only one of the answers, and it may not be huddle's.";
 const NOTES: readonly string[] = [TRUST_NOTE, NODE_NOTE, LATER_NOTE, LAST_WINS_NOTE];
 
-async function install(opts: InstallOptions): Promise<Installed> {
+async function install(opts: InstallOptions): Promise<InstallResult> {
   const { changed, twice } = await installHooks(HOOKS_FILE, opts.repoRoot, opts.bundle);
   const also = twiceNote(HOOKS_FILE, twice);
   return { changed: changed ? [HOOKS] : [], notes: also === null ? [...NOTES] : [...NOTES, also], files: [HOOKS] };
@@ -368,7 +368,7 @@ function here(): Surroundings {
   return { env: process.env, home: homedir() };
 }
 
-async function check(repoRoot: string): Promise<Check> {
+async function check(repoRoot: string): Promise<CheckResult> {
   const { result, settings, twice } = await checkHooks(HOOKS_FILE, repoRoot);
   if (!result.installed) return result;
   // The hooks are all there, and Cursor still wants a version on the file: the one these entries are written for.

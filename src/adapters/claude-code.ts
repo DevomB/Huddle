@@ -38,9 +38,9 @@ import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { locateRepo } from "../core/paths.ts";
 import { asRecord, asText, checkHooks, clip, contextOutput, exists, fileNamesHook, installHooks, onPath, plainCommand, readJsonObject, twiceNote } from "./json-hooks.ts";
-import type { Check, HookFile, Installed, Json, Registration } from "./json-hooks.ts";
+import type { HookFile, Json, Registration } from "./json-hooks.ts";
 import { SILENT } from "./types.ts";
-import type { Adapter, HookEvent, HookEventType, HookInput, HookOutcome, HookOutput, InstallOptions } from "./types.ts";
+import type { Adapter, CheckResult, HookEvent, HookEventType, HookInput, HookOutcome, HookOutput, InstallOptions, InstallResult } from "./types.ts";
 
 const NAME = "claude-code";
 const SETTINGS = ".claude/settings.json";
@@ -352,7 +352,7 @@ const CURSOR_NOTE =
 const CURSOR_HOOKS = ".cursor/hooks.json";
 const CURSOR_NAME = "cursor";
 
-async function install(opts: InstallOptions): Promise<Installed> {
+async function install(opts: InstallOptions): Promise<InstallResult> {
   const { changed, twice } = await installHooks(SETTINGS_FILE, opts.repoRoot, opts.bundle);
   const also = twiceNote(SETTINGS_FILE, twice);
   return { changed: changed ? [SETTINGS] : [], notes: also === null ? [...NOTES] : [...NOTES, also], files: [SETTINGS] };
@@ -443,7 +443,7 @@ function hooksDisabledBy(layers: Array<{ name: string; settings: Json | null | "
 }
 
 /** check(), with the surroundings passed in. */
-export async function checkClaudeCode(repoRoot: string, around: Surroundings): Promise<Check> {
+export async function checkClaudeCode(repoRoot: string, around: Surroundings): Promise<CheckResult> {
   const { result, settings, twice } = await checkHooks(SETTINGS_FILE, repoRoot);
   if (!result.installed) return result;
   const notes = [...NOTES];
