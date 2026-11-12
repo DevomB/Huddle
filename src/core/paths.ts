@@ -8,6 +8,7 @@ import { mkdir, readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { git } from "./git.ts";
 import { CliError } from "./io.ts";
+import { log } from "./log.ts";
 import { DEFAULT_CONFIG } from "./types.ts";
 import type { Config } from "./types.ts";
 
@@ -126,6 +127,12 @@ const NUMBER_LIMITS = {
  * Merges config sources over the defaults, later sources winning. Team config
  * is written by teammates, so every value is validated and an invalid value
  * falls back to the previous one rather than failing.
+ *
+ * `captureIntent` is the exception: it decides whether prompt text is
+ * published, so a value that is present but is not `true` turns capture off.
+ *
+ * The three intervals are also checked against each other afterwards (see
+ * reconcile).
  */
 export function mergeConfig(...sources: unknown[]): Config {
   const config: Config = { ...DEFAULT_CONFIG };
@@ -140,20 +147,71 @@ export function mergeConfig(...sources: unknown[]): Config {
       if (typeof value === "number" && Number.isFinite(value) && value >= min && value <= max) config[key] = value;
     }
     if (raw.mode === "warn") config.mode = raw.mode;
-    if (typeof raw.captureIntent === "boolean") config.captureIntent = raw.captureIntent;
+    if (Object.hasOwn(raw, "captureIntent")) config.captureIntent = raw.captureIntent === true;
   }
+  return reconcile(config);
+}
+
+/**
+ * Each interval can be valid alone and still break the others. A session is
+ * kept alive by heartbeats, so the TTL has to span at least two of them, or an
+ * idle session expires and reappears in every teammate's briefing. And a sync
+ * interval longer than the heartbeat would mean the heartbeat never fires on
+ * time. The TTL is raised and the sync interval lowered, because those are the
+ * directions that cost nothing: neither makes huddle talk to the remote more.
+ */
+function reconcile(config: Config): Config {
+  config.ttlMinutes = Math.max(config.ttlMinutes, 2 * config.heartbeatMinutes);
+  config.syncIntervalSeconds = Math.min(config.syncIntervalSeconds, config.heartbeatMinutes * 60);
   return config;
 }
 
-/** Defaults, then .huddle/config.json, then the local override. Missing or unreadable files are skipped. */
-export async function loadConfig(paths: RepoPaths): Promise<Config> {
-  return mergeConfig(await readJsonLoose(paths.teamConfigFile), await readJsonLoose(paths.localConfigFile));
+export interface ConfigReport {
+  config: Config;
+  /** Config files that exist but could not be used, one line each. Empty when all is well. */
+  problems: string[];
 }
 
-async function readJsonLoose(file: string): Promise<unknown> {
-  try {
-    return JSON.parse(await readFile(file, "utf8"));
-  } catch {
-    return undefined;
-  }
+/**
+ * Defaults, then .huddle/config.json, then the local override. A missing file
+ * is skipped.
+ *
+ * A file that exists but does not hold a JSON object is skipped too, with a
+ * line in `problems`. For the team file that also turns prompt capture off:
+ * the usual cause is a merge conflict in .huddle/config.json, and a team that
+ * had switched capture off must not start publishing prompts because of one.
+ * The local override can still turn it back on.
+ */
+export async function loadConfigReport(paths: RepoPaths): Promise<ConfigReport> {
+  const problems: string[] = [];
+  const read = async (file: string, label: string): Promise<unknown> => {
+    let text: string;
+    try {
+      text = await readFile(file, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      problems.push(`${label} cannot be read (${(error as NodeJS.ErrnoException).code ?? "error"})`);
+      return null;
+    }
+    try {
+      const value: unknown = JSON.parse(text);
+      if (typeof value === "object" && value !== null && !Array.isArray(value)) return value;
+      problems.push(`${label} is not a JSON object`);
+    } catch {
+      problems.push(`${label} is not valid JSON${/^(<<<<<<<|=======|>>>>>>>)/m.test(text) ? " (it has merge conflict markers)" : ""}`);
+    }
+    return null;
+  };
+  const team = await read(paths.teamConfigFile, ".huddle/config.json");
+  if (team === null) problems.push("the team's settings are ignored and prompt capture is off until .huddle/config.json is fixed");
+  const local = await read(paths.localConfigFile, "the local override (huddle/config.json in the git directory)");
+  const config = mergeConfig(team === null ? { captureIntent: false } : team, local);
+  return { config, problems };
+}
+
+/** The config alone. Problems go to the debug log; `huddle doctor` shows them. */
+export async function loadConfig(paths: RepoPaths): Promise<Config> {
+  const { config, problems } = await loadConfigReport(paths);
+  for (const problem of problems) log(paths, "config", problem);
+  return config;
 }

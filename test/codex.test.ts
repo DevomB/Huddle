@@ -309,8 +309,8 @@ test("format: context too long for Codex is cut at a line, with a pointer to the
 // ---------------------------------------------------------------------------
 
 const BUNDLE = ".huddle/huddle.mjs";
-const COMMAND = 'node "$(git rev-parse --show-toplevel)/.huddle/huddle.mjs" hook codex';
-const COMMAND_WINDOWS = "for /f \"delims=\" %i in ('git rev-parse --show-toplevel') do @node \"%i/.huddle/huddle.mjs\" hook codex";
+const COMMAND = 'command -v node >/dev/null 2>&1 || exit 0; node "$(git rev-parse --show-toplevel)/.huddle/huddle.mjs" hook codex';
+const COMMAND_WINDOWS = "where node >nul 2>nul || exit /b 0 & for /f \"delims=\" %i in ('git rev-parse --show-toplevel') do @node \"%i/.huddle/huddle.mjs\" hook codex";
 
 function handler(timeout: number, extra: Json = {}): Json {
   return { type: "command", command: COMMAND, commandWindows: COMMAND_WINDOWS, timeout, ...extra };
@@ -403,8 +403,9 @@ test("install: what is written follows the rules in Codex's hook reference", asy
     for (const key of Object.keys(only)) assert.ok(["type", "command", "commandWindows", "timeout", "async"].includes(key), `${event}: ${key}`);
     assert.equal(only.type, "command");
     // Resolved from the git root, as the reference advises: Codex may be started in a subdirectory.
-    assert.equal(only.command, 'node "$(git rev-parse --show-toplevel)/.huddle/huddle.mjs" hook codex');
-    assert.match(String(only.commandWindows), /^for \/f "delims=" %i in \('git rev-parse --show-toplevel'\) do @node "%i\/\.huddle\/huddle\.mjs" hook codex$/);
+    // In front of it, a check that node exists: a teammate without it gets a hook that does nothing, not one that fails.
+    assert.equal(only.command, 'command -v node >/dev/null 2>&1 || exit 0; node "$(git rev-parse --show-toplevel)/.huddle/huddle.mjs" hook codex');
+    assert.equal(only.commandWindows, "where node >nul 2>nul || exit /b 0 & for /f \"delims=\" %i in ('git rev-parse --show-toplevel') do @node \"%i/.huddle/huddle.mjs\" hook codex");
     assert.ok(typeof only.timeout === "number" && only.timeout >= 1, `${event}: a timeout in seconds`);
   }
   // A regular expression on the tool name; hook input always reports apply_patch for an edit.
@@ -475,8 +476,8 @@ test("install: handlers left by an older or hand-edited install are brought up t
     hooks: {
       // Relative to the cwd, and without a Windows command, as an older version might have written it.
       SessionStart: [{ hooks: [{ type: "command", command: "node .huddle/huddle.mjs hook codex", timeout: 30 }] }],
-      // Twice, once next to a user's own handler.
-      UserPromptSubmit: [{ hooks: [userGuard, handler(5)] }, { hooks: [handler(5)] }],
+      // Twice, once next to a user's own handler, and once without the check for node.
+      UserPromptSubmit: [{ hooks: [userGuard, handler(5)] }, { hooks: [{ type: "command", command: 'node "$(git rev-parse --show-toplevel)/.huddle/huddle.mjs" hook codex', timeout: 5 }] }],
       // Under the user's matcher, shared with the user's handler.
       PreToolUse: [{ matcher: "Bash", hooks: [handler(5), userGuard] }],
       // Alone under a matcher that is now wrong, and not async.
@@ -531,7 +532,7 @@ test("install: a bundle path that is not inert in a shell is refused before anyt
   assert.deepEqual((await codex.install({ repoRoot: root, bundle: "tools/huddle/huddle.mjs" })).changed, [".codex/hooks.json"]);
   const moved = await readJson(file);
   assert.deepEqual(countOurs(moved), ONE_EACH);
-  assert.equal(((moved.hooks as Record<string, Array<{ hooks: Json[] }>>).Stop?.[0]?.hooks[0] as Json).command, 'node "$(git rev-parse --show-toplevel)/tools/huddle/huddle.mjs" hook codex');
+  assert.equal(((moved.hooks as Record<string, Array<{ hooks: Json[] }>>).Stop?.[0]?.hooks[0] as Json).command, 'command -v node >/dev/null 2>&1 || exit 0; node "$(git rev-parse --show-toplevel)/tools/huddle/huddle.mjs" hook codex');
 });
 
 test("install: a hooks file huddle cannot read safely is refused and left exactly as it was", async (t) => {
@@ -629,6 +630,16 @@ test("install: the command finds the bundle from any directory of the repo, in e
     }
   }
   t.diagnostic(`ran the installed command in: ${shells.join(", ")}`);
+
+  // A teammate without node: the hook does nothing and succeeds, with no word on either stream.
+  const noNode = join(base, "bin without node");
+  await mkdir(noNode);
+  for (const shell of shells) {
+    for (const cwd of [root, deep]) {
+      const result = await run(shell, ["-c", command], { cwd, env: { ...env, PATH: noNode }, stdin: fixtureText("stop") });
+      assert.deepEqual(result, { code: 0, stdout: "", stderr: "" }, `${shell} in ${cwd}, no node on the PATH`);
+    }
+  }
 });
 
 // ---------------------------------------------------------------------------

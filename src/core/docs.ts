@@ -27,22 +27,46 @@ export const LIMITS = {
   branch: 200,
 } as const;
 
-// Built from code points so that this file stays plain ASCII: several of these
+// Built from code points so that this file stays plain ASCII: most of these
 // characters are invisible, and two of them end a line.
-const UNSAFE_RANGES: ReadonlyArray<readonly [number, number]> = [
+//
+// The rule is "nothing a reader cannot see". A character that renders as
+// nothing is a way to put text in front of an agent's tokenizer that the human
+// reading `huddle status` never sees (the Unicode tag block spells out whole
+// sentences that way), and variation selectors can carry arbitrary bytes.
+// The price is cosmetic: emoji lose their presentation selector and joined
+// emoji sequences fall apart into their parts.
+export const UNSAFE_RANGES: ReadonlyArray<readonly [number, number]> = [
   [0x0000, 0x001f], // C0 controls, including tab, CR and LF
   [0x007f, 0x009f], // DEL and the C1 controls
+  [0x00ad, 0x00ad], // soft hyphen
+  [0x061c, 0x061c], // Arabic letter mark (a direction mark)
+  [0x115f, 0x1160], // Hangul fillers: letters that render as nothing
+  [0x180b, 0x180f], // Mongolian variation selectors and vowel separator
   [0x200b, 0x200f], // zero-width characters and direction marks
   [0x2028, 0x2029], // line and paragraph separators
   [0x202a, 0x202e], // bidi embeddings and overrides
-  [0x2066, 0x2069], // bidi isolates
+  [0x2060, 0x206f], // word joiner, invisible operators, bidi isolates, deprecated format characters
+  [0x3164, 0x3164], // Hangul filler
+  [0xd800, 0xdfff], // a surrogate that is not half of a pair
+  [0xfe00, 0xfe0f], // variation selectors
   [0xfeff, 0xfeff], // byte order mark
+  [0xffa0, 0xffa0], // halfwidth Hangul filler
+  [0xfff9, 0xfffb], // interlinear annotation marks
+  [0x1d173, 0x1d17a], // musical formatting marks
+  [0xe0000, 0xe0fff], // tag characters and the variation selector supplement
 ];
-const escapeCodePoint = (codePoint: number) => "\\u" + codePoint.toString(16).padStart(4, "0");
+const escapeCodePoint = (codePoint: number) => `\\u{${codePoint.toString(16)}}`;
+// The `u` flag makes the class work by code point, which the ranges above U+FFFF need.
 const UNSAFE_CHARS = new RegExp(
   "[" + UNSAFE_RANGES.map(([from, to]) => `${escapeCodePoint(from)}-${escapeCodePoint(to)}`).join("") + "]",
-  "g",
+  "gu",
 );
+
+/** `text` with every unsafe character replaced. For text that is shown or logged but is not a document field. */
+export function replaceUnsafe(text: string, replacement: string): string {
+  return text.replace(UNSAFE_CHARS, replacement);
+}
 
 /** U+2026, appended to text that was cut. */
 export const ELLIPSIS = String.fromCodePoint(0x2026);
@@ -67,8 +91,15 @@ export function cleanPath(value: unknown): string {
   return Array.from(path).length > LIMITS.path ? "" : path;
 }
 
+/**
+ * UTC with a "Z", the only form the protocol allows. Date.parse alone would
+ * also take "1" or "Jan 1 2026" and read them in the reader's own time zone,
+ * so two teammates could disagree about the same document.
+ */
+const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/;
+
 function cleanIso(value: unknown): Iso | null {
-  if (typeof value !== "string") return null;
+  if (typeof value !== "string" || !ISO_RE.test(value)) return null;
   const ms = Date.parse(value);
   return Number.isNaN(ms) ? null : new Date(ms).toISOString();
 }
