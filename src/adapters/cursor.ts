@@ -252,9 +252,11 @@ function parse(input: HookInput): HookEvent | null {
 const MAX_CONTEXT_CHARS = 6000;
 
 /**
- * One line for stderr, which Cursor shows in its Hooks output channel, when an
- * edit could not be named. Without it nothing would ever show that the overlap
- * warnings are missing.
+ * One line for stderr when an edit could not be named. Without it nothing
+ * would ever show that the overlap warnings are missing. Where the line ends
+ * up is not verified: the page names a Hooks output channel "to debug
+ * configured and executed hooks and see errors", and does not say that a
+ * hook's stderr is shown there.
  */
 function unnamedTrace(native: Json | null): string {
   const unnamed = asRecord(native?.unnamed);
