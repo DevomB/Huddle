@@ -85,16 +85,26 @@ export async function ensureStateDir(paths: RepoPaths): Promise<void> {
   await mkdir(paths.seenDir, { recursive: true });
 }
 
+const PLAIN_SEEN_NAME = /^[a-z0-9_-]+$/;
+const WINDOWS_DEVICE_NAME = /^(?:con|prn|aux|nul|com[0-9]|lpt[0-9])$/;
+
 /**
  * The seen-state file for a session. Session ids come from agents, so they are
  * reduced to a safe file name; a hash suffix keeps two ids that reduce to the
  * same name apart.
+ *
+ * Only an id that is already lower-case and safe is used as it is. Anything
+ * with an upper-case letter gets the suffix too, because "Abc" and "abc" are
+ * one file on a case-insensitive filesystem (macOS, Windows). A name Windows
+ * reserves for a device ("con", "aux", "com1", ...) is prefixed as well.
  */
 export function seenFile(paths: RepoPaths, sessionId: string): string {
   const safe = sessionId.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 80);
-  if (safe === sessionId && safe !== "") return join(paths.seenDir, safe);
+  const device = WINDOWS_DEVICE_NAME.test(safe.toLowerCase());
+  if (safe === sessionId && PLAIN_SEEN_NAME.test(safe) && !device) return join(paths.seenDir, safe);
   const hash = createHash("sha256").update(sessionId).digest("hex").slice(0, 12);
-  return join(paths.seenDir, `${safe || "session"}.${hash}`);
+  // Windows treats "con.anything" as the device as well, so the name itself must change.
+  return join(paths.seenDir, `${device ? "_" : ""}${safe || "session"}.${hash}`);
 }
 
 // ---------------------------------------------------------------------------
