@@ -2203,7 +2203,7 @@ test("install: a user's own plugins and settings survive, untouched", async (t) 
 });
 
 test("install: an empty huddle.js, or huddle's own with a byte order mark in front, is replaced", async (t) => {
-  for (const content of ["", "\n\n", "﻿", "﻿" + pluginSource(BUNDLE)]) {
+  for (const content of ["", "\n\n", "\ufeff", "\ufeff" + pluginSource(BUNDLE)]) {
     const root = await emptyRepo(t);
     await mkdir(join(root, ".opencode/plugins"), { recursive: true });
     await writeFile(join(root, PLUGIN), content);
