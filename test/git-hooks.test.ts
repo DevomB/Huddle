@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { test } from "node:test";
@@ -9,11 +9,11 @@ import { GIT_HOOKS, MAX_STAGED_PATHS, checkGitHooks, commandLine, gitHooks, hook
 import type { GitHook } from "../src/adapters/git-hooks.ts";
 import { ADAPTERS, getAdapter } from "../src/adapters/index.ts";
 import { SILENT } from "../src/adapters/types.ts";
-import type { HookEvent, HookInput } from "../src/adapters/types.ts";
+import type { HookInput } from "../src/adapters/types.ts";
 import type { GitResult } from "../src/core/git.ts";
 import { manualSessionId } from "../src/core/identity.ts";
 import { pathsFor } from "../src/core/paths.ts";
-import { createHarness } from "./harness.ts";
+import { BUNDLE as BUILT_BUNDLE, BUNDLE_NODE, createHarness } from "./harness.ts";
 import type { Clone, Harness } from "./harness.ts";
 
 const BUNDLE = ".huddle/huddle.mjs";
@@ -50,7 +50,7 @@ interface Rec {
 
 interface Bench {
   h: Harness;
-  /** Runs git with the node that runs the tests first on PATH, and the recorder pointed at this bench. */
+  /** Runs git with the node that runs the bundle in these tests first on PATH, and the recorder pointed at this bench. */
   run(clone: Clone, args: string[], env?: Record<string, string | undefined>): Promise<GitResult>;
   /** Everything the recorder wrote so far, optionally for one hook. */
   records(hook?: GitHook): Rec[];
@@ -73,7 +73,7 @@ async function bench(t: TestContext): Promise<Bench> {
     h,
     records,
     run: (clone, args, env = {}) =>
-      clone.gitResult(args, { env: { PATH: `${dirname(process.execPath)}${delimiter}${process.env.PATH ?? ""}`, HUDDLE_TEST_RECORD: file, ...env } }),
+      clone.gitResult(args, { env: { PATH: `${dirname(BUNDLE_NODE)}${delimiter}${process.env.PATH ?? ""}`, HUDDLE_TEST_RECORD: file, ...env } }),
     async settled(hook, count) {
       for (let i = 0; i < 2000; i++) {
         const found = records(hook);
@@ -283,7 +283,7 @@ test("git parse: a commit made from an agent's shell belongs to that agent's ses
   const event = gitHooks.parse(input(["post-commit"], "", { HUDDLE_SESSION: "claude-7f3a" }));
   assert.equal(event?.sessionId, "claude-7f3a");
   assert.equal(event?.subagent, true, "it must not relabel or move the agent's session");
-  assert.equal((event as (HookEvent & { ambient?: boolean }) | null)?.ambient, true);
+  assert.equal(event?.ambient, true);
   // An empty or blank variable is no session.
   for (const blank of ["", "   "]) {
     const own = gitHooks.parse(input(["post-commit"], "", { HUDDLE_SESSION: blank }));
@@ -901,6 +901,133 @@ test("git install: a linked worktree shares the clone's hooks, and each worktree
   ok(await commitFile(b, alice, "in main.txt"));
   assert.equal(b.records().length, 2);
   assert.equal((await checkGitHooks(alice.dir)).detail, "git hooks in .git/hooks run .huddle/huddle.mjs, which is not in this checkout. Run huddle init.");
+});
+
+// ---------------------------------------------------------------------------
+// End to end: the real bundle behind the hooks, and nothing but git in front
+// ---------------------------------------------------------------------------
+
+/** What `huddle init` leaves in a repository, as far as git hooks need it: the built bundle and a config. */
+async function vendor(clone: Clone): Promise<void> {
+  await mkdir(join(clone.dir, ".huddle"), { recursive: true });
+  await copyFile(BUILT_BUNDLE, join(clone.dir, BUNDLE));
+  await clone.write(".huddle/config.json", "{}\n");
+}
+
+async function until(what: string, done: () => boolean | Promise<boolean>): Promise<void> {
+  for (let i = 0; i < 1500; i++) {
+    if (await done()) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`gave up waiting for ${what}`);
+}
+
+/**
+ * The post hooks run detached, so one may still be at work when a test ends
+ * and its directories are removed. This fires one more with the clock pinned
+ * and waits until it has left that time in the clone's state.
+ */
+async function lastHookDone(b: Bench, clone: Clone): Promise<void> {
+  const at = new Date(Date.now() + 120_000).toISOString();
+  ok(await b.run(clone, ["checkout", "--quiet", "-b", `done-${Date.now()}`], { HUDDLE_NOW: at }));
+  const { localFile } = await clone.paths();
+  await until("the last post hook to finish", () => existsSync(localFile) && readFileSync(localFile, "utf8").includes(at));
+}
+
+const huddleRefs = (h: Harness): Promise<string> => h.remoteGit("for-each-ref", "--format=%(refname)", "refs/huddle/");
+
+test("git hooks, end to end: a plain commit by alice, no agent anywhere, shows her to bob; bob's commit of the same file is warned and goes ahead", { skip: !POSIX }, async (t) => {
+  const b = await bench(t);
+  const alice = await b.h.clone("alice");
+  await vendor(alice);
+  await alice.commit("Set up huddle");
+  await alice.push();
+  const bob = await b.h.clone("bob");
+  // alice already has a hook of her own.
+  const marker = join(b.h.root, "user-marker");
+  await script(hookFile(alice, "pre-commit"), USER_HOOK);
+  await install(alice);
+  await install(bob);
+  assert.equal(await huddleRefs(b.h), "", "nobody has said anything yet");
+
+  // alice: git add, git commit. No huddle command, no agent.
+  const first = ok(await commitFile(b, alice, "src/auth.ts", { USER_MARKER: marker }));
+  assert.equal(first.stderr, "", "nobody to warn her about");
+  assert.equal(await readFile(marker, "utf8"), "user pre-commit ran\n", "her own hook still runs");
+  assert.match(await huddleRefs(b.h), /^refs\/huddle\/actors\/[a-z0-9]+$/, "the commit published her");
+
+  // bob sees her and what she has in flight.
+  assert.equal((await bob.huddle(["sync"])).code, 0);
+  const status = await bob.huddle(["status"]);
+  assert.match(status.stdout, /^- alice \/ git on main \(.*\): no stated intent\.\n +Files \(1\): src\/auth\.ts$/m);
+  assert.equal((await bob.huddle(["check", "src/auth.ts"])).code, 3);
+
+  // bob commits the same file with plain git: told about alice, and not stopped.
+  await bob.write("src/auth.ts", "bob's version\n");
+  ok(await b.run(bob, ["add", "src/auth.ts"]));
+  const warned = ok(await b.run(bob, ["commit", "--quiet", "-m", "bob's auth"]));
+  assert.match(warned.stderr, /^\[huddle\] src\/auth\.ts overlaps teammates' work in flight\./m);
+  assert.match(warned.stderr, /^- alice \/ git on main \(.*\) has it in flight/m);
+  assert.match(warned.stderr, /^\[huddle\] The commit goes ahead\. This is only a heads-up\.$/m);
+  assert.equal(await bob.git("log", "--format=%s", "-1"), "bob's auth");
+
+  // A file nobody else has: nothing is printed.
+  const other = ok(await commitFile(b, bob, "src/other.ts"));
+  assert.equal(other.stderr, "");
+
+  // And alice sees bob in turn, once his clone has synced.
+  assert.equal((await bob.huddle(["sync"])).code, 0);
+  assert.equal((await alice.huddle(["sync"])).code, 0);
+  assert.match((await alice.huddle(["status"])).stdout, /^- bob \/ \S+ on main \(.*\)[^\n]*\n +Files \(2\): src\/auth\.ts, src\/other\.ts$/m);
+
+  await lastHookDone(b, alice);
+  await lastHookDone(b, bob);
+});
+
+test("git hooks, end to end: post-commit alone starts the background sync that publishes the clone", { skip: !POSIX }, async (t) => {
+  const b = await bench(t);
+  const carol = await b.h.clone("carol");
+  await vendor(carol);
+  await carol.commit("Set up huddle");
+  await carol.push();
+  await install(carol);
+
+  // --no-verify skips pre-commit, so nothing waits for a sync: what publishes
+  // her is the detached process the post-commit hook leaves behind.
+  await carol.write("src/billing.ts", "export {};\n");
+  ok(await b.run(carol, ["add", "src/billing.ts"]));
+  ok(await b.run(carol, ["commit", "--quiet", "--no-verify", "-m", "billing"], { HUDDLE_NO_BACKGROUND: "" }));
+  await until("the background sync to publish", async () => (await huddleRefs(b.h)) !== "");
+  const paths = await carol.paths();
+  await until("the background sync to finish", () => !existsSync(paths.syncLock) && existsSync(paths.cacheFile));
+
+  const dan = await b.h.clone("dan");
+  assert.equal((await dan.huddle(["sync"])).code, 0);
+  assert.match((await dan.huddle(["status"])).stdout, /^- carol \/ git on main \(.*\): no stated intent\.\n +Files \(1\): src\/billing\.ts$/m);
+  await lastHookDone(b, carol);
+});
+
+test("git hooks, end to end: on a branch from before huddle was set up the hooks do nothing, and back on a branch that has it they work again", { skip: !POSIX }, async (t) => {
+  const b = await bench(t);
+  const erin = await b.h.clone("erin");
+  const before = await erin.git("rev-parse", "HEAD");
+  await vendor(erin);
+  await erin.commit("Set up huddle");
+  await erin.push();
+  await install(erin);
+  const { stateDir, localFile } = await erin.paths();
+
+  // The hooks belong to the clone, the bundle to the branch: this one has none.
+  ok(await b.run(erin, ["checkout", "--quiet", "-b", "old", before]));
+  assert.equal(existsSync(join(erin.dir, BUNDLE)), false);
+  const made = ok(await commitFile(b, erin, "src/a.ts"));
+  assert.equal(made.stderr, "");
+  assert.equal(existsSync(stateDir), false, "no huddle state was created");
+  assert.equal(await huddleRefs(b.h), "", "and nothing was published");
+
+  ok(await b.run(erin, ["checkout", "--quiet", "main"]));
+  await until("the post-checkout hook on main", () => existsSync(localFile));
+  await lastHookDone(b, erin);
 });
 
 // ---------------------------------------------------------------------------

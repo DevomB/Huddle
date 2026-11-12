@@ -119,7 +119,7 @@ function parseHook(input: HookInput): HookEvent | null {
   if (typeof cwd !== "string" || cwd === "") return null;
 
   const fromAgent = cleanText(input.env.HUDDLE_SESSION, LIMITS.sessionId);
-  const event: HookEvent & { ambient: true } = {
+  const event: HookEvent = {
     type: hook === "pre-commit" ? "pre-edit" : "post-edit",
     agent: NAME,
     sessionId: fromAgent || manualSessionId(pathsFor(cwd, cwd, cwd), {}),
