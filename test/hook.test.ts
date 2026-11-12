@@ -60,11 +60,6 @@ import type { Team } from "./engine.kit.ts";
 import { BUNDLE, BUNDLE_NODE } from "./harness.ts";
 import type { CleanupHost, Clone, RunResult } from "./harness.ts";
 
-// Whoever runs these tests may be an agent with hooks of its own. Its
-// SessionStart gets the path of a file that its shell runs; a session-start
-// here must never find that path and write into it.
-delete process.env.CLAUDE_ENV_FILE;
-
 type Json = Record<string, unknown>;
 type Agent = "claude-code" | "codex";
 
