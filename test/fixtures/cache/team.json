@@ -1,0 +1,264 @@
+{
+  "fetchedAt": "2026-11-12T11:59:48.000Z",
+  "refs": {
+    "refs/huddle/actors/alice222": {
+      "sha": "a11ce00000000000000000000000000000000001",
+      "doc": {
+        "v": 0,
+        "kind": "actor",
+        "actor": "alice222",
+        "user": "alice",
+        "host": "alice-mbp",
+        "updatedAt": "2026-11-12T11:59:20.000Z",
+        "sessions": [
+          {
+            "id": "sess-alice",
+            "agent": "claude-code",
+            "branch": "feat/auth",
+            "intent": "JWT middleware",
+            "intentSource": "prompt",
+            "files": [
+              "src/auth/jwt.ts",
+              "src/auth/middleware/verify-token.ts",
+              "src/auth/middleware/refresh-token.ts",
+              "test/auth/jwt.test.ts"
+            ],
+            "claims": [],
+            "startedAt": "2026-11-12T11:30:00.000Z",
+            "seenAt": "2026-11-12T11:59:20.000Z"
+          }
+        ]
+      }
+    },
+    "refs/huddle/actors/bobb2222": {
+      "sha": "b0b0000000000000000000000000000000000002",
+      "doc": {
+        "v": 0,
+        "kind": "actor",
+        "actor": "bobb2222",
+        "user": "bob",
+        "host": "bob-thinkpad",
+        "updatedAt": "2026-11-12T11:58:00.000Z",
+        "sessions": [
+          {
+            "id": "sess-bob",
+            "agent": "codex",
+            "branch": "feat/login",
+            "intent": "Build the login page UI",
+            "intentSource": "prompt",
+            "files": ["src/pages/login.tsx", "src/components/Form.tsx"],
+            "claims": ["src/pages/**"],
+            "startedAt": "2026-11-12T11:40:00.000Z",
+            "seenAt": "2026-11-12T11:58:00.000Z"
+          }
+        ]
+      }
+    },
+    "refs/huddle/actors/dave2222": {
+      "sha": "da7e000000000000000000000000000000000003",
+      "doc": {
+        "v": 0,
+        "kind": "actor",
+        "actor": "dave2222",
+        "user": "dave",
+        "host": "dave-desktop",
+        "updatedAt": "2026-11-12T11:45:00.000Z",
+        "sessions": [
+          {
+            "id": "sess-dave",
+            "agent": "cursor",
+            "branch": "main",
+            "intent": "Rewrite the README",
+            "intentSource": "manual",
+            "files": ["README.md"],
+            "claims": ["docs/**"],
+            "startedAt": "2026-11-12T11:00:00.000Z",
+            "seenAt": "2026-11-12T11:45:00.000Z"
+          }
+        ]
+      }
+    },
+    "refs/huddle/actors/selfself": {
+      "sha": "5e1f000000000000000000000000000000000004",
+      "doc": {
+        "v": 0,
+        "kind": "actor",
+        "actor": "selfself",
+        "user": "me",
+        "host": "my-laptop",
+        "updatedAt": "2026-11-12T11:59:50.000Z",
+        "sessions": [
+          {
+            "id": "sess-me",
+            "agent": "claude-code",
+            "branch": "t/mine",
+            "intent": "Add rate limiting",
+            "intentSource": "prompt",
+            "files": ["src/ratelimit.ts"],
+            "claims": [],
+            "startedAt": "2026-11-12T11:50:00.000Z",
+            "seenAt": "2026-11-12T11:59:45.000Z"
+          },
+          {
+            "id": "sess-me-2",
+            "agent": "gemini-cli",
+            "branch": "t/other",
+            "intent": "Refactor billing",
+            "intentSource": "prompt",
+            "files": ["src/billing/invoice.ts"],
+            "claims": [],
+            "startedAt": "2026-11-12T11:55:00.000Z",
+            "seenAt": "2026-11-12T11:59:50.000Z"
+          }
+        ]
+      }
+    },
+    "refs/huddle/actors/broken22": {
+      "sha": "bad0000000000000000000000000000000000005",
+      "doc": null
+    },
+    "refs/huddle/actors/wrongref": {
+      "sha": "bad0000000000000000000000000000000000006",
+      "doc": {
+        "v": 0,
+        "kind": "actor",
+        "actor": "mallory2",
+        "user": "mallory",
+        "host": "elsewhere",
+        "updatedAt": "2026-11-12T11:59:59.000Z",
+        "sessions": [
+          {
+            "id": "sess-mallory",
+            "agent": "codex",
+            "branch": "main",
+            "intent": "Published under someone else's ref",
+            "intentSource": "manual",
+            "files": ["src/auth/jwt.ts"],
+            "claims": ["**"],
+            "startedAt": "2026-11-12T11:59:00.000Z",
+            "seenAt": "2026-11-12T11:59:59.000Z"
+          }
+        ]
+      }
+    },
+    "refs/huddle/decisions/alice222": {
+      "sha": "dec0000000000000000000000000000000000007",
+      "doc": {
+        "v": 0,
+        "kind": "decisions",
+        "actor": "alice222",
+        "user": "alice",
+        "decisions": [
+          { "id": "dusenpm2", "at": "2026-11-12T08:00:00.000Z", "agent": "claude-code", "text": "Use npm for scripts" },
+          { "id": "dapierrs", "at": "2026-11-12T09:00:00.000Z", "agent": "claude-code", "text": "API errors use problem+json" }
+        ]
+      }
+    },
+    "refs/huddle/decisions/bobb2222": {
+      "sha": "dec0000000000000000000000000000000000008",
+      "doc": {
+        "v": 0,
+        "kind": "decisions",
+        "actor": "bobb2222",
+        "user": "bob",
+        "decisions": [
+          {
+            "id": "dusepnpm",
+            "at": "2026-11-12T10:00:00.000Z",
+            "agent": "codex",
+            "text": "Use pnpm, not npm",
+            "supersedes": "dusenpm2"
+          }
+        ]
+      }
+    },
+    "refs/huddle/tasks/tdocs222": {
+      "sha": "7a50000000000000000000000000000000000009",
+      "doc": {
+        "v": 0,
+        "kind": "task",
+        "id": "tdocs222",
+        "title": "Write the API docs",
+        "status": "open",
+        "owner": null,
+        "createdBy": { "actor": "alice222", "user": "alice", "session": "sess-alice", "agent": "claude-code" },
+        "createdAt": "2026-11-12T09:10:00.000Z",
+        "updatedAt": "2026-11-12T09:10:00.000Z"
+      }
+    },
+    "refs/huddle/tasks/tlogin22": {
+      "sha": "7a5000000000000000000000000000000000000a",
+      "doc": {
+        "v": 0,
+        "kind": "task",
+        "id": "tlogin22",
+        "title": "Fix the login redirect",
+        "status": "claimed",
+        "owner": { "actor": "bobb2222", "user": "bob", "session": "sess-bob", "agent": "codex" },
+        "createdBy": { "actor": "alice222", "user": "alice", "session": "sess-alice", "agent": "claude-code" },
+        "createdAt": "2026-11-12T09:20:00.000Z",
+        "updatedAt": "2026-11-12T11:41:00.000Z"
+      }
+    },
+    "refs/huddle/tasks/ttokens2": {
+      "sha": "7a5000000000000000000000000000000000000b",
+      "doc": {
+        "v": 0,
+        "kind": "task",
+        "id": "ttokens2",
+        "title": "Rotate refresh tokens",
+        "status": "claimed",
+        "owner": { "actor": "alice222", "user": "alice", "session": "sess-alice", "agent": "claude-code" },
+        "createdBy": { "actor": "bobb2222", "user": "bob", "session": "sess-bob", "agent": "codex" },
+        "createdAt": "2026-11-12T09:30:00.000Z",
+        "updatedAt": "2026-11-12T11:31:00.000Z"
+      }
+    },
+    "refs/huddle/tasks/tbilling": {
+      "sha": "7a5000000000000000000000000000000000000c",
+      "doc": {
+        "v": 0,
+        "kind": "task",
+        "id": "tbilling",
+        "title": "Split the invoice module",
+        "status": "claimed",
+        "owner": { "actor": "selfself", "user": "me", "session": "sess-me-2", "agent": "gemini-cli" },
+        "createdBy": { "actor": "selfself", "user": "me", "session": "sess-me", "agent": "claude-code" },
+        "createdAt": "2026-11-12T09:40:00.000Z",
+        "updatedAt": "2026-11-12T11:56:00.000Z"
+      }
+    },
+    "refs/huddle/tasks/treadme2": {
+      "sha": "7a5000000000000000000000000000000000000d",
+      "doc": {
+        "v": 0,
+        "kind": "task",
+        "id": "treadme2",
+        "title": "Rewrite the README",
+        "status": "claimed",
+        "owner": { "actor": "dave2222", "user": "dave", "session": "sess-dave", "agent": "cursor" },
+        "createdBy": { "actor": "dave2222", "user": "dave", "session": "sess-dave", "agent": "cursor" },
+        "createdAt": "2026-11-12T09:50:00.000Z",
+        "updatedAt": "2026-11-12T11:05:00.000Z"
+      }
+    },
+    "refs/huddle/tasks/tcisetup": {
+      "sha": "7a5000000000000000000000000000000000000e",
+      "doc": {
+        "v": 0,
+        "kind": "task",
+        "id": "tcisetup",
+        "title": "Set up CI",
+        "status": "done",
+        "owner": { "actor": "bobb2222", "user": "bob", "session": "sess-bob-old", "agent": "codex" },
+        "createdBy": { "actor": "alice222", "user": "alice", "session": "sess-alice", "agent": "claude-code" },
+        "createdAt": "2026-11-12T09:00:00.000Z",
+        "updatedAt": "2026-11-12T10:30:00.000Z"
+      }
+    },
+    "refs/huddle/somethingelse/abcd2345": {
+      "sha": "0dd000000000000000000000000000000000000f",
+      "doc": null
+    }
+  }
+}
