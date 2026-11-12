@@ -84,6 +84,15 @@ export function report(result: DecideResult, asked: { remote: string; supersedes
       const inForce = result.inForce ?? [];
       const first = inForce[0];
       const more = inForce.length > 1 ? ` (and ${inForce.length - 1} more; see "huddle decisions")` : "";
+      if (inForce.length > 1 && new Set(inForce.map((entry) => entry.decision.text)).size > 1) {
+        // Replaced along more than one line (audit A04: competing replacements, settled or not). Replacing it
+        // once more would add another line, and huddle does not pick between them.
+        io.err(
+          `huddle: decision ${supersedes} was replaced by more than one decision: ${inForce.map(shown).join("; ")}. Replacing it again would add one more, and huddle does not pick between them. ` +
+            "The decision was NOT recorded. Replace the rule that should change instead: huddle decide --supersedes <its id> \"<the rule>\"",
+        );
+        return EXIT.CONFLICT;
+      }
       io.err(
         first === undefined
           ? `huddle: decision ${supersedes} was already replaced. The decision was NOT recorded; run "huddle decisions" to see what is in force.`

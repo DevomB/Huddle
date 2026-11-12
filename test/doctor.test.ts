@@ -85,7 +85,10 @@ test("a healthy repo passes, and says what it checked", async (t) => {
 test("hooks that are installed and cannot work are a warning that says what to do; hooks nobody installed are not", { skip: process.platform === "win32" ? "file modes" : false }, async (t) => {
   const { alice } = await setUp(t);
   const gitHooks = async () => find((await doctorJson(alice)).report, "hooks: git hooks");
-  assert.equal((await gitHooks()).level, "ok", "a default init installs the git hooks");
+  // The git hooks are an option: a plain init leaves them out, and that is not something to warn about.
+  assert.equal((await gitHooks()).level, "info", "a plain init does not install the git hooks");
+  assert.equal((await alice.huddle(["init", "--agent", "git"])).code, 0);
+  assert.equal((await gitHooks()).level, "ok", "asked for by name, they are installed");
 
   // One of them loses its executable bit. git skips it from now on and says nothing; doctor does.
   const hook = join(alice.dir, ".git", "hooks", "pre-commit");
@@ -160,6 +163,8 @@ test("hooks that work here and are not committed are a warning: teammates would 
 test("hooks the team commits next to its own git hooks are checked the same way; hooks under .git are nobody's to commit", { skip: process.platform === "win32" ? "file modes" : false }, async (t) => {
   const { h, alice } = await setUp(t);
   const gitHooks = async () => find((await doctorJson(alice, ["--offline"])).report, "hooks: git hooks");
+  // Asked for by name: a plain init leaves the git hooks out.
+  assert.equal((await alice.huddle(["init", "--agent", "git"])).code, 0);
   assert.deepEqual({ level: (await gitHooks()).level }, { level: "ok" }, "under .git/hooks: never committed, and no warning for that");
 
   // The team keeps its hooks in the repository.
@@ -455,7 +460,8 @@ test("in a worktree whose branch has no .huddle, doctor says whose settings are 
   // The hook lines and AGENTS.md wait for the branch too, and do not repeat that advice either; the git hooks
   // (installed for the clone, with no bundle here to run) are not a second thing to look at.
   const waiting = report.checks.filter((c) => c.name.startsWith("hooks: ") || c.name === "AGENTS.md");
-  assert.ok(waiting.some((c) => c.name === "hooks: git hooks") && waiting.length >= 6, waiting.map((c) => c.name).join(", "));
+  // One line per adapter this version has (Claude Code, Codex, git hooks), and AGENTS.md.
+  assert.ok(waiting.some((c) => c.name === "hooks: git hooks") && waiting.length >= 4, waiting.map((c) => c.name).join(", "));
   for (const line of waiting) assert.deepEqual({ name: line.name, level: line.level, detail: line.detail }, { name: line.name, level: "info", detail: "not on this branch yet" });
   assert.deepEqual(find(report, "hooks: git hooks").notes, ["this branch does not have huddle yet (see bundle); the hooks work here once it does"]);
   assert.deepEqual(find(report, "AGENTS.md").notes, ["this branch does not have huddle yet (see bundle); the block comes with it"]);
@@ -598,7 +604,8 @@ test("git's own error text is shown without its unhelpful ending and without cre
   await writeFile(fakeSsh, "#!/bin/sh\necho \"proxy: cannot reach https://bot:leaky-token@proxy.example/x\" >&2\nexit 255\n");
   await chmod(fakeSsh, 0o755);
   await alice.git("remote", "set-url", "origin", "ssh://git@huddle.invalid/team/repo.git");
-  await alice.git("config", "core.sshCommand", fakeSsh);
+  // core.sshCommand is a shell command line, and the harness's directories have a space in their names.
+  await alice.git("config", "core.sshCommand", `'${fakeSsh.replace(/'/g, "'\\''")}'`);
   const r = await alice.huddle(["doctor"]);
   assert.equal(r.code, 1);
   assert.match(r.stdout, /cannot reach remote "origin" \(ssh:\/\/\*\*\*@huddle\.invalid\/team\/repo\.git\): proxy: cannot reach https:\/\/\*\*\*@proxy\.example\/x \/ fatal: Could not read from remote repository\./);

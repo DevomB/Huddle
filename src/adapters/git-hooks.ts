@@ -579,9 +579,14 @@ export async function checkGitHooks(repoRoot: string, platform: NodeJS.Platform 
   return { installed: true, detail: `${count}; ${foreign.join(", ")} left alone`, notes, files };
 }
 
-/** Every repository with a working tree has git, whatever agent is or is not in use. */
-async function detect(repoRoot: string): Promise<boolean> {
-  return (await locateRepo(repoRoot)) !== null;
+/**
+ * Never by itself: the git hooks are an option someone asks for, with
+ * `huddle init --agent git` (or --all). Every repository has git, so
+ * detecting it would put these hooks into every clone that runs a plain
+ * `huddle init`, next to the hooks of the agent that clone really uses.
+ */
+async function detect(_repoRoot: string): Promise<boolean> {
+  return false;
 }
 
 export const gitHooks: Adapter = {

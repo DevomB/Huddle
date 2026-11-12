@@ -1,4 +1,9 @@
 // T1.4. huddle check
+//
+// MVP (CONTRACT 4.2): the answer is one of three, and only one of them is a
+// clearance. "overlap" (exit 3) whatever the freshness; "clear" (exit 0) only
+// on a fresh and complete team picture; anything else is "unknown" (exit 1):
+// not knowing about a teammate is never reported as there being none.
 
 import { parse } from "../core/args.ts";
 import { openContext } from "../core/context.ts";
@@ -6,17 +11,24 @@ import { filesInFlight, toRepoPath } from "../core/files.ts";
 import { EXIT, UsageError } from "../core/io.ts";
 import type { Io } from "../core/io.ts";
 import { renderOverlaps } from "../core/render.ts";
-import { currentView, resolveSession } from "../core/session.ts";
+import { envelope, readTeam, refreshOutcome, resolveSession } from "../core/session.ts";
+import { sync } from "../core/sync.ts";
 import { overlaps } from "../core/view.ts";
+import type { RefreshOutcome } from "../core/view.ts";
 
-export const summary = "Check paths for overlap with teammates; exits 3 on overlap";
+export const summary = "Check paths for overlap with teammates; exits 3 on overlap, 1 when it cannot know";
 
-const USAGE = "huddle check [--json] [<path>...]   (no path: this worktree's files in flight)";
+const USAGE = "huddle check [--json] [--refresh] [<path>...]   (no path: this worktree's files in flight; --refresh: sync first)";
+
+export type Verdict = "overlap" | "clear" | "unknown";
 
 export async function run(args: string[], io: Io): Promise<number> {
-  const { values, positionals } = parse(args, { json: { type: "boolean", default: false } }, USAGE);
+  const { values, positionals } = parse(
+    args,
+    { json: { type: "boolean", default: false }, refresh: { type: "boolean", default: false } },
+    USAGE,
+  );
   const ctx = await openContext(io);
-  const me = await resolveSession(ctx);
 
   let targets: string[];
   if (positionals.length === 0) {
@@ -29,9 +41,16 @@ export async function run(args: string[], io: Io): Promise<number> {
     });
   }
 
-  // From the cache: no network, so this is safe to call before every edit.
-  const view = await currentView(ctx, me.id);
+  // From the cache unless asked: no network, so this is safe to call before every edit.
+  // --refresh runs one sync first, throttled like any other.
+  let refresh: RefreshOutcome = "none";
+  if (values.refresh) refresh = refreshOutcome(await sync(ctx));
+  const me = await resolveSession(ctx);
+  const team = await readTeam(ctx, me.id, refresh);
+  const view = team.view;
   const found = targets.map((path) => ({ path, overlaps: overlaps(view, path) })).filter((entry) => entry.overlaps.length > 0);
+  const trusted = team.freshness.freshness === "fresh" && team.completeness.complete;
+  const verdict: Verdict = found.length > 0 ? "overlap" : trusted ? "clear" : "unknown";
 
   if (values.json) {
     io.out(
@@ -49,17 +68,23 @@ export async function run(args: string[], io: Io): Promise<number> {
               seenAt: overlap.session.seenAt,
               via: overlap.via,
               match: overlap.match,
+              ...(overlap.via === "coverage" && overlap.session.partial ? { total: overlap.session.partial.total } : {}),
             })),
           })),
+          verdict,
+          ...envelope(team),
         },
         null,
         2,
       ),
     );
-  } else if (found.length === 0) {
-    io.out(`no overlap: checked ${targets.length} path${targets.length === 1 ? "" : "s"} against ${view.sessions.length} other session${view.sessions.length === 1 ? "" : "s"}`);
-  } else {
+  } else if (verdict === "overlap") {
     for (const entry of found) io.out(renderOverlaps(entry.path, entry.overlaps, ctx.now));
+  } else {
+    const what = `${targets.length} path${targets.length === 1 ? "" : "s"} against ${view.sessions.length} other session${view.sessions.length === 1 ? "" : "s"}`;
+    if (verdict === "clear") io.out(`no overlap: checked ${what}`);
+    else io.out(`unknown: checked ${what}, but the team picture cannot be trusted: ${team.warnings.join("; ")}. Run "huddle check --refresh" (or "huddle sync") and check again`);
   }
-  return found.length > 0 ? EXIT.CONFLICT : EXIT.OK;
+  for (const warning of team.warnings) io.err(`huddle: ${warning}`);
+  return verdict === "overlap" ? EXIT.CONFLICT : verdict === "clear" ? EXIT.OK : EXIT.ERROR;
 }

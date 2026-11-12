@@ -5,8 +5,9 @@ import { openContext } from "../core/context.ts";
 import { EXIT, UsageError } from "../core/io.ts";
 import type { Io } from "../core/io.ts";
 import { renderDecisions } from "../core/render.ts";
-import { currentView, resolveSession } from "../core/session.ts";
+import { envelope, readTeam, refreshOutcome, resolveSession } from "../core/session.ts";
 import { sync } from "../core/sync.ts";
+import type { RefreshOutcome } from "../core/view.ts";
 
 export const summary = "List the team's current decisions";
 
@@ -22,16 +23,14 @@ export async function run(args: string[], io: Io): Promise<number> {
   const ctx = await openContext(io);
 
   // Refresh first unless told not to, as `huddle status` does: throttled, and a failure just means cached data.
-  let warning = "";
-  if (!values.cached) {
-    const result = await sync(ctx);
-    if (result.error === "offline") warning = `could not reach remote "${ctx.config.remote}"; showing the last known decisions`;
-  }
+  let refresh: RefreshOutcome = "none";
+  if (!values.cached) refresh = refreshOutcome(await sync(ctx));
 
   const me = await resolveSession(ctx);
-  const view = await currentView(ctx, me.id);
-  if (values.json) io.out(JSON.stringify({ fetchedAt: view.fetchedAt, decisions: view.decisions }, null, 2));
+  const team = await readTeam(ctx, me.id, refresh);
+  const view = team.view;
+  if (values.json) io.out(JSON.stringify({ fetchedAt: view.fetchedAt, decisions: view.decisions, ...envelope(team) }, null, 2));
   else io.out(renderDecisions(view));
-  if (warning) io.err(`huddle: ${warning}`);
+  for (const warning of team.warnings) io.err(`huddle: ${warning}`);
   return EXIT.OK;
 }

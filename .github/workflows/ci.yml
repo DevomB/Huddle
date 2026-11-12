@@ -18,6 +18,45 @@ permissions:
 # the same SHA again: every job below skips that case.
 
 jobs:
+  smoke:
+    # The fast job: what a user does with a clean checkout. Pack from clean
+    # source (prepack builds the bundle), install the tarball, run the bins
+    # (on Windows the .cmd shims from PowerShell and from CMD), and the
+    # two-clone demo against the built bundle.
+    name: Smoke (Node 22, ${{ matrix.os }})
+    if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 't/mvp-')
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: node scripts/ci-evidence.mjs platform smoke-evidence ($PSVersionTable.PSVersion.ToString())
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - name: Pack from clean source and install the tarball
+        run: npm run smoke:pack -- --keep smoke-evidence
+      - name: Two-clone demo
+        if: hashFiles('scripts/demo-mvp.mjs') != ''
+        run: npm run demo -- --evidence smoke-evidence
+      - name: Keep the smoke evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-${{ matrix.os }}
+          path: smoke-evidence
+          if-no-files-found: ignore
+
   test:
     name: Typecheck and test (Node 22, ${{ matrix.os }}, shard ${{ matrix.shard }}/3)
     if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 't/mvp-')

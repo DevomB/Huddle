@@ -302,10 +302,20 @@ test("report: what each outcome prints and which exit code it gives", () => {
     { user: "bob", decision: { id: "bbbb2222", at: at(20), agent: "codex", text: "Use npm" } },
     { user: "carol", decision: { id: "cccc2222", at: at(10), agent: "manual", text: "Use yarn" } },
   ];
+  // Two different rules both replace it: they conflict (audit A04), and huddle does not pick one for the caller.
   const late = said({ ok: false, reason: "already-superseded", inForce }, "zzzz2222");
   assert.equal(
     late.err,
-    'huddle: decision zzzz2222 was already replaced by [bbbb2222] Use npm (bob / codex) (and 1 more; see "huddle decisions"). ' +
+    "huddle: decision zzzz2222 was replaced by more than one decision: [bbbb2222] Use npm (bob / codex); [cccc2222] Use yarn (carol / manual). " +
+      "Replacing it again would add one more, and huddle does not pick between them. The decision was NOT recorded. " +
+      'Replace the rule that should change instead: huddle decide --supersedes <its id> "<the rule>"',
+  );
+  assert.equal(late.code, 3);
+  // One rule at the end of the chain: pointed at.
+  const single = said({ ok: false, reason: "already-superseded", inForce: inForce.slice(0, 1) }, "zzzz2222");
+  assert.equal(
+    single.err,
+    "huddle: decision zzzz2222 was already replaced by [bbbb2222] Use npm (bob / codex). " +
       "The decision was NOT recorded. To replace the rule in force, run the command again with --supersedes bbbb2222.",
   );
 
@@ -408,7 +418,7 @@ test("offline, the decision is not recorded and the command says so with exit 1"
   const listed = await alice.huddle(["decisions"], { now: at(100) });
   assert.equal(listed.code, 0);
   assert.match(listed.stdout, /Decisions \(1\)/);
-  assert.match(listed.stderr, /showing the last known decisions/);
+  assert.match(listed.stderr, /could not reach remote "origin"; showing the last known state/);
   assert.deepEqual(texts((await remoteLogs(h))[0]!.decisions), ["one"]);
 });
 

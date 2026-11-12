@@ -14,6 +14,7 @@
 import { ELLIPSIS, cleanText } from "./docs.ts";
 import type { Iso, Seen } from "./types.ts";
 import { countTasks, taskState } from "./view.ts";
+import type { Completeness, FreshnessReport } from "./view.ts";
 import type { Overlap, TeamView, ViewDecision, ViewSession, ViewTask } from "./view.ts";
 
 /**
@@ -175,11 +176,24 @@ function sessionLine(session: ViewSession, nowMs: number, detail: Level): string
   return line;
 }
 
+/**
+ * " CONFLICT: …" for a decision that competes with another one in force
+ * (ViewDecision.conflictsWith), "" otherwise. huddle does not pick one, so
+ * both are shown, and each says so.
+ */
+function conflictNote(decision: ViewDecision): string {
+  const others = decision.conflictsWith ?? [];
+  if (others.length === 0) return "";
+  const ids = others.map((id) => `[${shownText(id, 40)}]`).join(", ");
+  const replaced = shownText(decision.supersedes ?? "", 40);
+  return ` CONFLICT: this and ${ids} both replace [${replaced}], and huddle does not pick one. Settle it together, then replace the one that should go: huddle decide --supersedes <its id> "<the rule>"`;
+}
+
 function decisionLines(decisions: ViewDecision[], fresh: boolean, detail: Level): string[] {
   if (decisions.length === 0) return [];
   const head = `Decisions (${decisions.length}${fresh ? " new" : ""})`;
   if (detail.decisions <= 0) return [`${head}: run \`huddle decisions\` to read them.`];
-  const shown = decisions.slice(0, detail.decisions).map((decision) => sentence(shownText(decision.text, detail.decisionChars)));
+  const shown = decisions.slice(0, detail.decisions).map((decision) => sentence(shownText(decision.text, detail.decisionChars)) + conflictNote(decision));
   const more = decisions.length - shown.length;
   if (shown.length === 1 && more === 0) return [`${head}: ${shown[0]}`];
   const lines = [`${head}:`, ...shown.map((line) => `- ${line}`)];
@@ -253,7 +267,8 @@ function itemsOf(view: TeamView): Record<string, string> {
     const shown = JSON.stringify([session.user, session.agent, session.branch, session.intent, [...session.files].sort(), [...session.claims].sort()]);
     items[sessionItem(session)] = `${fingerprint(shown)} ${who(session)} (${branchOf(session)})`;
   }
-  for (const decision of view.decisions) items[decisionItem(decision)] = fingerprint(decision.text);
+  // A decision that becomes conflicted (or stops being) is news again.
+  for (const decision of view.decisions) items[decisionItem(decision)] = fingerprint(`${decision.text}${conflictNote(decision)}`);
   items[TASKS_ITEM] = taskSummary(view);
   return items;
 }
@@ -421,7 +436,7 @@ function decisionLog(view: TeamView, notice: boolean): string[] {
   const nowMs = Date.parse(view.now);
   const lines = [`Decisions (${view.decisions.length}), newest first.${notice ? ` ${NOTICE}` : ""}`];
   for (const decision of view.decisions) {
-    lines.push(`- [${shownText(decision.id, 40)}] ${sentence(shownText(decision.text, 500))} (${who(decision)}, ${ageOf(decision.at, nowMs)})`);
+    lines.push(`- [${shownText(decision.id, 40)}] ${sentence(shownText(decision.text, 500))} (${who(decision)}, ${ageOf(decision.at, nowMs)})${conflictNote(decision)}`);
   }
   return lines;
 }
@@ -477,10 +492,57 @@ export function renderOverlaps(path: string, found: Overlap[], now: Date): strin
     const match = shownText(overlap.match, 200);
     let how: string;
     if (overlap.via === "claim") how = `claimed ${match}`;
+    else if (overlap.via === "coverage") {
+      const total = overlap.session.partial?.total ?? 0;
+      how = `has ${total} files in flight, more than it lists, and ${match} covers the rest (conservative: this file may not be one of them)`;
+    }
     else if (match === shownText(path, 200)) how = "has it in flight";
     else how = `has ${match} in flight`;
     lines.push(`- ${sessionHead(overlap.session, nowMs)} ${how}: ${intentOf(overlap.session)}`);
   }
   lines.push("Say so before editing, and coordinate or pick a different file if you can.");
   return lines.join("\n");
+}
+
+// ---------------------------------------------------------------- freshness
+
+/**
+ * The sentences that say how far the team picture can be trusted (CONTRACT
+ * 4.2): the same words in text output, on stderr and in JSON `warnings`.
+ * Empty when the picture is fresh and complete.
+ */
+export function freshnessWarnings(report: FreshnessReport, completeness: Completeness, remote: string): string[] {
+  const warnings: string[] = [];
+  const name = `"${shownText(remote, 80)}"`;
+  const age = report.ageSeconds === null ? "" : ` from ${formatAge(report.ageSeconds * 1000)}`;
+  switch (report.refresh) {
+    case "offline":
+      warnings.push(`could not reach remote ${name}; showing the last known state${age}`);
+      break;
+    case "denied":
+      warnings.push(`remote ${name} refused a push to refs/huddle/*; run "huddle doctor". Showing the last known state${age}`);
+      break;
+    case "busy":
+      warnings.push(`another huddle sync in this clone was still running, so this is the last known state${age}`);
+      break;
+    case "failed":
+      warnings.push(`the refresh from remote ${name} did not finish (the reason is in the huddle log); showing the last known state${age}`);
+      break;
+    default:
+      break;
+  }
+  if (report.freshness === "never") warnings.push(`no team state yet: this clone has never synced with remote ${name}. Run "huddle sync"`);
+  else if (report.freshness === "unreadable") warnings.push(`this clone's team state (cache.json) could not be read. Run "huddle sync" to rebuild it`);
+  else if (report.freshness === "stale" && (report.refresh === "none" || report.refresh === "ok")) {
+    warnings.push(`the team state is${age}, older than ${report.staleAfterSeconds}s. Run "huddle sync" for a current picture`);
+  }
+  if (completeness.unreadableActors > 0) {
+    const n = completeness.unreadableActors;
+    warnings.push(`${n} ${plural(n, "teammate's state", "teammates' states")} could not be read by this version of huddle, so ${plural(n, "its sessions are", "their sessions are")} not shown`);
+  }
+  if (completeness.uncovered > 0) {
+    const n = completeness.uncovered;
+    warnings.push(`${n} teammate ${plural(n, "session has", "sessions have")} more files in flight than ${plural(n, "it", "they")} published`);
+  }
+  return warnings;
 }
