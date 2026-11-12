@@ -125,7 +125,7 @@ jobs:
         with:
           pattern: evidence-*
           path: all-evidence
-      - run: node scripts/ci-evidence.mjs summary all-evidence
+      - run: node scripts/ci-evidence.mjs summary all-evidence --expect linux=3,win32=3
 
   bundle-node20:
     name: CLI tests with the bundle on Node 20
