@@ -1332,14 +1332,17 @@ test("detect: wherever huddle's Claude Code hooks are, Cursor's belong too, beca
   assert.equal(notes.some((note) => /Cursor/.test(note)), false, notes.join("\n"));
 });
 
-test("the adapter is registered under the name used in `huddle hook cursor`, and git hooks stay last", () => {
+test("the adapter is registered under the name used in `huddle hook cursor`, after Claude Code, and git hooks stay last", () => {
   assert.equal(getAdapter("cursor"), cursor);
   assert.equal(cursor.name, "cursor");
   assert.equal(cursor.title, "Cursor");
-  assert.deepEqual(
-    ADAPTERS.map((adapter) => adapter.name),
-    ["claude-code", "codex", "gemini-cli", "cursor", "git"],
-  );
+  // Not the whole list: another adapter joining the registry is no business of this test. Two things about the order are.
+  const names = ADAPTERS.map((adapter) => adapter.name);
+  // init asks the adapters in this order, and Cursor's detect() says yes where huddle's Claude Code hooks are: on a
+  // first run they are there only because Claude Code's install came first.
+  assert.ok(names.indexOf("claude-code") !== -1 && names.indexOf("claude-code") < names.indexOf("cursor"), names.join(", "));
+  assert.equal(names.at(-1), "git", names.join(", "));
+  assert.equal(new Set(names).size, names.length, "no name twice");
 });
 
 // ---------------------------------------------------------------------------
