@@ -7,9 +7,11 @@ import { parse } from "../core/args.ts";
 import { ageMs } from "../core/clock.ts";
 import { openContext } from "../core/context.ts";
 import type { Ctx } from "../core/context.ts";
+import { resolveBase } from "../core/files.ts";
 import { git } from "../core/git.ts";
 import { EXIT, NotImplementedError, UsageError } from "../core/io.ts";
 import type { Io } from "../core/io.ts";
+import { loadConfigReport } from "../core/paths.ts";
 import { toActorDoc } from "../core/session.ts";
 import { readCache, readLocal } from "../core/store.ts";
 import { actorRef, REF_PATTERN } from "../core/types.ts";
@@ -107,13 +109,51 @@ async function bundle(ctx: Ctx): Promise<Check> {
   return check("bundle", "ok", `${BUNDLE} is huddle ${version} and committed`);
 }
 
-function config(ctx: Ctx): Check {
+async function config(ctx: Ctx): Promise<Check> {
   const c = ctx.config;
   const detail = `remote ${c.remote}, base ${c.base}, sync every ${c.syncIntervalSeconds}s, heartbeat ${c.heartbeatMinutes}m, sessions expire after ${c.ttlMinutes}m, mode ${c.mode}`;
   const capture = c.captureIntent
     ? "prompt capture is on: the first 200 characters of each prompt are shared with everyone who can read this repo (captureIntent: false turns it off)"
     : "prompt capture is off: agents announce what they are doing with huddle intent";
-  return check("config", "info", detail, [capture]);
+  // A settings file that cannot be used is skipped, not fatal; what was skipped is said here.
+  const { problems } = await loadConfigReport(ctx.paths);
+  return check("config", problems.length > 0 ? "warn" : "info", detail, [...problems, capture]);
+}
+
+/**
+ * The clock huddle goes by. HUDDLE_NOW pins it for tests; left set in a real
+ * shell it stamps every session with one fixed moment, and they stop looking
+ * alive to teammates once that moment is older than the TTL.
+ */
+function clock(ctx: Ctx): Check[] {
+  if (!ctx.io.env.HUDDLE_NOW) return [];
+  return [
+    check("clock", "warn", `HUDDLE_NOW is set: huddle believes it is ${ctx.now.toISOString()}`, [
+      "HUDDLE_NOW is for tests; unset it, or this clone's sessions carry the wrong time",
+    ]),
+  ];
+}
+
+/** The branch that committed work is measured against (files changed since the merge-base with it). */
+async function base(ctx: Ctx): Promise<Check> {
+  const { remote, base: wanted } = ctx.config;
+  const found = await resolveBase(ctx.paths.worktree, ctx.config);
+  if (found === null) {
+    return check("base branch", "warn", `no base branch found: no ${remote}/HEAD, ${remote}/main or ${remote}/master${wanted === "auto" ? "" : `, and no branch "${wanted}"`}`, [
+      "committed files are then shared only until their branch is pushed; uncommitted files are shared as usual",
+      'set "base" in .huddle/config.json to the branch that work is merged into',
+    ]);
+  }
+  const short = found.replace(/^refs\/(?:remotes|heads)\//, "");
+  const target = found.endsWith("/HEAD") ? await git(["symbolic-ref", "--quiet", "--short", found], { cwd: ctx.paths.worktree }) : null;
+  const name = target?.ok && target.stdout.trim() ? `${short} (${target.stdout.trim()})` : short;
+  const explicit = [`refs/remotes/${remote}/${wanted}`, `refs/heads/${wanted}`];
+  if (wanted !== "auto" && !explicit.includes(found)) {
+    return check("base branch", "warn", `"base" is "${wanted}", but there is no such branch here or on ${remote}; using ${name}`, [
+      `fix "base" in .huddle/config.json, or run "git fetch ${remote}" if the branch is new`,
+    ]);
+  }
+  return check("base branch", "ok", name);
 }
 
 /** Reachability and push access. Skipped with --offline. */
@@ -218,6 +258,27 @@ async function hooks(ctx: Ctx): Promise<Check[]> {
   return checks;
 }
 
+/** How long a sighting of a second writer in the log stays worth a warning. */
+const SHARED_ACTOR_MAX_AGE_MS = 24 * 60 * 60_000;
+
+/**
+ * sync logs it when this clone's entry on the remote was written by a clone
+ * that is not this one (see foreignSessions in core/sync.ts). Two clones with
+ * one actor id overwrite each other and never see each other, so the latest
+ * such line, while it is recent, is shown as a problem to fix.
+ */
+function sharedActor(log: string, ctx: Ctx): Check | null {
+  const lines = log.split("\n").filter((line) => line.includes("another clone is publishing as this one"));
+  const last = lines[lines.length - 1];
+  if (!last) return null;
+  const age = ageMs(last.slice(0, last.indexOf(" ")), ctx.now);
+  if (Number.isNaN(age) || age > SHARED_ACTOR_MAX_AGE_MS) return null;
+  return check("actor id", "warn", `another clone is publishing under this clone's actor id ${ctx.identity.actor} (seen ${formatAge(Math.max(0, age))})`, [
+    "this happens when a repository is copied together with its .git directory",
+    `delete ${ctx.paths.actorFile} in the copy, then run "huddle sync" in both`,
+  ]);
+}
+
 async function state(ctx: Ctx): Promise<Check[]> {
   const [local, cache] = await Promise.all([readLocal(ctx.paths), readCache(ctx.paths)]);
   const ttlMs = ctx.config.ttlMinutes * 60_000;
@@ -236,6 +297,8 @@ async function state(ctx: Ctx): Promise<Check[]> {
   }
 
   const log = await readText(ctx.paths.logFile);
+  const shared = sharedActor(log ?? "", ctx);
+  if (shared) checks.push(shared);
   const failures = (log ?? "").split("\n").filter((line) => /fail|error|denied|offline/i.test(line));
   const recent = failures[failures.length - 1];
   checks.push(check("log", "info", ctx.paths.logFile, recent ? [`last problem logged: ${redactUrl(recent).slice(0, 300)}`] : []));
@@ -253,7 +316,7 @@ export async function run(args: string[], io: Io): Promise<number> {
   if (positionals.length > 0) throw new UsageError(`unexpected argument "${positionals[0]}"\nUsage: ${USAGE}`);
 
   const ctx = await openContext(io);
-  const checks: Check[] = [await toolchain(ctx), await bundle(ctx), config(ctx)];
+  const checks: Check[] = [await toolchain(ctx), await bundle(ctx), await config(ctx), ...clock(ctx), await base(ctx)];
   if (values.offline) checks.push(check("remote", "info", "not checked (--offline)"));
   else checks.push(...(await remote(ctx)));
   checks.push(...(await hooks(ctx)), ...(await state(ctx)));
