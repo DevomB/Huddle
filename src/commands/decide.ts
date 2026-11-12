@@ -85,10 +85,11 @@ export function report(result: DecideResult, asked: { remote: string; supersedes
       const first = inForce[0];
       const more = inForce.length > 1 ? ` (and ${inForce.length - 1} more; see "huddle decisions")` : "";
       if (inForce.length > 1 && new Set(inForce.map((entry) => entry.decision.text)).size > 1) {
-        // Competing replacements (audit A04). Replacing the decision they compete for once more would add a third.
+        // Replaced along more than one line (audit A04: competing replacements, settled or not). Replacing it
+        // once more would add another line, and huddle does not pick between them.
         io.err(
-          `huddle: decision ${supersedes} was replaced by competing decisions: ${inForce.map(shown).join("; ")}. They conflict, and huddle does not pick one. ` +
-            "The decision was NOT recorded. Settle it together, then replace the one that should go: huddle decide --supersedes <its id> \"<the rule>\"",
+          `huddle: decision ${supersedes} was replaced by more than one decision: ${inForce.map(shown).join("; ")}. Replacing it again would add one more, and huddle does not pick between them. ` +
+            "The decision was NOT recorded. Replace the rule that should change instead: huddle decide --supersedes <its id> \"<the rule>\"",
         );
         return EXIT.CONFLICT;
       }

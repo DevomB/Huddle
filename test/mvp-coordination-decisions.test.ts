@@ -108,7 +108,7 @@ describe("A04: concurrent replacement of one decision is marked as a conflict", 
   test("replacing the contested decision once more is refused, exit 3, and says how to settle it", async () => {
     const again = await seed.huddle(["decide", "--supersedes", first, "Use format D"], { now: at(21) });
     assert.equal(again.code, 3, again.stdout + again.stderr);
-    assert.match(again.stderr, /They conflict, and huddle does not pick one\. The decision was NOT recorded/);
+    assert.match(again.stderr, /replaced by more than one decision: .*huddle does not pick between them\. The decision was NOT recorded/);
     assert.match(again.stderr, /huddle decide --supersedes <its id>/);
     assert.equal((await viewOf(seed, at(22))).decisions.some((d) => d.text === "Use format D"), false);
   });

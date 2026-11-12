@@ -306,9 +306,9 @@ test("report: what each outcome prints and which exit code it gives", () => {
   const late = said({ ok: false, reason: "already-superseded", inForce }, "zzzz2222");
   assert.equal(
     late.err,
-    "huddle: decision zzzz2222 was replaced by competing decisions: [bbbb2222] Use npm (bob / codex); [cccc2222] Use yarn (carol / manual). " +
-      "They conflict, and huddle does not pick one. The decision was NOT recorded. " +
-      'Settle it together, then replace the one that should go: huddle decide --supersedes <its id> "<the rule>"',
+    "huddle: decision zzzz2222 was replaced by more than one decision: [bbbb2222] Use npm (bob / codex); [cccc2222] Use yarn (carol / manual). " +
+      "Replacing it again would add one more, and huddle does not pick between them. The decision was NOT recorded. " +
+      'Replace the rule that should change instead: huddle decide --supersedes <its id> "<the rule>"',
   );
   assert.equal(late.code, 3);
   // One rule at the end of the chain: pointed at.
