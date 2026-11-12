@@ -108,14 +108,14 @@ test("hooks that are installed and cannot work are a warning that says what to d
   await writeFile(hook, "#!/bin/sh\n");
   const partly = await gitHooks();
   assert.equal(partly.level, "warn");
-  assert.match(partly.detail, /^huddle git hooks in \.git\/hooks are missing for pre-commit\. Run huddle init\.$/);
+  assert.match(partly.detail, /^huddle git hooks in \.git\/hooks are missing for pre-commit\. Run huddle init --agent git\.$/);
   await writeFile(hook, original);
 
   // No huddle hook at all is not damage: nobody set them up in this clone (they are per clone, not committed).
   for (const name of ["pre-commit", "post-commit", "post-checkout", "post-merge", "post-rewrite"]) await rm(join(alice.dir, ".git", "hooks", name), { force: true });
   const none = await gitHooks();
   assert.equal(none.level, "info");
-  assert.match(none.detail, /^no huddle git hooks in \.git\/hooks\. Run huddle init\.$/);
+  assert.match(none.detail, /^no huddle git hooks in \.git\/hooks\. Run huddle init --agent git\.$/);
 });
 
 test("hooks that work here and are not committed are a warning: teammates would not get them", async (t) => {
