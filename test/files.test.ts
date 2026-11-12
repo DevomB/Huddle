@@ -242,6 +242,42 @@ test("toRepoPath sees through a symlink to the worktree", async (t) => {
   assert.equal(toRepoPath(paths, clone.dir, join(link, "src", "new", "file.ts")), "src/new/file.ts");
 });
 
+test("toRepoPath answers at once for a path no file system would take", async (t) => {
+  // A hook hands toRepoPath whatever its agent sent, and has 150 ms for the whole event.
+  const h = await createHarness(t);
+  const clone = await h.clone("alice");
+  const paths = await clone.paths();
+  const link = join(h.root, "link-to-alice");
+  await symlink(clone.dir, link);
+  const timed = <T>(run: () => T): { value: T; ms: number } => {
+    const started = performance.now();
+    const value = run();
+    return { value, ms: performance.now() - started };
+  };
+
+  // Longer than any path can be: not a file, wherever it points. (64,000 directories took 48 s before.)
+  const endless = join(clone.dir, ...Array.from({ length: 64_000 }, () => "d"), "f.ts");
+  const refused = timed(() => toRepoPath(paths, clone.dir, endless));
+  assert.equal(refused.value, null);
+  assert.ok(refused.ms < 1000, `took ${Math.round(refused.ms)} ms`);
+
+  // As long as a path can be, thousands of directories that do not exist, reached through a symlink
+  // and from outside: both ask the file system, and give up on the missing tail after a bounded number of looks.
+  const tail = Array.from({ length: 10_000 }, () => "d");
+  const through = timed(() => toRepoPath(paths, clone.dir, join(link, ...tail, "f.ts")));
+  const outside = timed(() => toRepoPath(paths, clone.dir, join(h.root, "elsewhere", ...tail, "f.ts")));
+  assert.equal(outside.value, null);
+  assert.equal(through.value, null, "past the bound the path is taken as given, and as given it is not in the worktree");
+  for (const { ms } of [through, outside]) assert.ok(ms < 1000, `took ${Math.round(ms)} ms`);
+
+  // Inside the worktree as given, the file system is not asked at all; a deep new file is still found through a symlink.
+  const deepInside = timed(() => toRepoPath(paths, clone.dir, join(clone.dir, ...tail, "f.ts")));
+  assert.equal(deepInside.value, [...tail, "f.ts"].join("/"));
+  assert.ok(deepInside.ms < 1000, `took ${Math.round(deepInside.ms)} ms`);
+  const fewMissing = Array.from({ length: 40 }, (_, i) => `new${i}`);
+  assert.equal(toRepoPath(paths, clone.dir, join(link, ...fewMissing, "f.ts")), [...fewMissing, "f.ts"].join("/"));
+});
+
 test("toRepoPattern resolves claim globs from where they were typed", async (t) => {
   const h = await createHarness(t);
   const clone = await h.clone("alice");

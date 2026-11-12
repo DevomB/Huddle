@@ -121,16 +121,27 @@ async function unpushedFiles(worktree: string, config: Config): Promise<string[]
  * itself or outside the worktree.
  */
 export function toRepoPath(paths: RepoPaths, cwd: string, path: string): string | null {
-  if (path === "") return null;
+  if (path === "" || path.length > MAX_PATH_CHARS) return null;
   const absolute = isAbsolute(path) ? resolve(path) : resolve(cwd, path);
-  // The worktree path from git has symlinks resolved; the path we were given
-  // may not (macOS /tmp, a symlinked checkout). Try it as given, then resolved.
-  for (const candidate of [absolute, resolveExisting(absolute)]) {
+  const inside = (candidate: string): string | null => {
     const rel = relative(paths.worktree, candidate);
-    if (rel !== "" && !isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`)) return rel.split(sep).join("/");
-  }
-  return null;
+    return rel !== "" && !isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`) ? rel.split(sep).join("/") : null;
+  };
+  // The worktree path from git has symlinks resolved; the path we were given
+  // may not (macOS /tmp, a symlinked checkout). Try it as given, and only then
+  // resolved: resolving asks the file system, and this runs before every edit.
+  return inside(absolute) ?? inside(resolveExisting(absolute));
 }
+
+/** No operating system takes a longer path (Windows: 32,767 characters; Linux 4,096 bytes). Anything longer is not a file. */
+const MAX_PATH_CHARS = 32_767;
+/**
+ * How many directories at the end of a path may not exist yet (a new file in
+ * new directories) before the path is taken as given. Each one costs a look at
+ * the file system, all of it synchronous, and a hook calls this with whatever
+ * an agent handed it and a deadline of 150 ms.
+ */
+const MAX_MISSING_TAIL = 256;
 
 /** Resolves symlinks in the longest existing prefix of `path`; the rest (a file not created yet) is kept as is. */
 function resolveExisting(path: string): string {
@@ -141,7 +152,7 @@ function resolveExisting(path: string): string {
       return resolve(realpathSync(current), ...missing.reverse());
     } catch {
       const parent = dirname(current);
-      if (parent === current) return path;
+      if (parent === current || missing.length === MAX_MISSING_TAIL) return path;
       missing.push(current.slice(parent.length).replace(/^[\\/]/, ""));
       current = parent;
     }
