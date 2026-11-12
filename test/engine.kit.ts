@@ -48,6 +48,26 @@ export async function timed<T>(work: () => Promise<T>): Promise<{ ms: number; va
   return { ms: performance.now() - started, value };
 }
 
+/**
+ * How many times its deadline a hook gets under test, unless the test says
+ * otherwise. A hook has 150 ms for an edit. On a machine that is running a
+ * dozen test files at once it runs out of them now and then, as it should,
+ * and a test that only wanted the hook's answer then fails for a reason that
+ * is not its own.
+ *
+ * Set on this process, so that it reaches the hooks handled in it (ioFor) and
+ * the ones it starts through the bundle (the harness passes the environment
+ * on). Whatever the developer's shell had there is replaced.
+ */
+export const PATIENCE = 20;
+process.env.HUDDLE_HOOK_PATIENCE = String(PATIENCE);
+
+/**
+ * For the tests that are about time, as the environment of an event or of a
+ * hook process: every deadline as it is for a user.
+ */
+export const ON_THE_CLOCK: Readonly<Record<string, string>> = Object.freeze({ HUDDLE_HOOK_PATIENCE: "1" });
+
 // ---------------------------------------------------------------------------
 // Clones
 // ---------------------------------------------------------------------------

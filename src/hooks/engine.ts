@@ -28,6 +28,9 @@
 // write it could interrupt is an atomic rename or is covered by stale-lock
 // recovery (core/store.ts). Agents put no time limit on some hooks at all
 // (Claude Code on an async PostToolUse), so this is the only one there is.
+// A machine that is too slow for these numbers can have all of them made
+// longer with HUDDLE_HOOK_PATIENCE (see patienceOf). And whatever gets around
+// an event's deadline meets the limit on the whole process: lifetimeMs().
 //
 // Syncs. A background sync is throttled to one per syncIntervalSeconds. What
 // becomes of one that comes too early is decided in core/sync.ts; either way
@@ -61,7 +64,7 @@
 // is not repeated before every edit of the same file.
 
 import { createHash } from "node:crypto";
-import { appendFile, mkdir, readFile, realpath, stat } from "node:fs/promises";
+import { appendFile, mkdir, readFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { ADAPTERS, getAdapter } from "../adapters/index.ts";
 import type { HookEvent, HookEventType, HookOutcome, HookOutput } from "../adapters/types.ts";
@@ -73,7 +76,7 @@ import { getIdentity, getIdentityFast } from "../core/identity.ts";
 import { EXIT } from "../core/io.ts";
 import type { Io } from "../core/io.ts";
 import { log } from "../core/log.ts";
-import { ensureStateDir, loadConfig, locateRepo } from "../core/paths.ts";
+import { ensureStateDir, isSetUp, loadConfig, locateRepo, sameDirectory } from "../core/paths.ts";
 import type { RepoPaths } from "../core/paths.ts";
 import { DEFAULT_BRIEFING_CHARS, formatAge, renderBriefing, renderOverlaps } from "../core/render.ts";
 import { currentView, resolveSession } from "../core/session.ts";
@@ -116,6 +119,8 @@ const CHECK_RESERVE_MS = 150;
 const STDIN_WAIT_MS = 300;
 /** What session-start keeps back from its deadline for everything that comes after the sync. */
 const BRIEFING_RESERVE_MS = 300;
+/** The longest session-start waits for that sync: the rest of its deadline, which patience does not make longer. */
+const SYNC_WAIT_MS = DEADLINE_MS["session-start"] - BRIEFING_RESERVE_MS;
 /** A store lock is not waited for longer than this, nor into the last moments before the deadline. */
 const MAX_STORE_WAIT_MS = 1000;
 const STORE_MARGIN_MS = 30;
@@ -164,14 +169,49 @@ function deadlineIn(startedMs: number, budgetMs: number): Deadline {
   return { left: () => end - performance.now() };
 }
 
-/** How long this event may take. Takes whatever it is given: an event that is not one gets the shortest deadline there is. */
-function deadlineFor(event: HookEvent | null | undefined): number {
+/**
+ * HUDDLE_HOOK_PATIENCE, a number from 1 to 100: every time limit of a hook is
+ * that many times as long. It is for a machine on which hooks keep giving up
+ * at their deadlines, which the debug log shows: a slow disk, a scanner that
+ * reads every file first, a container on a busy host. It buys time for the
+ * machine and none for the network: how long a hook waits for a sync stays as
+ * it is (see sessionStart and refreshFirst). Anything that is not such a
+ * number counts as 1. Takes whatever it is given.
+ */
+function patienceOf(io: Io | null | undefined): number {
+  const env: unknown = io?.env;
+  const raw = Number(typeof env === "object" && env !== null ? (env as NodeJS.ProcessEnv).HUDDLE_HOOK_PATIENCE : undefined);
+  return raw >= 1 && raw <= 100 ? raw : 1;
+}
+
+/**
+ * How long this event may take, with `patience`. Takes whatever it is given:
+ * an event that is not one gets the shortest deadline there is.
+ */
+function deadlineFor(event: HookEvent | null | undefined, patience: number): number {
+  return patience * baseDeadline(event);
+}
+
+function baseDeadline(event: HookEvent | null | undefined): number {
   const type: unknown = event?.type;
   if (typeof type !== "string" || !Object.hasOwn(DEADLINE_MS, type)) return DEADLINE_MS["pre-edit"];
   if (type === "pre-edit" && event?.ambient === true) return PATIENT_PRE_EDIT_MS;
   // It does a prompt's work, and for its agent it is the only event that brings news: a prompt's time.
   if (type === "post-edit" && event?.brief === true) return DEADLINE_MS.prompt;
   return DEADLINE_MS[type as HookEventType];
+}
+
+/** What comes on top of the longest deadline before a hook process is ended from outside the event (see lifetimeMs). */
+const LIFETIME_MARGIN_MS = 500;
+
+/**
+ * The longest a hook process may live, for the timer that commands/hook.ts
+ * sets: the longest deadline there is, and a little more. Every event has a
+ * deadline of its own, after which the process exits. This is the limit for
+ * whatever gets around that.
+ */
+export function lifetimeMs(io: Io | null | undefined): number {
+  return patienceOf(io) * Math.max(PATIENT_PRE_EDIT_MS, ...Object.values(DEADLINE_MS)) + LIFETIME_MARGIN_MS;
 }
 
 type Settled<T> = { done: true; value: T } | { done: false };
@@ -233,24 +273,6 @@ interface Where {
   away: boolean;
 }
 
-/** `huddle init` was run here (or someone made the directory by hand to opt this clone in). */
-async function isSetUp(paths: RepoPaths): Promise<boolean> {
-  try {
-    return (await stat(paths.teamDir)).isDirectory();
-  } catch {
-    return false;
-  }
-}
-
-async function sameDirectory(a: string, b: string): Promise<boolean> {
-  if (a === b) return true;
-  try {
-    return (await realpath(a)) === (await realpath(b));
-  } catch {
-    return false;
-  }
-}
-
 /**
  * The repository an event is about, or null when there is none huddle may
  * touch. It is the one the agent is working in (event.cwd) when that is set
@@ -301,6 +323,12 @@ interface Run {
   /** Fixed for the event; honors HUDDLE_NOW in io.env. */
   now: Date;
   deadline: Deadline;
+  /**
+   * What the deadline was multiplied by (patienceOf). The two reserves that are
+   * kept back from a deadline for the work after a sync are multiplied by it
+   * as well: see sessionStart and refreshFirst.
+   */
+  patience: number;
 }
 
 interface Prepared {
@@ -532,7 +560,8 @@ async function sessionStart(run: Run): Promise<Prepared> {
   try {
     const [identity, touched] = await Promise.all([getIdentity(run.home), touch(run)]);
     const ctx = contextFor(run, identity);
-    const budget = deadline.left() - BRIEFING_RESERVE_MS;
+    // The remote gets what it always gets. Patience is for this machine: it makes the reserve longer, not the wait.
+    const budget = Math.min(SYNC_WAIT_MS, deadline.left() - BRIEFING_RESERVE_MS * run.patience);
     if (budget > 0) await syncFor(ctx, budget);
     else effects.spawnBackgroundSync(run.home, io.self, { force: true });
     const view = await currentView(ctx, id, undefined, viewerOf(run, touched));
@@ -748,12 +777,18 @@ async function refreshFirst(run: Run): Promise<boolean> {
     const stamp = waitStamp(paths);
     const waitedAgo = now.getTime() - Date.parse((await readFile(stamp, "utf8").catch(() => "")).trim());
     if (waitedAgo >= 0 && waitedAgo < STALE_AFTER_MS) return false;
-    const budget = Math.min(MAX_REFRESH_WAIT_MS, Math.floor(deadline.left()) - CHECK_RESERVE_MS);
-    if (budget <= 0) return false;
+    // What the wait may take, counted from this moment. Patience is for this machine: it makes what is kept back
+    // for the check longer, and the wait for the remote stays what it is.
+    const room = (): number => Math.min(MAX_REFRESH_WAIT_MS, Math.floor(deadline.left()) - CHECK_RESERVE_MS * run.patience);
+    if (room() <= 0) return false;
     // Recorded first: if it cannot be, there is no limit on how often this would wait, so it does not wait at all.
     await ensureStateDir(paths);
     await writeFileAtomic(stamp, now.toISOString());
-    await syncFor(contextFor(run, await getIdentityFast(run.home)), budget);
+    const ctx = contextFor(run, await getIdentityFast(run.home));
+    // Counted again: recording it took time as well, and that is not taken from the check.
+    const budget = room();
+    if (budget <= 0) return false;
+    await syncFor(ctx, budget);
     return true;
   } catch (error) {
     log(paths, "hook", "pre-edit: could not refresh the team state first", error);
@@ -866,7 +901,7 @@ async function ambientSession(run: Run): Promise<string> {
   return (await resolveSession({ ...ctx, paths: run.paths })).id;
 }
 
-async function prepare(event: HookEvent, io: Io, deadline: Deadline, trace: Trace): Promise<Prepared> {
+async function prepare(event: HookEvent, io: Io, deadline: Deadline, patience: number, trace: Trace): Promise<Prepared> {
   if (typeof event.type !== "string" || !Object.hasOwn(DEADLINE_MS, event.type)) return { outcome: {} };
   const ambient = event.ambient === true;
   const named = ambient ? "" : sessionIdOf(event.sessionId);
@@ -886,6 +921,7 @@ async function prepare(event: HookEvent, io: Io, deadline: Deadline, trace: Trac
     passive: ambient || event.subagent === true,
     now: clockNow(io.env),
     deadline,
+    patience,
   };
   if (ambient) run.id = await ambientSession(run);
   if (run.id === "") return { outcome: {} };
@@ -912,7 +948,9 @@ async function prepare(event: HookEvent, io: Io, deadline: Deadline, trace: Trac
 async function commit(prepared: Prepared, deadline: Deadline, trace: Trace, type: unknown): Promise<void> {
   if (prepared.commit === undefined) return;
   try {
-    await before(deadline, prepared.commit());
+    const recorded = await before(deadline, prepared.commit());
+    // The write may still land. If it does not, the session is told the same thing once more.
+    if (!recorded.done) log(trace.paths, "hook", `${String(type)}: its deadline passed before what was shown was on record`);
   } catch (error) {
     log(trace.paths, "hook", `${String(type)}: could not record what was shown`, error);
   }
@@ -928,9 +966,10 @@ export async function handleEvent(event: HookEvent, io: Io): Promise<HookOutcome
   const trace: Trace = { paths: null };
   lastTrace = trace;
   try {
-    const budget = deadlineFor(event);
+    const patience = patienceOf(io);
+    const budget = deadlineFor(event, patience);
     const deadline = deadlineIn(performance.now(), budget);
-    const prepared = await before(deadline, prepare(event, io, deadline, trace));
+    const prepared = await before(deadline, prepare(event, io, deadline, patience, trace));
     if (!prepared.done) {
       log(trace.paths, "hook", `${event.type}: gave up at its deadline of ${budget} ms`);
       return {};
@@ -1001,14 +1040,16 @@ export async function runHook(args: string[], io: Io): Promise<number> {
       return EXIT.OK;
     }
 
-    const stdin = await before(deadlineIn(started, STDIN_WAIT_MS + 50), io.readStdin({ timeoutMs: STDIN_WAIT_MS, json: true }));
+    const patience = patienceOf(io);
+    const stdinWait = STDIN_WAIT_MS * patience;
+    const stdin = await before(deadlineIn(started, stdinWait + 50), io.readStdin({ timeoutMs: stdinWait, json: true }));
     if (!stdin.done) return EXIT.OK;
     const event = adapter.parse({ args: rest, stdin: stdin.value, env: io.env, cwd: io.cwd });
     if (event === null || typeof event !== "object") return EXIT.OK; // not an event huddle cares about
 
-    const budget = deadlineFor(event);
+    const budget = deadlineFor(event, patience);
     const deadline = deadlineIn(started, budget);
-    const prepared = await before(deadline, prepare(event, io, deadline, trace));
+    const prepared = await before(deadline, prepare(event, io, deadline, patience, trace));
     if (!prepared.done) {
       log(trace.paths, "hook", `${event.type}: gave up at its deadline of ${budget} ms`);
       return EXIT.OK;
