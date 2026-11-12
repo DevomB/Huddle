@@ -443,11 +443,15 @@ describe("local.json across processes", () => {
 
   test("processes that die holding the lock cost no committed update, and the lock keeps working", async () => {
     const paths = await makePaths();
-    const bumpers = Array.from({ length: 6 }, () => startWorker(paths, "bump", "80"));
-    const [first, second, third] = bumpers;
+    const bumpers = Array.from({ length: 4 }, () => startWorker(paths, "bump", "80"));
+    // Two more, to be killed. They go on until they are: on a busy machine the signal can be late, and a victim
+    // that had a fixed number of updates to make was now and then done before it arrived.
+    const victims = Array.from({ length: 2 }, () => startWorker(paths, "bump", "forever"));
+    const [first] = bumpers;
+    const [second, third] = victims;
     assert.ok(first && second && third);
     // Once the bumpers are contending, three processes take the lock and die inside their update,
-    // and two bumpers are killed at an arbitrary point of theirs.
+    // and the two victims are killed at an arbitrary point of theirs.
     await first.said(`${first.child.pid}-2\n`);
     const dying = Array.from({ length: 3 }, () => startWorker(paths, "die-holding"));
     await Promise.all([
@@ -457,7 +461,8 @@ describe("local.json across processes", () => {
     for (const result of await Promise.all(dying.map((d) => d.done))) {
       assert.equal(result.code, null, `a die-holding worker was not killed: ${result.stderr}`);
     }
-    const results = await Promise.all(bumpers.map((b) => b.done));
+    const finished = await Promise.all(bumpers.map((b) => b.done));
+    const killed = await Promise.all(victims.map((v) => v.done));
 
     // Whatever a dead holder left behind, the lock can be taken at once and the file is intact.
     await updateLocal(paths, () => {}, { waitMs: 0 });
@@ -468,17 +473,22 @@ describe("local.json across processes", () => {
     const stored = new Set(shared.files);
     assert.equal(stored.size, shared.files.length, "no entry was stored twice");
 
-    let survivors = 0;
-    for (const [i, result] of results.entries()) {
-      const printed = result.stdout.split("\n").filter(Boolean);
-      const missing = printed.filter((entry) => !stored.has(entry));
-      assert.deepEqual(missing, [], `bumper ${i} announced updates that were lost`);
-      if (result.code === 0) {
-        survivors++;
-        assert.equal(printed.length, 80, `bumper ${i} finished without making all of its updates`);
-      }
+    /** What a worker announced: each entry was printed after its update had returned. */
+    const announced = (result: Finished): string[] => result.stdout.split("\n").filter(Boolean);
+    for (const [i, result] of [...finished, ...killed].entries()) {
+      const missing = announced(result).filter((entry) => !stored.has(entry));
+      assert.deepEqual(missing, [], `worker ${i} announced updates that were lost`);
     }
-    assert.equal(survivors, 4, results.map((r) => `${r.code}: ${r.stderr}`).join("\n"));
+    // The four that were left alone made every one of their updates.
+    for (const [i, result] of finished.entries()) {
+      assert.equal(result.code, 0, `bumper ${i} failed: ${result.stderr}`);
+      assert.equal(announced(result).length, 80, `bumper ${i} finished without making all of its updates`);
+    }
+    // The two victims were at work when the signal ended them: past the update they were killed after, and not done.
+    for (const [i, result] of killed.entries()) {
+      assert.equal(result.code, null, `victim ${i} was not killed (exit code ${result.code}): ${result.stderr}`);
+      assert.ok(announced(result).length >= (i === 0 ? 11 : 26), `victim ${i} announced ${announced(result).length} updates`);
+    }
   });
 
   test("a reader never sees a partial file while a writer rewrites it", async () => {

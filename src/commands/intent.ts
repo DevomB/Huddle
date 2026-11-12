@@ -2,13 +2,13 @@
 
 import { parse } from "../core/args.ts";
 import { openContext } from "../core/context.ts";
-import { cleanText, LIMITS } from "../core/docs.ts";
 import { currentBranch } from "../core/files.ts";
 import { EXIT, UsageError } from "../core/io.ts";
 import type { Io } from "../core/io.ts";
 import { resolveSession } from "../core/session.ts";
 import { touchSession } from "../core/store.ts";
 import { spawnBackgroundSync } from "../core/sync.ts";
+import { toIntent } from "../hooks/intent.ts";
 
 export const summary = "Say what this session is doing: huddle intent \"<text>\"";
 
@@ -25,7 +25,8 @@ export async function run(args: string[], io: Io): Promise<number> {
   }
   if (values.clear && positionals.length > 0) throw new UsageError(`--clear takes no text\nUsage: ${USAGE}`);
 
-  const intent = values.clear ? "" : cleanText(positionals.join(" "), LIMITS.intent);
+  // The same function as for a prompt's intent, so that what looks like a credential is taken out on both paths.
+  const intent = values.clear ? "" : toIntent(positionals.join(" "));
   if (!values.clear && intent === "") throw new UsageError(`the intent is empty\nUsage: ${USAGE}`);
 
   await touchSession(ctx.paths, {

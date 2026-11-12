@@ -10,7 +10,7 @@ import { renderTasks } from "../core/render.ts";
 import { currentView, resolveSession } from "../core/session.ts";
 import { sync } from "../core/sync.ts";
 import { addTask, claimTask, dropTask, finishTask } from "../core/tasks.ts";
-import type { TaskResult, Who } from "../core/tasks.ts";
+import type { SyncFailure, TaskResult, Who } from "../core/tasks.ts";
 import { ID_RE } from "../core/types.ts";
 import type { Owner, TaskDoc } from "../core/types.ts";
 
@@ -53,13 +53,26 @@ function label(task: TaskDoc): string {
   return `[${task.id}] ${task.title}`;
 }
 
-/** A failure that is nobody's turn to act on but the user's: the remote could not be reached or refused us. */
-function remoteFailure(ctx: Ctx, reason: "offline" | "denied"): CliError {
-  return new CliError(
-    reason === "offline"
-      ? `could not reach remote "${ctx.config.remote}"; nothing was changed`
-      : `remote "${ctx.config.remote}" refused a push to refs/huddle/*; nothing was changed. Run "huddle doctor"`,
-  );
+/**
+ * Why a change stopped before anything was decided, in the user's words. Each
+ * one says what was at fault, because the next step differs: wait for the
+ * network, fix the remote, or just run the command again.
+ */
+export function notSynced(reason: SyncFailure, remote: string, logFile: string): string {
+  switch (reason) {
+    case "offline":
+      return `could not reach remote "${remote}"; nothing was changed`;
+    case "denied":
+      return `remote "${remote}" refused a push to refs/huddle/*; nothing was changed. Run "huddle doctor"`;
+    case "busy":
+      return "another huddle command is still syncing in this clone; nothing was changed. Run the command again";
+    case "sync-failed":
+      return `remote "${remote}" answered, but this clone's own state could not be published; nothing was changed. Run the command again; if it keeps failing, the reason is in ${logFile}`;
+  }
+}
+
+function syncStopped(ctx: Ctx, reason: SyncFailure): CliError {
+  return new CliError(notSynced(reason, ctx.config.remote, ctx.paths.logFile));
 }
 
 async function add(args: string[], io: Io): Promise<number> {
@@ -72,7 +85,7 @@ async function add(args: string[], io: Io): Promise<number> {
     io.out(`added ${label(result.task)}`);
     return EXIT.OK;
   }
-  if (result.reason === "offline" || result.reason === "denied") throw remoteFailure(ctx, result.reason);
+  if (result.reason === "offline" || result.reason === "denied") throw syncStopped(ctx, result.reason);
   throw new CliError(`could not add the task (${result.reason}); try again`);
 }
 
@@ -125,7 +138,9 @@ function refused(ctx: Ctx, verb: Verb, id: string, result: Extract<TaskResult, {
   switch (result.reason) {
     case "offline":
     case "denied":
-      throw remoteFailure(ctx, result.reason);
+    case "busy":
+    case "sync-failed":
+      throw syncStopped(ctx, result.reason);
     case "not-found":
       throw new CliError(`no task ${id}; see "huddle task list"`);
     case "already-done":

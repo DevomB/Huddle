@@ -11,7 +11,8 @@ import { openContext } from "../src/core/context.ts";
 import type { Ctx } from "../src/core/context.ts";
 import type { Io } from "../src/core/io.ts";
 import { touchSession } from "../src/core/store.ts";
-import { addTask, claimTask, dropTask, finishTask, syncFailure } from "../src/core/tasks.ts";
+import { notSynced } from "../src/commands/task.ts";
+import { addTask, claimTask, dropTask, finishTask, lookup, syncFailure } from "../src/core/tasks.ts";
 import { actorRef, taskRef } from "../src/core/types.ts";
 import type { TaskDoc, Transport } from "../src/core/types.ts";
 import { BUNDLE, createHarness } from "./harness.ts";
@@ -348,7 +349,7 @@ describe("huddle task", () => {
    * been active since. This is the state between a hook recording a session's
    * activity and the sync that publishes it.
    */
-  async function trailingTwin(name: string): Promise<{ twin: Clone; id: string }> {
+  async function trailingTwin(name: string): Promise<{ twin: Clone; id: string; actor: string }> {
     const twin = await h.clone(name);
     const id = await addVia(twin, "Shared desk", at(500));
     assert.equal((await twin.huddle(["task", "claim", id], { now: at(500), session: "beta" })).code, 0);
@@ -361,7 +362,7 @@ describe("huddle task", () => {
     const actor = readFileSync(join(twin.dir, ".git", "huddle", "actor"), "utf8").trim();
     const published = JSON.parse(remoteGit(h, ["cat-file", "blob", `${actorRef(actor)}:doc.json`])) as { sessions: { id: string; seenAt: string }[] };
     assert.equal(published.sessions.find((session) => session.id === "beta")?.seenAt, at(500), "setup: the remote copy of beta should still be the old one");
-    return { twin, id };
+    return { twin, id, actor };
   }
 
   test("a task held by another live session of the same clone is never taken over", async () => {
@@ -380,6 +381,43 @@ describe("huddle task", () => {
     rmSync((await twin.paths()).cacheFile);
     const attempt = await twin.huddle(["task", "claim", id], { now: at(515.5), session: "alpha" });
     assert.deepEqual([attempt.code, attempt.stdout.trim()], [3, `[${id}] Shared desk is taken by twin-without-cache / manual`]);
+    assert.equal(remoteTask(h, id).owner?.session, "beta");
+  });
+
+  test("lookup judges this clone's own sessions by what the clone knows, not by its published copy", async () => {
+    // Since sync publishes a woken session before the task is looked up, the two
+    // tests above no longer depend on this. What is left is a session that comes
+    // back between the claimer's sync and its lookup, which no command can be
+    // made to hit. So lookup is asked directly, with no sync in between.
+    const { twin, id, actor } = await trailingTwin("twin-lookup");
+    const cached = JSON.parse(readFileSync((await twin.paths()).cacheFile, "utf8")) as { refs: Record<string, { doc: { sessions?: { id: string; seenAt: string }[] } }> };
+    const copy = cached.refs[actorRef(actor)]?.doc.sessions?.find((session) => session.id === "beta");
+    assert.equal(copy?.seenAt, at(500), "setup: the cached copy of this clone's document should show beta as last seen at 500");
+
+    // 15.5 minutes after the cached sign of life, 1.5 after the one this clone recorded: live.
+    const soon = await lookup(await ctxFor(twin, at(515.5), "alpha"), id, "alpha");
+    assert.equal(soon?.task.ownerLive, true);
+    assert.equal(soon?.task.owner?.session, "beta");
+    // And it is the recorded sign of life that counts, not "always live": 15.5 minutes after that one, beta is gone.
+    const later = await lookup(await ctxFor(twin, at(529.5), "alpha"), id, "alpha");
+    assert.equal(later?.task.ownerLive, false);
+  });
+
+  test("a session that wakes up just after another session of its clone published keeps its task against other clones", async () => {
+    // Other clones have only the published copy to go by. beta's copy is 13 minutes
+    // old when beta wakes up; its sync has to send the new sign of life at once
+    // (sync's rule for a session a heartbeat ahead of what teammates hold), or
+    // another clone would take the task 90 seconds after its owner was last at work.
+    const twin = await h.clone("twin-seen-from-outside");
+    const outsider = await h.clone("outsider");
+    const id = await addVia(twin, "Shared desk", at(500));
+    assert.equal((await twin.huddle(["task", "claim", id], { now: at(500), session: "beta" })).code, 0);
+    assert.equal((await twin.huddle(["intent", "something else"], { now: at(513), session: "alpha" })).code, 0);
+    assert.equal((await twin.huddle(["sync"], { now: at(513), session: "alpha" })).code, 0);
+    assert.equal((await twin.huddle(["sync"], { now: at(514), session: "beta" })).code, 0);
+
+    const attempt = await outsider.huddle(["task", "claim", id], { now: at(515.5) });
+    assert.deepEqual([attempt.code, attempt.stdout.trim()], [3, `[${id}] Shared desk is taken by twin-seen-from-outside / manual`]);
     assert.equal(remoteTask(h, id).owner?.session, "beta");
   });
 
@@ -638,11 +676,22 @@ describe("tasks.ts", () => {
     // The fetch worked and our own push was refused: the task push would be refused as well.
     assert.equal(syncFailure({ ...round, error: "denied" }), "denied");
     assert.equal(syncFailure({ ...round, error: "offline" }), "offline", "our session may not be on the remote yet");
-    assert.equal(syncFailure({ ...round, error: "lost-race" }), "offline");
-    assert.equal(syncFailure({ ran: false, fetched: false, published: false, error: "internal" }), "offline");
-    // Another sync held the lock for the whole wait: no error, and no fresh state either.
-    assert.equal(syncFailure({ ran: false, skipped: "locked", fetched: false, published: false }), "offline");
-    assert.equal(syncFailure({ ran: false, skipped: "throttled", fetched: false, published: false }), "offline");
+    // The remote answered and our own document lost its push, or something broke on our side: not the network.
+    assert.equal(syncFailure({ ...round, error: "lost-race" }), "sync-failed");
+    assert.equal(syncFailure({ ran: false, fetched: false, published: false, error: "internal" }), "sync-failed");
+    // Another sync held the lock for the whole wait: no error, no fresh state, and the remote was never asked.
+    assert.equal(syncFailure({ ran: false, skipped: "locked", fetched: false, published: false }), "busy");
+    assert.equal(syncFailure({ ran: false, skipped: "throttled", fetched: false, published: false }), "busy");
+  });
+
+  test("each reason a change stopped before it was decided is told apart, and only the network is called the network", () => {
+    const say = (reason: Parameters<typeof notSynced>[0]): string => notSynced(reason, "origin", "/repo/.git/huddle/log");
+    assert.equal(say("offline"), 'could not reach remote "origin"; nothing was changed');
+    assert.equal(say("denied"), 'remote "origin" refused a push to refs/huddle/*; nothing was changed. Run "huddle doctor"');
+    assert.equal(say("busy"), "another huddle command is still syncing in this clone; nothing was changed. Run the command again");
+    assert.match(say("sync-failed"), /^remote "origin" answered, but this clone's own state could not be published; nothing was changed\. Run the command again; .* \/repo\/\.git\/huddle\/log$/);
+    for (const reason of ["busy", "sync-failed"] as const) assert.doesNotMatch(say(reason), /could not reach/);
+    for (const reason of ["offline", "denied", "busy", "sync-failed"] as const) assert.match(say(reason), /nothing was changed/);
   });
 
   test("an unknown task is not-found for every change", async () => {
@@ -650,5 +699,30 @@ describe("tasks.ts", () => {
     for (const change of [claimTask, finishTask, dropTask]) {
       assert.deepEqual(await change(ctx, "zzzzzzzz", who), { ok: false, reason: "not-found" });
     }
+  });
+
+  // Last in this block: it runs at a later time than the tests above.
+  test("when this clone's own document loses its push, nothing is decided and the remote is not blamed", async () => {
+    const late = { session: "alice-late", agent: "manual" };
+    const ctx = await ctxFor(alice, at(900), late.session);
+    const added = await addTask(ctx, "Needs its owner published first", late);
+    assert.ok(added.ok);
+    // A second writer of this clone's ref (a copy of the repository) gets in first, every time.
+    const real = ctx.transport;
+    const own = actorRef(ctx.identity.actor);
+    let taskPushes = 0;
+    ctx.transport = {
+      fetchAll: (known) => real.fetchAll(known),
+      remove: (target, expect) => real.remove(target, expect),
+      publish: async (target, doc, expect) => {
+        if (target === own) return { ok: false, reason: "lost-race" };
+        taskPushes++;
+        return real.publish(target, doc, expect);
+      },
+    };
+    // The claimer's session is new, so the sync has to publish it, and cannot.
+    assert.deepEqual(await claimTask(ctx, added.task.id, late), { ok: false, reason: "sync-failed" });
+    assert.equal(taskPushes, 0, "the claim must not be pushed when its owner's session is not on the remote");
+    assert.equal(remoteTask(h, added.task.id).status, "open");
   });
 });
