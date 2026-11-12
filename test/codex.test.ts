@@ -382,6 +382,10 @@ test("install: an empty repo gets .codex/hooks.json with one handler per event",
   const { root, file } = await scratchRepo(t);
   const result = await codex.install({ repoRoot: root, bundle: BUNDLE });
   assert.deepEqual(result.changed, [".codex/hooks.json"]);
+  // What the team commits, named whether or not this run changed it.
+  assert.deepEqual((result as { files?: string[] }).files, [".codex/hooks.json"]);
+  const again = await codex.install({ repoRoot: root, bundle: BUNDLE });
+  assert.deepEqual([again.changed, (again as { files?: string[] }).files], [[], [".codex/hooks.json"]]);
   assert.equal(result.notes.length, 1);
   assert.match(result.notes[0] ?? "", /trust the project/);
   assert.match(result.notes[0] ?? "", /\/hooks/);
@@ -718,8 +722,10 @@ test("check: reports what install left, and what is still missing", async (t) =>
   assert.deepEqual(await checkCodex(root, around), { installed: false, detail: ".codex/hooks.json not found. Run huddle init.", notes: [] });
 
   await codex.install({ repoRoot: root, bundle: BUNDLE });
+  // Never installed is one thing; there and not able to work is `broken`, which doctor warns about.
   assert.deepEqual(await checkCodex(root, around), {
     installed: false,
+    broken: true,
     detail: "hooks in .codex/hooks.json run .huddle/huddle.mjs, which is not in this checkout. Run huddle init.",
     notes: [],
   });
@@ -757,7 +763,7 @@ test("check: a file with no huddle hooks, or that cannot be read, is not install
     assert.deepEqual(await checkCodex(root, around), { installed: false, detail: "no huddle hooks in .codex/hooks.json. Run huddle init.", notes: [] });
   }
   const { root } = await scratchRepo(t, "{ nope");
-  assert.deepEqual(await checkCodex(root, around), { installed: false, detail: ".codex/hooks.json cannot be read as a JSON object. Fix the file, then run huddle init.", notes: [] });
+  assert.deepEqual(await checkCodex(root, around), { installed: false, broken: true, detail: ".codex/hooks.json cannot be read as a JSON object. Fix the file, then run huddle init.", notes: [] });
 });
 
 test("check: reads the hooks feature switch out of a config.toml", () => {

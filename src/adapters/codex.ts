@@ -35,9 +35,9 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { asRecord, asText, checkHooks, clip, contextOutput, exists, installHooks, onPath } from "./json-hooks.ts";
-import type { HookFile, Json, Registration } from "./json-hooks.ts";
+import type { Check, HookFile, Installed, Json, Registration } from "./json-hooks.ts";
 import { SILENT } from "./types.ts";
-import type { Adapter, CheckResult, HookEvent, HookEventType, HookInput, HookOutcome, HookOutput, InstallOptions, InstallResult } from "./types.ts";
+import type { Adapter, HookEvent, HookEventType, HookInput, HookOutcome, HookOutput, InstallOptions } from "./types.ts";
 
 const NAME = "codex";
 const HOOKS = ".codex/hooks.json";
@@ -244,9 +244,9 @@ const HOOKS_FILE: HookFile = {
 const TRUST_NOTE =
   "Codex runs a project's hooks only after two steps, which each teammate does once: trust the project when Codex asks, then review the hooks by running /hooks in Codex and trusting huddle's. Codex asks for that review again whenever a hook's definition changes.";
 
-async function install(opts: InstallOptions): Promise<InstallResult> {
+async function install(opts: InstallOptions): Promise<Installed> {
   const changed = await installHooks(HOOKS_FILE, opts.repoRoot, opts.bundle);
-  return { changed: changed ? [HOOKS] : [], notes: [TRUST_NOTE] };
+  return { changed: changed ? [HOOKS] : [], notes: [TRUST_NOTE], files: [HOOKS] };
 }
 
 // ---------------------------------------------------------------------------
@@ -304,7 +304,7 @@ async function hooksFeatureIn(path: string): Promise<boolean | undefined> {
 }
 
 /** check(), with the surroundings passed in. */
-export async function checkCodex(repoRoot: string, around: Surroundings): Promise<CheckResult> {
+export async function checkCodex(repoRoot: string, around: Surroundings): Promise<Check> {
   const { result } = await checkHooks(HOOKS_FILE, repoRoot);
   if (!result.installed) return result;
   const notes = [TRUST_NOTE];

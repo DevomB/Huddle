@@ -2,7 +2,11 @@
 //
 //   { "hooks": { "<Event>": [ { "matcher": "...", "hooks": [ <handler>, ... ] } ] } }
 //
-// which is Claude Code's .claude/settings.json and Codex's .codex/hooks.json.
+// which is Claude Code's .claude/settings.json and Codex's .codex/hooks.json,
+// or of the flat shape Cursor's .cursor/hooks.json has (HookFile.flat):
+//
+//   { "version": 1, "hooks": { "<event>": [ <handler>, ... ] } }
+//
 // What differs per agent is the list of events, the handler huddle writes and
 // how to recognize that handler again. The adapter supplies those in a
 // HookFile; merging, writing and checking the file are the same for all.
@@ -10,7 +14,7 @@
 import { chmod, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { delimiter, dirname, join } from "node:path";
 import { CliError } from "../core/io.ts";
-import type { CheckResult, HookEventType } from "./types.ts";
+import type { CheckResult, HookEventType, InstallResult } from "./types.ts";
 
 export type Json = Record<string, unknown>;
 
@@ -42,6 +46,14 @@ export interface HookFile {
   /** Repo-relative path of the file, forward slashes. Also its name in messages. */
   path: string;
   registrations: readonly Registration[];
+  /**
+   * Each item of an event's list is a handler itself and carries its own
+   * matcher; there are no groups. handlerFor() then returns the whole item,
+   * matcher included.
+   */
+  flat?: boolean;
+  /** A top-level "version" the agent requires. Written when the file has none; one that is there is left alone. */
+  version?: number;
   /** The handler huddle registers for an event, for a bundle at this repo-relative path. */
   handlerFor(registration: Registration, bundle: string): Json;
   /**
@@ -132,6 +144,33 @@ function placeHandler(file: HookFile, groups: unknown[], registration: Registrat
   return changed;
 }
 
+/**
+ * The same for a flat list, whose items are the handlers: exactly one huddle
+ * handler, the wanted one, where the first of them stood.
+ */
+function placeFlat(file: HookFile, items: unknown[], wanted: Json): boolean {
+  let placed = false;
+  let changed = false;
+  for (let i = 0; i < items.length; i++) {
+    if (!file.isOurs(items[i])) continue;
+    if (placed) {
+      items.splice(i--, 1);
+      changed = true;
+      continue;
+    }
+    if (!sameJson(items[i], wanted)) {
+      items[i] = wanted;
+      changed = true;
+    }
+    placed = true;
+  }
+  if (!placed) {
+    items.push(wanted);
+    changed = true;
+  }
+  return changed;
+}
+
 function refuse(file: HookFile, problem: string): never {
   throw new CliError(`${file.path} ${problem}. huddle will not overwrite it: fix the file, then run huddle init again.`);
 }
@@ -150,9 +189,22 @@ function parseFile(file: HookFile, text: string): Json {
   return asRecord(parsed) ?? refuse(file, "does not hold a JSON object");
 }
 
+/** What a top-level "version" has to be. */
+export function isVersion(value: unknown): boolean {
+  return typeof value === "number" && Number.isInteger(value) && value > 0;
+}
+
 /** Adds huddle's handlers to the parsed file, in place. Returns whether anything changed. */
 function mergeHooks(file: HookFile, settings: Json, bundle: string): boolean {
   let changed = false;
+  if (file.version !== undefined) {
+    if (settings.version === undefined) {
+      settings.version = file.version;
+      changed = true;
+    } else if (!isVersion(settings.version)) {
+      refuse(file, 'has a "version" that is not a positive whole number');
+    }
+  }
   if (settings.hooks === undefined) {
     settings.hooks = {};
     changed = true;
@@ -162,10 +214,10 @@ function mergeHooks(file: HookFile, settings: Json, bundle: string): boolean {
     const wanted = file.handlerFor(registration, bundle);
     const groups = hooks[registration.event];
     if (groups === undefined) {
-      hooks[registration.event] = [groupFor(registration, wanted)];
+      hooks[registration.event] = [file.flat === true ? wanted : groupFor(registration, wanted)];
       changed = true;
     } else if (Array.isArray(groups)) {
-      if (placeHandler(file, groups, registration, wanted)) changed = true;
+      if (file.flat === true ? placeFlat(file, groups, wanted) : placeHandler(file, groups, registration, wanted)) changed = true;
     } else {
       refuse(file, `has a "hooks.${registration.event}" entry that is not a list`);
     }
@@ -259,6 +311,17 @@ export async function readJsonObject(path: string): Promise<Json | null | "inval
 
 type Standing = "ok" | "differs" | "missing";
 
+/**
+ * `broken`: the hooks are there and cannot work as they are, which doctor
+ * warns about; an adapter that was never installed is only mentioned.
+ * `files`: every file of the adapter that the team commits, changed by this
+ * run or not, which init uses to say what is still to be committed. Both are
+ * optional fields of the contract that T2.3 adds to types.ts; until that is
+ * merged they are spelled out here.
+ */
+export type Check = CheckResult & { broken?: boolean };
+export type Installed = InstallResult & { files?: string[] };
+
 /** How one event's registration stands, plus the bundle its handler runs. */
 function standingOf(file: HookFile, hooks: Json | null, registration: Registration): { standing: Standing; bundle: string | null } {
   const groups = hooks === null ? undefined : hooks[registration.event];
@@ -267,14 +330,17 @@ function standingOf(file: HookFile, hooks: Json | null, registration: Registrati
   let bundle: string | null = null;
   for (const item of Array.isArray(groups) ? groups : []) {
     const group = asRecord(item);
-    for (const candidate of group !== null && Array.isArray(group.hooks) ? (group.hooks as unknown[]) : []) {
+    const candidates = file.flat === true ? [item] : group !== null && Array.isArray(group.hooks) ? (group.hooks as unknown[]) : [];
+    for (const candidate of candidates) {
       const handler = asRecord(candidate);
       if (handler === null || !file.isOurs(handler)) continue;
       found++;
       const runs = file.bundleOf(handler);
       if (bundle === null) bundle = runs;
+      // A flat handler holds its matcher, so comparing the handler compares that too.
+      const matcherFits = file.flat === true || sameMatcher(group?.matcher, registration.matcher);
       // "Exact" is what install would write for the bundle this handler already points at.
-      if (runs !== null && sameMatcher(group?.matcher, registration.matcher) && sameJson(handler, file.handlerFor(registration, runs))) exact = true;
+      if (runs !== null && matcherFits && sameJson(handler, file.handlerFor(registration, runs))) exact = true;
     }
   }
   return { standing: found === 0 ? "missing" : found === 1 && exact ? "ok" : "differs", bundle };
@@ -286,26 +352,30 @@ function standingOf(file: HookFile, hooks: Json | null, registration: Registrati
  * that are the adapter's own. `notes` is empty: the adapter knows which manual
  * steps its agent needs.
  */
-export async function checkHooks(file: HookFile, repoRoot: string): Promise<{ result: CheckResult; settings: Json | null }> {
-  const no = (detail: string, settings: Json | null = null) => ({ result: { installed: false, detail, notes: [] }, settings });
+export async function checkHooks(file: HookFile, repoRoot: string): Promise<{ result: Check; settings: Json | null }> {
+  const no = (detail: string, settings: Json | null, broken: boolean): { result: Check; settings: Json | null } => ({
+    result: broken ? { installed: false, broken: true, detail, notes: [] } : { installed: false, detail, notes: [] },
+    settings,
+  });
   const settings = await readJsonObject(join(repoRoot, file.path));
-  if (settings === null) return no(`${file.path} not found. Run huddle init.`);
-  if (settings === "invalid") return no(`${file.path} cannot be read as a JSON object. Fix the file, then run huddle init.`);
+  if (settings === null) return no(`${file.path} not found. Run huddle init.`, null, false);
+  // The agent reads this file for more than huddle's hooks, and cannot read it either.
+  if (settings === "invalid") return no(`${file.path} cannot be read as a JSON object. Fix the file, then run huddle init.`, null, true);
 
   const hooks = asRecord(settings.hooks);
   const standings = file.registrations.map((registration) => ({ event: registration.event, ...standingOf(file, hooks, registration) }));
   const missing = standings.filter((item) => item.standing === "missing").map((item) => item.event);
   const differing = standings.filter((item) => item.standing === "differs").map((item) => item.event);
-  if (missing.length === file.registrations.length) return no(`no huddle hooks in ${file.path}. Run huddle init.`, settings);
+  if (missing.length === file.registrations.length) return no(`no huddle hooks in ${file.path}. Run huddle init.`, settings, false);
   if (missing.length > 0 || differing.length > 0) {
     const parts: string[] = [];
     if (missing.length > 0) parts.push(`missing for ${missing.join(", ")}`);
     if (differing.length > 0) parts.push(`not what this version installs for ${differing.join(", ")}`);
-    return no(`huddle hooks in ${file.path} are ${parts.join(" and ")}. Run huddle init.`, settings);
+    return no(`huddle hooks in ${file.path} are ${parts.join(" and ")}. Run huddle init.`, settings, true);
   }
   // Every handler is "ok", so every one names its bundle.
   for (const bundle of new Set(standings.map((item) => item.bundle ?? ""))) {
-    if (!(await exists(join(repoRoot, bundle)))) return no(`hooks in ${file.path} run ${bundle}, which is not in this checkout. Run huddle init.`, settings);
+    if (!(await exists(join(repoRoot, bundle)))) return no(`hooks in ${file.path} run ${bundle}, which is not in this checkout. Run huddle init.`, settings, true);
   }
   return { result: { installed: true, detail: `${file.registrations.length} hooks in ${file.path}`, notes: [] }, settings };
 }

@@ -593,6 +593,10 @@ test("install: an empty repo gets .claude/settings.json with one exec-form handl
   const { root, file } = await scratchRepo(t);
   const result = await claudeCode.install({ repoRoot: root, bundle: BUNDLE });
   assert.deepEqual(result.changed, [".claude/settings.json"]);
+  // What the team commits, named whether or not this run changed it.
+  assert.deepEqual((result as { files?: string[] }).files, [".claude/settings.json"]);
+  const again = await claudeCode.install({ repoRoot: root, bundle: BUNDLE });
+  assert.deepEqual([again.changed, (again as { files?: string[] }).files], [[], [".claude/settings.json"]]);
   assertStandingNotes(result.notes);
 
   const text = await readFile(file, "utf8");
@@ -927,8 +931,10 @@ test("check: reports what install left, and what is still missing", async (t) =>
   assert.deepEqual(await checkClaudeCode(root, around), { installed: false, detail: ".claude/settings.json not found. Run huddle init.", notes: [] });
 
   await claudeCode.install({ repoRoot: root, bundle: BUNDLE });
+  // Never installed is one thing; there and not able to work is `broken`, which doctor warns about.
   assert.deepEqual(await checkClaudeCode(root, around), {
     installed: false,
+    broken: true,
     detail: "hooks in .claude/settings.json run .huddle/huddle.mjs, which is not in this checkout. Run huddle init.",
     notes: [],
   });
@@ -958,6 +964,7 @@ test("check: reports what install left, and what is still missing", async (t) =>
   await writeFile(file, JSON.stringify(settings));
   assert.deepEqual(await checkClaudeCode(root, around), {
     installed: false,
+    broken: true,
     detail: "huddle hooks in .claude/settings.json are missing for Stop, SessionEnd. Run huddle init.",
     notes: [],
   });
@@ -986,7 +993,7 @@ test("check: settings with no huddle hooks, or that cannot be read, are not inst
     const { root } = await scratchRepo(t, content);
     assert.deepEqual(
       await checkClaudeCode(root, around),
-      { installed: false, detail: ".claude/settings.json cannot be read as a JSON object. Fix the file, then run huddle init.", notes: [] },
+      { installed: false, broken: true, detail: ".claude/settings.json cannot be read as a JSON object. Fix the file, then run huddle init.", notes: [] },
       content,
     );
   }
@@ -1006,6 +1013,7 @@ test("check: a doubled or shell-form handler is reported as not what this versio
   await withBundle(second.root);
   const result = await checkClaudeCode(second.root, around);
   assert.equal(result.installed, false);
+  assert.equal(result.broken, true);
   assert.match(result.detail, /not what this version installs for Stop/);
 });
 

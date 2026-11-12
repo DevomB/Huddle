@@ -28,6 +28,9 @@
 //   moved with /cd, runs none of these hooks. install() and check() say so.
 // - It reads .claude/settings.local.json from the repository root, and in a
 //   linked worktree from the main checkout's root.
+//
+// Cursor loads this file's hooks as well. They do nothing there: see
+// parsePayload().
 
 import { exec, execFile } from "node:child_process";
 import { realpath } from "node:fs/promises";
@@ -35,9 +38,9 @@ import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { locateRepo } from "../core/paths.ts";
 import { asRecord, asText, checkHooks, clip, contextOutput, exists, installHooks, onPath, readJsonObject } from "./json-hooks.ts";
-import type { HookFile, Json, Registration } from "./json-hooks.ts";
+import type { Check, HookFile, Installed, Json, Registration } from "./json-hooks.ts";
 import { SILENT } from "./types.ts";
-import type { Adapter, CheckResult, HookEvent, HookEventType, HookInput, HookOutcome, HookOutput, InstallOptions, InstallResult } from "./types.ts";
+import type { Adapter, HookEvent, HookEventType, HookInput, HookOutcome, HookOutput, InstallOptions } from "./types.ts";
 
 const NAME = "claude-code";
 const SETTINGS = ".claude/settings.json";
@@ -174,6 +177,13 @@ function shellChangedPaths(payload: Json): string[] {
 function parsePayload(input: HookInput): HookEvent | null {
   const payload = asRecord(JSON.parse(input.stdin));
   if (payload === null) return null;
+  // Cursor runs the hooks in .claude/settings.json too, unless that is
+  // switched off there (https://cursor.com/docs/reference/third-party-hooks,
+  // read 2026-11-12), and every payload of Cursor's carries `cursor_version`.
+  // Such a session is the Cursor adapter's. And an answer in Claude Code's
+  // form is not safe to give Cursor: on its PreToolUse, a response it cannot
+  // match to its schema blocks the tool call.
+  if (asText(payload.cursor_version) !== "") return null;
   const nativeEvent = asText(payload.hook_event_name);
   const type = TYPE_OF_EVENT.get(nativeEvent);
   const sessionId = asText(payload.session_id).trim();
@@ -319,9 +329,9 @@ const TRUST_NOTE =
   "In an interactive session Claude Code runs a project's hooks only once its workspace trust dialog has been accepted for the folder. Each teammate is asked the first time they start claude in the repo.";
 const NOTES: readonly string[] = [ROOT_NOTE, NODE_NOTE, TRUST_NOTE];
 
-async function install(opts: InstallOptions): Promise<InstallResult> {
+async function install(opts: InstallOptions): Promise<Installed> {
   const changed = await installHooks(SETTINGS_FILE, opts.repoRoot, opts.bundle);
-  return { changed: changed ? [SETTINGS] : [], notes: [...NOTES] };
+  return { changed: changed ? [SETTINGS] : [], notes: [...NOTES], files: [SETTINGS] };
 }
 
 // ---------------------------------------------------------------------------
@@ -409,7 +419,7 @@ function hooksDisabledBy(layers: Array<{ name: string; settings: Json | null | "
 }
 
 /** check(), with the surroundings passed in. */
-export async function checkClaudeCode(repoRoot: string, around: Surroundings): Promise<CheckResult> {
+export async function checkClaudeCode(repoRoot: string, around: Surroundings): Promise<Check> {
   const { result, settings } = await checkHooks(SETTINGS_FILE, repoRoot);
   if (!result.installed) return result;
   const notes = [...NOTES];
