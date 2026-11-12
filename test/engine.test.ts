@@ -11,7 +11,7 @@ import { join, relative } from "node:path";
 import { test } from "node:test";
 import type { HookEvent, HookEventType } from "../src/adapters/types.ts";
 import type { Io } from "../src/core/io.ts";
-import { OVERLAP_HINT } from "../src/core/render.ts";
+import { OVERLAP_HINT, shownText } from "../src/core/render.ts";
 import type { ActorDoc } from "../src/core/types.ts";
 import { DEADLINE_MS, handleEvent, sessionIdOf } from "../src/hooks/engine.ts";
 import { REDACTED } from "../src/hooks/intent.ts";
@@ -628,6 +628,13 @@ test("a warning never grows past 4000 characters: what does not fit is counted, 
   assert.ok(south.startsWith(`${overlapHead("south.ts")}\n`) && south.endsWith(`\n${SAY_SO}`), south.slice(-300));
   const together = north.length - moreNote(1).length + south.length;
   assert.ok(together > 4000 && together < 4100, `the two blocks and the line break between them are ${together} characters`);
+
+  // The line that counts the rest shows the path the way the first line of the warning does, "<" and ">" included.
+  await cacheTeam(bob, 10, crowd(15, ["<tag>.ts"], "y"));
+  const shown = shownText("<tag>.ts", 200);
+  assert.notEqual(shown, "<tag>.ts");
+  const tagged = ((await fire(bob, "pre-edit", 60, { paths: ["<tag>.ts"] })).context ?? "").split("\n");
+  assert.deepEqual([tagged.length, tagged[0], tagged.at(-1)], [17, overlapHead(shown), unnamedNote(1, shown)]);
 });
 
 test("one session always fits in a warning: the longest names there can be, in characters that count double", async (t) => {

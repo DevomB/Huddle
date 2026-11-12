@@ -19,7 +19,8 @@
 //     characters, has punctuation in it, or is broken by a line wrap
 //   - the one-letter flags of particular tools, other than -p after -u,
 //     sshpass -p and curl -u
-//   - text written to get past it, with characters that only look like "="
+//   - text written to get past it: a character that only looks like "=", an
+//     invisible one inside a name
 //
 // `captureIntent: false` is the switch for a team that cannot accept that.
 

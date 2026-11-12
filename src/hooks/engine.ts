@@ -78,7 +78,7 @@ import type { Io } from "../core/io.ts";
 import { log } from "../core/log.ts";
 import { ensureStateDir, isSetUp, loadConfig, locateRepo, sameDirectory } from "../core/paths.ts";
 import type { RepoPaths } from "../core/paths.ts";
-import { DEFAULT_BRIEFING_CHARS, formatAge, renderBriefing, renderOverlaps } from "../core/render.ts";
+import { DEFAULT_BRIEFING_CHARS, formatAge, renderBriefing, renderOverlaps, shownText } from "../core/render.ts";
 import { currentView, resolveSession } from "../core/session.ts";
 import { readCache, readLocal, readSeen, removeSeen, removeSession, updateLocal, writeFileAtomic, writeSeen } from "../core/store.ts";
 import { spawnBackgroundSync, syncWithin } from "../core/sync.ts";
@@ -639,9 +639,9 @@ function moreNote(count: number): string {
   return `[huddle] ${count} more of the paths in this edit overlap teammates' work as well: run \`huddle check\` with those paths.`;
 }
 
-/** The line after the block of a path that has more sessions on it than the block names. */
+/** The line after the block of a path that has more sessions on it than the block names. The path is shown as the block's first line shows it. */
 function unnamedNote(count: number, path: string): string {
-  return `[huddle] ${count} more ${count === 1 ? "session overlaps" : "sessions overlap"} ${cleanText(path, 200)} as well: run \`huddle check\` with that path to see them all.`;
+  return `[huddle] ${count} more ${count === 1 ? "session overlaps" : "sessions overlap"} ${shownText(path, 200)} as well: run \`huddle check\` with that path to see them all.`;
 }
 
 /**
