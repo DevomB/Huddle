@@ -7,6 +7,7 @@ import type { Attributed, DecideResult } from "../core/decisions.ts";
 import { cleanText, LIMITS } from "../core/docs.ts";
 import { EXIT, UsageError } from "../core/io.ts";
 import type { Io } from "../core/io.ts";
+import { shownText } from "../core/render.ts";
 import { resolveSession } from "../core/session.ts";
 import { scrubSecrets } from "../hooks/intent.ts";
 import { ID_RE } from "../core/types.ts";
@@ -50,9 +51,14 @@ export async function run(args: string[], io: Io): Promise<number> {
   return report(result, { remote: ctx.config.remote, supersedes }, io);
 }
 
-/** "[id] text (user / agent)", the way `huddle decisions` lists one. */
+/**
+ * "[id] text (user / agent)", the way `huddle decisions` lists one. It is a
+ * teammate's text and an agent may be the one reading it, so it is shown as
+ * the renderer shows it (render.ts, shownText): one line, without "<" or ">".
+ */
 function shown({ decision, user }: Attributed): string {
-  return `[${decision.id}] ${decision.text} (${cleanText(user, LIMITS.name) || "unknown"} / ${cleanText(decision.agent, LIMITS.name) || "unknown"})`;
+  const text = shownText(decision.text, LIMITS.decisionText);
+  return `[${shownText(decision.id, 40)}] ${text} (${shownText(user, LIMITS.name) || "unknown"} / ${shownText(decision.agent, LIMITS.name) || "unknown"})`;
 }
 
 /**

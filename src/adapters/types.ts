@@ -125,10 +125,31 @@ export interface InstallResult {
   changed: string[];
   /** Things the user still has to do by hand (trust a project, review hooks, ...). */
   notes: string[];
+  /**
+   * Every file of this adapter that the team commits, repo-relative, whether
+   * this run changed it or not. `huddle init` uses it to name what is still
+   * to be committed. An adapter with such files should set it: without it
+   * init goes by `changed`, and a file that an earlier run wrote and nobody
+   * committed is not named again.
+   */
+  files?: string[];
 }
 
 export interface CheckResult {
   installed: boolean;
+  /**
+   * Optional: true when hooks are there but cannot work as they are (some are
+   * missing, a settings file is not valid). `huddle doctor` warns about that;
+   * an adapter that was simply never installed is only mentioned.
+   */
+  broken?: boolean;
+  /**
+   * Optional, when `installed`: the files that hold this adapter's hooks and
+   * that the team commits, repo-relative. `huddle doctor` warns when one of
+   * them is not committed, because teammates then do not get the hooks by
+   * pulling. Hooks that live outside the worktree (.git/hooks) are not listed.
+   */
+  files?: string[];
   /** One line for `huddle doctor`. */
   detail: string;
   /** Manual steps the user may still need, shown by doctor. */
