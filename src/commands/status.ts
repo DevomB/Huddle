@@ -5,8 +5,9 @@ import { openContext } from "../core/context.ts";
 import { EXIT, UsageError } from "../core/io.ts";
 import type { Io } from "../core/io.ts";
 import { renderStatus } from "../core/render.ts";
-import { currentView, resolveSession } from "../core/session.ts";
+import { envelope, readTeam, refreshOutcome, resolveSession } from "../core/session.ts";
 import { sync } from "../core/sync.ts";
+import type { RefreshOutcome } from "../core/view.ts";
 
 export const summary = "Show who is working on what";
 
@@ -22,19 +23,18 @@ export async function run(args: string[], io: Io): Promise<number> {
   const ctx = await openContext(io);
 
   // Refresh first unless told not to. Throttled like any sync, so a status
-  // right after another sync costs nothing; a failure just means cached data.
-  let warning = "";
-  if (!values.cached) {
-    const result = await sync(ctx);
-    if (result.error === "offline") warning = `could not reach remote "${ctx.config.remote}"; showing the last known state`;
-    else if (result.error === "denied") warning = `remote "${ctx.config.remote}" refused a push to refs/huddle/*; run "huddle doctor"`;
-  }
+  // right after another sync costs nothing; a failure just means cached data,
+  // and the warnings say so the same way in text and in JSON (CONTRACT 4.2).
+  let refresh: RefreshOutcome = "none";
+  if (!values.cached) refresh = refreshOutcome(await sync(ctx));
 
   const me = await resolveSession(ctx);
-  const view = await currentView(ctx, me.id);
+  const team = await readTeam(ctx, me.id, refresh);
+  const view = team.view;
 
   if (values.json) {
-    io.out(JSON.stringify({ you: { actor: ctx.identity.actor, user: ctx.identity.user, session: me.session }, ...view }, null, 2));
+    io.out(JSON.stringify({ you: { actor: ctx.identity.actor, user: ctx.identity.user, session: me.session }, ...view, ...envelope(team) }, null, 2));
+    for (const warning of team.warnings) io.err(`huddle: ${warning}`);
     return EXIT.OK;
   }
 
@@ -46,6 +46,6 @@ export async function run(args: string[], io: Io): Promise<number> {
     io.out(`You: ${ctx.identity.user}. Not announced yet: run huddle intent "<what you are doing>" or huddle sync.`);
   }
   io.out(renderStatus(view));
-  if (warning) io.err(`huddle: ${warning}`);
+  for (const warning of team.warnings) io.err(`huddle: ${warning}`);
   return EXIT.OK;
 }

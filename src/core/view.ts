@@ -159,6 +159,7 @@ export function buildView(cache: Cache, self: Self, now: Date, opts: ViewOptions
           ...session,
           files: [...session.files],
           claims: [...session.claims],
+          ...(session.partial === undefined ? {} : { partial: { total: session.partial.total, cover: [...session.partial.cover] } }),
           actor: doc.actor,
           user: doc.user,
           host: doc.host,
@@ -244,8 +245,14 @@ function isNormalized(path: string): boolean {
 
 export interface Overlap {
   session: ViewSession;
-  /** The path is one of the session's files in flight, or it matches one of its claim globs. */
-  via: "file" | "claim";
+  /**
+   * "file": the path is one of the session's files in flight. "claim": it
+   * matches one of the session's claims. "coverage": it matches a glob huddle
+   * generated because the session has more files in flight than it could
+   * list (Session.partial): conservative, the file may not be one of them.
+   * All three are an overlap.
+   */
+  via: "file" | "claim" | "coverage";
   /** The file or the glob that matched. */
   match: string;
 }
@@ -277,7 +284,90 @@ export function overlaps(view: TeamView, path: string): Overlap[] {
       continue;
     }
     const claim = session.claims.find((candidate) => claimMatches(candidate, target));
-    if (claim !== undefined) found.push({ session, via: "claim", match: claim });
+    if (claim !== undefined) found.push({ session, via: session.partial?.cover.includes(claim) ? "coverage" : "claim", match: claim });
   }
   return found;
+}
+
+// ------------------------------------------------------------------ freshness
+
+/**
+ * How far the team picture can be trusted (CONTRACT 4.2):
+ * - "fresh": cache.json readable, fetched within staleAfterSeconds, and any
+ *   refresh this command tried worked;
+ * - "stale": fetched once, but longer ago than that, or this command's
+ *   refresh failed;
+ * - "never": this clone has no successful fetch;
+ * - "unreadable": cache.json exists and cannot be used.
+ */
+export type Freshness = "fresh" | "stale" | "never" | "unreadable";
+
+/**
+ * What the command's own refresh did. "none": it did not try (a cache-only
+ * read, or the throttle found the last sync recent). "ok": it fetched.
+ * Anything else: why it did not.
+ */
+export type RefreshOutcome = "none" | "ok" | "offline" | "denied" | "busy" | "failed";
+
+export interface FreshnessInput {
+  /** From readCacheStatus (store.ts): "missing" is no cache.json at all. */
+  cacheState: "ok" | "missing" | "unreadable";
+  fetchedAt: Iso | null;
+  now: Date;
+  syncIntervalSeconds: number;
+  refresh?: RefreshOutcome;
+}
+
+export interface FreshnessReport {
+  freshness: Freshness;
+  /** Whole seconds since the last successful fetch, never negative; null when there is none to go by. */
+  ageSeconds: number | null;
+  /** Older than this is stale. */
+  staleAfterSeconds: number;
+  refresh: RefreshOutcome;
+}
+
+/** max(4 × syncIntervalSeconds, 60): a clone with live hooks syncs every interval, so four missed rounds is a real gap. */
+export function staleAfterSeconds(syncIntervalSeconds: number): number {
+  const interval = Number.isFinite(syncIntervalSeconds) && syncIntervalSeconds > 0 ? syncIntervalSeconds : DEFAULT_CONFIG.syncIntervalSeconds;
+  return Math.max(4 * interval, 60);
+}
+
+/** Pure. The one place freshness is decided; commands and hooks both call it. */
+export function classifyFreshness(input: FreshnessInput): FreshnessReport {
+  const limit = staleAfterSeconds(input.syncIntervalSeconds);
+  const refresh = input.refresh ?? "none";
+  const fetchedMs = input.fetchedAt === null ? Number.NaN : Date.parse(input.fetchedAt);
+  const nowMs = input.now.getTime();
+  const raw = Number.isNaN(fetchedMs) || Number.isNaN(nowMs) ? null : (nowMs - fetchedMs) / 1000;
+  const report = (freshness: Freshness, ageSeconds: number | null): FreshnessReport => ({ freshness, ageSeconds, staleAfterSeconds: limit, refresh });
+  if (input.cacheState === "unreadable") return report("unreadable", null);
+  if (raw === null) return report("never", null);
+  const age = Math.max(0, Math.floor(raw));
+  if (refresh !== "none" && refresh !== "ok") return report("stale", age);
+  // A fetch stamped far ahead of this clock says nothing about how old it is.
+  if (raw >= limit || raw < -MAX_CLOCK_SKEW_MS / 1000) return report("stale", age);
+  return report("fresh", age);
+}
+
+export interface Completeness {
+  /** False when some of the team cannot be seen, or a live session published only part of its files with nothing covering the rest. */
+  complete: boolean;
+  /** Actor refs whose document this version cannot read: those teammates' sessions are missing from the view. */
+  unreadableActors: number;
+  /** Live sessions in the view with `partial` and no `cover`. */
+  uncovered: number;
+}
+
+/** Pure. `view` must be built from `cache`. */
+export function teamCompleteness(cache: Cache, view: TeamView): Completeness {
+  let unreadableActors = 0;
+  for (const [ref, entry] of Object.entries(cache.refs ?? {})) {
+    const where = parseRef(ref);
+    if (where?.kind !== "actor") continue;
+    const doc = entry?.doc;
+    if (doc === null || doc === undefined || doc.kind !== "actor" || doc.actor !== where.id) unreadableActors++;
+  }
+  const uncovered = view.sessions.filter((session) => session.partial !== undefined && session.partial.cover.length === 0).length;
+  return { complete: unreadableActors === 0 && uncovered === 0, unreadableActors, uncovered };
 }

@@ -408,7 +408,7 @@ test("offline, the decision is not recorded and the command says so with exit 1"
   const listed = await alice.huddle(["decisions"], { now: at(100) });
   assert.equal(listed.code, 0);
   assert.match(listed.stdout, /Decisions \(1\)/);
-  assert.match(listed.stderr, /showing the last known decisions/);
+  assert.match(listed.stderr, /could not reach remote "origin"; showing the last known state/);
   assert.deepEqual(texts((await remoteLogs(h))[0]!.decisions), ["one"]);
 });
 
