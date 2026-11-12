@@ -48,6 +48,26 @@ export async function timed<T>(work: () => Promise<T>): Promise<{ ms: number; va
   return { ms: performance.now() - started, value };
 }
 
+/**
+ * How many times its deadline a hook gets under test, unless the test says
+ * otherwise. A hook has 150 ms for an edit. On a machine that is running a
+ * dozen test files at once it runs out of them now and then, as it should,
+ * and a test that only wanted the hook's answer then fails for a reason that
+ * is not its own.
+ *
+ * Set on this process, so that it reaches the hooks handled in it (ioFor) and
+ * the ones it starts through the bundle (the harness passes the environment
+ * on). Whatever the developer's shell had there is replaced.
+ */
+export const PATIENCE = 20;
+process.env.HUDDLE_HOOK_PATIENCE = String(PATIENCE);
+
+/**
+ * For the tests that are about time, as the environment of an event or of a
+ * hook process: every deadline as it is for a user.
+ */
+export const ON_THE_CLOCK: Readonly<Record<string, string>> = Object.freeze({ HUDDLE_HOOK_PATIENCE: "1" });
+
 // ---------------------------------------------------------------------------
 // Clones
 // ---------------------------------------------------------------------------
@@ -294,8 +314,11 @@ export const DELTA_HEAD = `[huddle] Update on teammates' agents. ${NOTICE}`;
 export const FULL_FOOT = `${OVERLAP_HINT} ${COMMANDS}`;
 export const overlapHead = (path: string): string => `[huddle] ${path} overlaps teammates' work in flight. ${NOTICE}`;
 export const SAY_SO = "Say so before editing, and coordinate or pick a different file if you can.";
-export const moreNote = (count: number): string => `[huddle] ${count} more of the paths in this edit overlap teammates' work as well: run \`huddle check\`.`;
-export const CUT_NOTE = "[huddle] Cut short to fit: run `huddle check` for the rest.";
+export const moreNote = (count: number): string =>
+  `[huddle] ${count} more of the paths in this edit overlap teammates' work as well: run \`huddle check\` with those paths.`;
+/** The line after the block of a path that has `count` more sessions on it than the block names. */
+export const unnamedNote = (count: number, path: string): string =>
+  `[huddle] ${count} more ${count === 1 ? "session overlaps" : "sessions overlap"} ${path} as well: run \`huddle check\` with that path to see them all.`;
 
 /** Joins the lines of an expected text. */
 export const text = (...lines: string[]): string => lines.join("\n");
