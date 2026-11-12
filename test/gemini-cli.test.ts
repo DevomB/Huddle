@@ -467,7 +467,7 @@ test("with the engine: a briefing at the start, the user warned before the edit,
   assert.deepEqual(await sessionsOf(bob), []);
 
   // What was asked of the network on the way. One sync waited for at the start. Then: the new intent at once; no
-  // sync for any of the seven tool events around edits; one left to the throttle after each of the two other tools;
+  // sync for any of the eight tool events around edits; one left to the throttle after each of the two other tools;
   // the ends of the turn and of the session at once.
   assert.equal(asked.waited.length, 1);
   assert.deepEqual(asked.background, [forced(bob), throttled(bob), throttled(bob), forced(bob), forced(bob)]);
