@@ -1,0 +1,10 @@
+{
+  "session_id": "0199f3a2-6c1e-7d50-b8a4-2f9e61c0d7ab",
+  "transcript_path": "/home/dev/.codex/sessions/2026/11/12/rollout-2026-11-12T09-30-00-0199f3a2-6c1e-7d50-b8a4-2f9e61c0d7ab.jsonl",
+  "cwd": "/home/dev/acme",
+  "model": "gpt-5-codex",
+  "permission_mode": "default",
+  "turn_id": "turn-2",
+  "hook_event_name": "UserPromptSubmit",
+  "prompt": "Add rate limiting to the login endpoint"
+}
