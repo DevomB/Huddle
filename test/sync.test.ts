@@ -2,13 +2,16 @@
 // The first test is the exit test from plan.md §5.
 
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
-import { contentHash, shouldPublish } from "../src/core/sync.ts";
+import { openContext } from "../src/core/context.ts";
+import type { Io } from "../src/core/io.ts";
+import { contentHash, shouldPublish, spawnBackgroundSync, syncWithin } from "../src/core/sync.ts";
 import { DEFAULT_CONFIG } from "../src/core/types.ts";
 import type { ActorDoc, LocalState, Session } from "../src/core/types.ts";
-import { createHarness } from "./harness.ts";
+import { BUNDLE, createHarness } from "./harness.ts";
 import type { Clone, Harness } from "./harness.ts";
 
 const T0 = Date.parse("2026-01-01T00:00:00Z");
@@ -135,7 +138,7 @@ test("a sync with nothing new does not push; a change does; the heartbeat does a
   await ok(alice, ["sync"], at(8 * MIN));
   const third = await remoteRefs(h);
   assert.notEqual(third, second, "no heartbeat after the interval despite activity");
-  assert.equal((await actorDocs(h))[0]!.sessions[0]!.seenAt, at(8 * MIN).replace("Z", ".000Z"));
+  assert.equal((await actorDocs(h))[0]!.sessions[0]!.seenAt, at(8 * MIN));
 });
 
 test("background syncs are throttled to one per syncIntervalSeconds; --force and manual syncs are not", async (t) => {
@@ -318,6 +321,36 @@ test("two worktrees of one clone are two sessions of one actor, and see each oth
   assert.equal(check.code, 3, "a file in flight in another worktree of the same clone is still an overlap");
 });
 
+test("two sessions in one worktree share its files: they see each other, but their common dirty files are not an overlap", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  const bob = await h.clone("bob");
+  await ok(alice, ["intent", "first agent"], at(0), { HUDDLE_SESSION: "one" });
+  await ok(alice, ["intent", "second agent"], at(1), { HUDDLE_SESSION: "two" });
+  await alice.write("src/shared.ts", "x\n");
+  await ok(alice, ["sync"], at(2), { HUDDLE_SESSION: "one" });
+
+  // Both sessions report the worktree's dirty file, because either may have written it.
+  const docs = await actorDocs(h);
+  assert.deepEqual(docs[0]!.sessions.map((s) => s.files), [["src/shared.ts"], ["src/shared.ts"]]);
+
+  // From inside that worktree the file is this session's own work as much as the other's: no warning.
+  const own = await alice.huddle(["check", "src/shared.ts"], { now: at(3), env: { HUDDLE_SESSION: "one" } });
+  assert.equal(own.code, 0, `a session was warned about its own worktree's files: ${own.stdout}`);
+  const status = await ok(alice, ["status", "--cached"], at(3), { HUDDLE_SESSION: "one" });
+  assert.match(status.stdout, /second agent/, "the other session is still listed");
+
+  // A claim is a statement by one session, not a property of the worktree, so it still counts.
+  await ok(alice, ["claim", "docs/**"], at(4), { HUDDLE_SESSION: "two" });
+  const claimed = await alice.huddle(["check", "docs/guide.md"], { now: at(5), env: { HUDDLE_SESSION: "one" } });
+  assert.equal(claimed.code, 3);
+
+  // For a teammate in another clone the file is in flight twice over.
+  await ok(bob, ["sync"], at(6));
+  const theirs = await bob.huddle(["check", "src/shared.ts"], { now: at(7) });
+  assert.equal(theirs.code, 3);
+});
+
 test("HUDDLE_SESSION selects the session; without it a command joins the live session of its worktree", async (t) => {
   const h = await createHarness(t);
   const alice = await h.clone("alice");
@@ -379,7 +412,7 @@ test("status --json is machine-readable and carries the whole view", async (t) =
   assert.equal(view.sessions.length, 1);
   assert.equal(view.sessions[0]!.user, "alice");
   assert.equal(view.sessions[0]!.intent, "build auth");
-  assert.equal(view.fetchedAt, at(2).replace("Z", ".000Z"), "status refreshed the cache itself");
+  assert.equal(view.fetchedAt, at(2), "status refreshed the cache itself");
 });
 
 test("status does not announce the caller: looking is not presence", async (t) => {
@@ -455,4 +488,100 @@ test("shouldPublish: changes always, heartbeats only after activity, silence whe
   assert.equal(shouldPublish(published, active, hash, new Date(at(3 * MIN)), config), true, "active and the heartbeat is due");
   assert.equal(shouldPublish({ ...published, at: at(999) }, d, hash, new Date(at(0)), config), true, "a publish time in the future is not trusted");
   assert.equal(shouldPublish({ ...published, at: "garbage" }, d, hash, new Date(at(0)), config), true);
+});
+
+// ---------------------------------------------------------------------------
+// Concurrency and the background path. These use the real clock.
+// ---------------------------------------------------------------------------
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function until(what: string, check: () => Promise<boolean>, timeoutMs = 15_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (await check()) return;
+    if (Date.now() > deadline) assert.fail(`timed out waiting for ${what}`);
+    await sleep(50);
+  }
+}
+
+/** True once no sync holds the lock, so the harness can remove the clone safely. */
+async function syncIdle(clone: Clone): Promise<boolean> {
+  const { syncLock } = await clone.paths();
+  return !existsSync(syncLock);
+}
+
+test("several syncs at once in one clone all succeed and leave one consistent doc", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  await ok(alice, ["intent", "racing"], new Date().toISOString());
+  await alice.write("a.ts", "a\n");
+
+  const results = await Promise.all(Array.from({ length: 6 }, () => alice.huddle(["sync"])));
+  for (const r of results) assert.equal(r.code, 0, r.stderr);
+
+  const docs = await actorDocs(h);
+  assert.equal(docs.length, 1);
+  assert.equal(docs[0]!.sessions.length, 1);
+  assert.deepEqual(docs[0]!.sessions[0]!.files, ["a.ts"]);
+  const local = JSON.parse(await readFile((await alice.paths()).localFile, "utf8")) as LocalState;
+  assert.equal(local.sessions.length, 1);
+  assert.equal(local.published?.sha, (await remoteRefs(h)).split(" ")[1], "local state records the commit that is actually on the remote");
+  assert.ok(await syncIdle(alice), "a sync lock was left behind");
+});
+
+test("intent starts a detached background sync that publishes without being waited for", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+
+  const r = await alice.huddle(["intent", "announce in the background"], { env: { HUDDLE_NO_BACKGROUND: "" } });
+  assert.equal(r.code, 0, r.stderr);
+  await until("the background sync to publish", async () => (await remoteRefs(h)) !== "");
+  await until("the background sync to finish", () => syncIdle(alice));
+  assert.equal((await actorDocs(h))[0]!.sessions[0]!.intent, "announce in the background");
+});
+
+function inProcessIo(clone: Clone): Io {
+  return { cwd: clone.dir, env: process.env, self: BUNDLE, out: () => {}, err: () => {}, readStdin: async () => "" };
+}
+
+test("syncWithin runs the sync in a detached process and reports whether it met the budget", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  await ok(alice, ["intent", "budgeted"], new Date().toISOString());
+  const saved = process.env.HUDDLE_NO_BACKGROUND;
+  delete process.env.HUDDLE_NO_BACKGROUND;
+  try {
+    // A generous budget: the sync finishes inside it, and its effect is visible on return.
+    const ctx = await openContext(inProcessIo(alice));
+    assert.equal(await syncWithin(ctx, 10_000), true);
+    assert.equal((await actorDocs(h))[0]!.sessions[0]!.intent, "budgeted");
+
+    // A budget no sync can meet: the caller gets control back at once, and the sync still completes.
+    await alice.huddle(["intent", "abandoned wait"], { env: { HUDDLE_NO_BACKGROUND: "1" } });
+    const started = Date.now();
+    assert.equal(await syncWithin(await openContext(inProcessIo(alice)), 1), false);
+    assert.ok(Date.now() - started < 1000, `syncWithin held on for ${Date.now() - started} ms past a 1 ms budget`);
+    await until("the abandoned sync to publish anyway", async () => (await actorDocs(h))[0]?.sessions[0]?.intent === "abandoned wait");
+  } finally {
+    process.env.HUDDLE_NO_BACKGROUND = saved;
+    // The detached sync must be done before the harness removes the clone under it.
+    await until("the detached sync to finish", () => syncIdle(alice));
+  }
+});
+
+test("spawnBackgroundSync never throws and does nothing when it would be throttled or is disabled", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  const paths = await alice.paths();
+  await ok(alice, ["intent", "x"], at(0));
+  await ok(alice, ["sync"], at(0));
+  const before = await remoteRefs(h);
+
+  spawnBackgroundSync(paths, BUNDLE); // HUDDLE_NO_BACKGROUND=1 in the harness
+  spawnBackgroundSync(paths, ""); // no script to run
+  spawnBackgroundSync(paths, join(h.root, "missing.mjs"), { config: { ...DEFAULT_CONFIG }, now: new Date(at(1)) }); // throttled: never starts
+  await sleep(300);
+  assert.equal(await remoteRefs(h), before);
+  assert.ok(await syncIdle(alice));
 });

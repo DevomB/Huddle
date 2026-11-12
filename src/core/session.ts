@@ -80,12 +80,20 @@ export function toActorDoc(identity: Identity, sessions: LocalSession[], now: Da
  * The team as session `sessionId` of this clone sees it, from the cache. This
  * clone's own entry is replaced with its current local sessions, so sessions
  * in other worktrees of the same clone show up at once rather than after the
- * next publish. No network.
+ * next publish. No network. `worktree` is where the viewer is working; it
+ * defaults to the worktree the context was opened in.
  */
-export async function currentView(ctx: Ctx, sessionId: string, state?: LocalState): Promise<TeamView> {
+export async function currentView(ctx: Ctx, sessionId: string, state?: LocalState, worktree?: string): Promise<TeamView> {
   const [cache, local] = await Promise.all([readCache(ctx.paths), state ?? readLocal(ctx.paths)]);
   const ref = actorRef(ctx.identity.actor);
-  const own = normalizeDoc(toActorDoc(ctx.identity, local.sessions, ctx.now, ctx.config.ttlMinutes));
+  // Sessions that share the viewer's worktree share its dirty files: those are
+  // the viewer's own work as much as theirs, so they are not shown as someone
+  // else's files in flight. Their intent and claims still are.
+  const viewer = worktree ?? ctx.paths.worktree;
+  const sessions = local.sessions.map((session) =>
+    session.worktree === viewer && session.id !== sessionId ? { ...session, files: [] } : session,
+  );
+  const own = normalizeDoc(toActorDoc(ctx.identity, sessions, ctx.now, ctx.config.ttlMinutes));
   if (own) cache.refs[ref] = { sha: cache.refs[ref]?.sha ?? "", doc: own };
   return buildView(cache, { actor: ctx.identity.actor, session: sessionId }, ctx.now, { ttlMinutes: ctx.config.ttlMinutes });
 }
