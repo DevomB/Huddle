@@ -118,6 +118,19 @@ test("claims: a claim covers the path it matches and everything under a director
   assert.equal(claimMatches("src/auth.ts", "src/auth.tsx"), false);
 });
 
+test("claims: covering a directory is the claim followed by **, for every prefix of the path", () => {
+  const paths = ["a", "a/b", "a/b/c", "a/b/c/d.ts", "x/a/b", "b/a", "a.ts/b", "ab/c"];
+  const claims = ["a", "a/b", "*/b", "**/b", "a/**", "a/*/c", "**/c/*.ts", "?", "a/b/c/d.ts", "x/**/b", "**", "*.ts", "a?/c"];
+  for (const claim of claims) {
+    for (const path of paths) {
+      const segments = path.split("/");
+      // The definition: the glob matches the path or some directory above it.
+      const expected = segments.some((_, index) => globMatch(claim, segments.slice(0, index + 1).join("/")));
+      assert.equal(claimMatches(claim, path), expected, `claim ${claim} on ${path}`);
+    }
+  }
+});
+
 test("claims: the repo root claims everything; nothing claims the empty path", () => {
   assert.equal(claimMatches(".", "src/auth.ts"), true);
   assert.equal(claimMatches("/", "README.md"), true);

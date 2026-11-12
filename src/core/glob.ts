@@ -50,24 +50,47 @@ function splitPath(path: string): SplitPath | null {
   return { segments, chars: new Array<string[] | undefined>(segments.length) };
 }
 
-function compile(pattern: string): Segment[] | null {
+interface Compiled {
+  /** The pattern itself. */
+  exact: Segment[];
+  /** The pattern followed by `**`: it, or anything under a directory it matches. */
+  covering: Segment[];
+}
+
+// Compiling is the same work for every path checked against a claim, and a
+// commit can check hundreds of paths against every claim on the team.
+const MAX_COMPILED = 4096;
+const compiledPatterns = new Map<string, Compiled | null>();
+
+function compile(pattern: string): Compiled | null {
+  const known = compiledPatterns.get(pattern);
+  if (known !== undefined) return known;
+  const compiled = compileFresh(pattern);
+  if (compiledPatterns.size >= MAX_COMPILED) compiledPatterns.clear();
+  compiledPatterns.set(pattern, compiled);
+  return compiled;
+}
+
+function compileFresh(pattern: string): Compiled | null {
   const trimmed = pattern.trim();
   if (trimmed === "" || trimmed.length > MAX_PATTERN_CHARS) return null;
-  const raw = normalizePath(trimmed);
-  const parts = raw === "" ? [] : raw.split("/");
+  // Same normalization as normalizePath: empty and "." segments drop out.
+  const parts = trimmed.split("/").filter((part) => part !== "" && part !== ".");
   if (trimmed.endsWith("/") && parts.length > 0) parts.push("**");
-  const segments: Segment[] = [];
+  const exact: Segment[] = [];
   for (const part of parts) {
     if (part === "**") {
-      const last = segments[segments.length - 1];
-      if (last === undefined || last.kind !== "globstar") segments.push({ kind: "globstar" });
+      const last = exact[exact.length - 1];
+      if (last === undefined || last.kind !== "globstar") exact.push({ kind: "globstar" });
     } else if (part.includes("*") || part.includes("?")) {
-      segments.push({ kind: "wild", chars: Array.from(part) });
+      exact.push({ kind: "wild", chars: Array.from(part) });
     } else {
-      segments.push({ kind: "literal", text: part });
+      exact.push({ kind: "literal", text: part });
     }
   }
-  return segments;
+  const last = exact[exact.length - 1];
+  const covering = last !== undefined && last.kind === "globstar" ? exact : [...exact, { kind: "globstar" } as const];
+  return { exact, covering };
 }
 
 /** `*` and `?` inside one segment. Iterative, O(pattern * text) worst case. */
@@ -136,7 +159,7 @@ export function globMatch(pattern: string, path: string): boolean {
   const compiled = compile(pattern);
   const split = splitPath(path);
   if (compiled === null || split === null) return false;
-  return matchSegments(compiled, split, split.segments.length);
+  return matchSegments(compiled.exact, split, split.segments.length);
 }
 
 /**
@@ -145,13 +168,14 @@ export function globMatch(pattern: string, path: string): boolean {
  * a .gitignore entry for a directory covers its contents, and `.` or `/`
  * claims the whole repo. This errs towards warning, which is the safe side
  * for an advisory check.
+ *
+ * "Matches the path or a directory above it" is the same as "the claim
+ * followed by `**` matches the whole path", so this is one walk, not one per
+ * path prefix.
  */
 export function claimMatches(claim: string, path: string): boolean {
   const compiled = compile(claim);
   const split = splitPath(path);
   if (compiled === null || split === null || split.segments.length === 0) return false;
-  for (let length = split.segments.length; length >= 0; length--) {
-    if (matchSegments(compiled, split, length)) return true;
-  }
-  return false;
+  return matchSegments(compiled.covering, split, split.segments.length);
 }

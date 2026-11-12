@@ -44,6 +44,13 @@ export interface HookEvent {
 export interface HookOutcome {
   /** Text to put in front of the agent: a briefing or an overlap warning. Absent or "" means print nothing. */
   context?: string;
+  /**
+   * Variables the agent's later shell commands should see. The engine sets
+   * HUDDLE_SESSION on session-start, so that `huddle intent` typed by the agent
+   * lands in the session its hooks created. An adapter whose agent has no way
+   * to set environment ignores this.
+   */
+  env?: Record<string, string>;
 }
 
 /** A raw hook invocation: `huddle hook <agent> [args...]` with the payload on stdin. */
@@ -60,6 +67,14 @@ export interface HookOutput {
   stdout: string;
   stderr: string;
   exitCode: number;
+  /**
+   * Lines to append to files, for agents that take environment through a file
+   * the hook writes to (Claude Code's CLAUDE_ENV_FILE). format() stays pure:
+   * runHook does the appending, skips a line the file already contains, and
+   * swallows errors. Such a file is executed as shell code by the agent, so the
+   * adapter must build each line from values it has validated.
+   */
+  appendLines?: Array<{ path: string; line: string }>;
 }
 
 export interface InstallOptions {
