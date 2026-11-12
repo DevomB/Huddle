@@ -700,7 +700,6 @@ function countOurs(settings: Json): Record<string, number> {
 
 test("install: an empty repo gets .gemini/settings.json with one handler per event", async (t) => {
   const { root, file } = await scratchRepo(t);
-  // `files` joins the adapter contract with T2.3; until then it is json-hooks' own type that has it.
   const result: InstallResult = await geminiCli.install({ repoRoot: root, bundle: BUNDLE });
   assert.deepEqual(result.changed, [".gemini/settings.json"]);
   // The file the team commits: named on every run, so that init can keep saying it is not committed yet.
