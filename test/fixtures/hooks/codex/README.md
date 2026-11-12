@@ -14,7 +14,8 @@ receives on stdin, at the release that was current on 2026-11-12
   starting with `Exit code: 0`;
 - the patch grammar in `codex-rs/apply-patch/src/parser.rs`;
 - `session-end.json`, which is the example payload printed in the hook
-  reference (https://developers.openai.com/codex/hooks).
+  reference (https://developers.openai.com/codex/hooks, which redirects to
+  https://learn.chatgpt.com/docs/hooks).
 
 Ids, paths, the model name and the `tool_response` values are invented. The
 adapter reads none of them except `session_id` and `cwd`.
