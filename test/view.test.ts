@@ -444,7 +444,7 @@ test("view: building a view neither changes the cache nor depends on anything bu
 
 test("view: an empty cache gives an empty view; an invalid clock is an error", () => {
   const view = buildView({ fetchedAt: null, refs: {} }, ME, NOW);
-  assert.deepEqual(view, { now: "2026-11-12T12:00:00.000Z", fetchedAt: null, self: ME, sessions: [], decisions: [], tasks: [] });
+  assert.deepEqual(view, { now: "2026-11-12T12:00:00.000Z", fetchedAt: null, self: ME, sessions: [], decisions: [], conflicts: [], tasks: [] });
   assert.deepEqual(countTasks(view), { open: 0, taken: 0, stale: 0, unclear: 0, done: 0 });
   assert.throws(() => buildView({ fetchedAt: null, refs: {} }, ME, new Date("not a date")), TypeError);
 });

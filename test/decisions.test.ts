@@ -302,10 +302,20 @@ test("report: what each outcome prints and which exit code it gives", () => {
     { user: "bob", decision: { id: "bbbb2222", at: at(20), agent: "codex", text: "Use npm" } },
     { user: "carol", decision: { id: "cccc2222", at: at(10), agent: "manual", text: "Use yarn" } },
   ];
+  // Two different rules both replace it: that is an unresolved conflict (CONTRACT 4.4), and the way out is --resolve.
   const late = said({ ok: false, reason: "already-superseded", inForce }, "zzzz2222");
   assert.equal(
     late.err,
-    'huddle: decision zzzz2222 was already replaced by [bbbb2222] Use npm (bob / codex) (and 1 more; see "huddle decisions"). ' +
+    "huddle: decision zzzz2222 was replaced by competing decisions: [bbbb2222] Use npm (bob / codex); [cccc2222] Use yarn (carol / manual). " +
+      "That is an unresolved conflict and none of them is in force. The decision was NOT recorded. " +
+      'To settle it, agree on one rule and run: huddle decide --resolve zzzz2222 "<the rule>"',
+  );
+  assert.equal(late.code, 3);
+  // One rule in force at the end of the chain: the old message, pointing at it.
+  const single = said({ ok: false, reason: "already-superseded", inForce: inForce.slice(0, 1) }, "zzzz2222");
+  assert.equal(
+    single.err,
+    "huddle: decision zzzz2222 was already replaced by [bbbb2222] Use npm (bob / codex). " +
       "The decision was NOT recorded. To replace the rule in force, run the command again with --supersedes bbbb2222.",
   );
 
@@ -608,7 +618,9 @@ test("two full logs that each hide the same decision of a third clone: neither m
     const seeded = await ctx.transport.publish(decisionsRef(ctx.identity.actor), { v: 0, kind: "decisions", actor: ctx.identity.actor, user: clone.name, decisions: log }, "absent");
     assert.equal(seeded.ok, true);
   }
-  const hidden = async (viewer: Clone, now: string) => !(await ok(viewer, ["decisions"], now)).stdout.includes("carol: use tabs");
+  // Hidden: not listed as a rule in force. (Both logs replace it, so it is named as the decision an
+  // unresolved conflict is about; that line starts "- Unresolved", not "- [id] carol: use tabs".)
+  const hidden = async (viewer: Clone, now: string) => !/^- \[[a-z2-7]{8}\] carol: use tabs/m.test((await ok(viewer, ["decisions"], now)).stdout);
   assert.equal(await hidden(carol, at(10)), true, "setup: carol's decision is superseded");
 
   // Each log could make room only by dropping the one decision of its own that hides carol's.

@@ -22,6 +22,32 @@ export interface ViewSession extends Session {
 export interface ViewDecision extends Decision {
   actor: string;
   user: string;
+  /**
+   * Other decisions that are the same rule: same text, competing replacements
+   * of the same decision (a settled conflict, see DecisionConflict). Shown
+   * once, under the smallest id. `huddle decide --supersedes` with any of the
+   * ids replaces all of them.
+   */
+  sameAs?: string[];
+}
+
+/**
+ * Two or more decisions replace the same decision, directly or down their
+ * chains, and say different things (audit A04: each author's log is
+ * compare-and-swapped on its own, so two replacements made at the same moment
+ * both land). None of them is in force, and no clock picks a winner: the team
+ * settles it with `huddle decide --resolve <over> "<rule>"`, which replaces
+ * every candidate with the same text.
+ */
+export interface DecisionConflict {
+  /** The id `huddle decide --resolve` takes: the decision they compete to replace, or for a loop the smallest id in it. */
+  over: string;
+  /** "fork": competing replacements. "loop": decisions that replace one another, with nothing at the end. */
+  kind: "fork" | "loop";
+  /** The decision at `over`, when it is in a readable log. */
+  replaced: ViewDecision | null;
+  /** The competing rules, by text and then id. */
+  candidates: ViewDecision[];
 }
 
 /**
@@ -56,8 +82,10 @@ export interface TeamView {
    * included: two agents in two worktrees of one clone collide like any others.
    */
   sessions: ViewSession[];
-  /** The union of all actors' decisions, minus superseded ones, newest first. */
+  /** The union of all actors' decisions, minus superseded ones and conflicted ones, newest first. */
   decisions: ViewDecision[];
+  /** Unresolved decision conflicts (see DecisionConflict), by `over`. Their candidates are not in `decisions`. */
+  conflicts: DecisionConflict[];
   /** All tasks, oldest first. */
   tasks: ViewTask[];
 }
@@ -115,6 +143,7 @@ export function buildView(cache: Cache, self: Self, now: Date, opts: ViewOptions
     self: self.session === undefined ? { actor: self.actor } : { actor: self.actor, session: self.session },
     sessions: [],
     decisions: [],
+    conflicts: [],
     tasks: [],
   };
 
@@ -179,14 +208,12 @@ export function buildView(cache: Cache, self: Self, now: Date, opts: ViewOptions
 
   // A decision is hidden once any other decision names it in `supersedes`,
   // whoever wrote it and whatever their clocks said. Ids are random, so the
-  // name is unambiguous across actors.
-  const superseded = new Set<string>();
-  for (const decision of decisions) {
-    if (decision.supersedes !== undefined && decision.supersedes !== decision.id) superseded.add(decision.supersedes);
-  }
-  view.decisions = decisions
-    .filter((decision) => !superseded.has(decision.id))
-    .sort((a, b) => Date.parse(b.at) - Date.parse(a.at) || compareText(a.actor, b.actor) || compareText(a.id, b.id));
+  // name is unambiguous across actors. Competing replacements are a conflict.
+  const settled = settleDecisions(decisions);
+  view.decisions = settled.inForce.sort(
+    (a, b) => Date.parse(b.at) - Date.parse(a.at) || compareText(a.actor, b.actor) || compareText(a.id, b.id),
+  );
+  view.conflicts = settled.conflicts;
 
   const presence = (task: TaskDoc): OwnerPresence | null => {
     if (task.status !== "claimed" || task.owner === null) return null;
@@ -213,6 +240,94 @@ export function buildView(cache: Cache, self: Self, now: Date, opts: ViewOptions
     .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt) || compareText(a.id, b.id));
 
   return view;
+}
+
+/**
+ * Splits decisions into the rules in force and the unresolved conflicts. Pure.
+ *
+ * Every decision replaces at most one (`supersedes`), so the decisions form
+ * chains that branch where two decisions replace the same one (a fork). The
+ * ends of the chains (decisions nothing replaces) are the candidates. Each end
+ * belongs to the top-most fork above it; an end with no fork above it is in
+ * force. The ends under one fork are one rule when they all say the same
+ * thing (a settled conflict: `sameAs`), and a conflict when they do not.
+ * A loop (crafted or damaged logs: a decision can only replace one that
+ * already exists) is handled the same way, with the loop in place of the
+ * fork; a loop with nothing at its end is a conflict of its members, never
+ * silently gone.
+ */
+export function settleDecisions(all: ViewDecision[]): { inForce: ViewDecision[]; conflicts: DecisionConflict[] } {
+  const byId = new Map<string, ViewDecision>();
+  for (const decision of all) if (!byId.has(decision.id)) byId.set(decision.id, decision);
+  const parentOf = (decision: ViewDecision): string | undefined =>
+    decision.supersedes !== undefined && decision.supersedes !== decision.id ? decision.supersedes : undefined;
+  const children = new Map<string, number>();
+  for (const decision of byId.values()) {
+    const parent = parentOf(decision);
+    if (parent !== undefined) children.set(parent, (children.get(parent) ?? 0) + 1);
+  }
+
+  /** Walks up from `start`; the key of the top-most fork, or of the loop it runs into, or undefined. */
+  const reached = new Set<string>();
+  const topOf = (start: ViewDecision): { key: string; loop: boolean } | undefined => {
+    let top: string | undefined;
+    const path: string[] = [];
+    const seen = new Set<string>([start.id]);
+    reached.add(start.id);
+    let current = parentOf(start);
+    while (current !== undefined) {
+      if (seen.has(current)) {
+        // `start` itself is in the loop only when it is replaced (a loop with no end, found from inside).
+        const loop = (current === start.id ? [start.id, ...path] : path.slice(path.indexOf(current))).sort(compareText);
+        return { key: loop[0] ?? current, loop: true };
+      }
+      seen.add(current);
+      path.push(current);
+      reached.add(current);
+      if ((children.get(current) ?? 0) >= 2) top = current;
+      const node = byId.get(current);
+      current = node === undefined ? undefined : parentOf(node);
+    }
+    return top === undefined ? undefined : { key: top, loop: false };
+  };
+
+  const inForce: ViewDecision[] = [];
+  const groups = new Map<string, { loop: boolean; members: ViewDecision[] }>();
+  for (const decision of byId.values()) {
+    if (children.has(decision.id)) continue; // replaced: not an end
+    const top = topOf(decision);
+    if (top === undefined) {
+      inForce.push(decision);
+      continue;
+    }
+    const group = groups.get(top.key) ?? { loop: top.loop, members: [] };
+    group.members.push(decision);
+    groups.set(top.key, group);
+  }
+  // What no end leads to can only be a loop with nothing at its end.
+  const unreached = [...byId.values()].filter((decision) => !reached.has(decision.id));
+  for (const decision of unreached) {
+    const top = topOf(decision);
+    const key = top?.key ?? decision.id;
+    const group = groups.get(key) ?? { loop: true, members: [] };
+    group.loop = true;
+    if (!group.members.some((member) => member.id === decision.id)) group.members.push(decision);
+    groups.set(key, group);
+  }
+
+  const conflicts: DecisionConflict[] = [];
+  for (const [over, group] of [...groups.entries()].sort(([a], [b]) => compareText(a, b))) {
+    const members = group.members.sort((a, b) => compareText(a.text, b.text) || compareText(a.id, b.id));
+    const texts = new Set(members.map((member) => member.text));
+    const ends = members.filter((member) => !children.has(member.id));
+    if (texts.size === 1 && ends.length === members.length) {
+      const [first, ...rest] = [...members].sort((a, b) => compareText(a.id, b.id));
+      if (first) inForce.push(rest.length > 0 ? { ...first, sameAs: rest.map((member) => member.id) } : first);
+      continue;
+    }
+    conflicts.push({ over, kind: group.loop ? "loop" : "fork", replaced: byId.get(over) ?? null, candidates: members });
+  }
+  return { inForce, conflicts };
 }
 
 /**
