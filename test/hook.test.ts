@@ -27,6 +27,7 @@ import {
   DELTA_HEAD,
   FULL_FOOT,
   FULL_HEAD,
+  NOTHING_ASKED,
   SAY_SO,
   ago,
   aliceBuildsAuth,
@@ -332,7 +333,7 @@ test("input that is no event is answered with silence and exit code 0, and nothi
     for (const stdin of inputs) assert.deepEqual(await hook(bob, agent, stdin, 0), SILENT, `${agent}: ${stdin.slice(0, 60)}`);
   }
   assert.equal(existsSync(join(bob.dir, ".git", "huddle")), false);
-  assert.deepEqual(asked, { background: [], options: [], waited: [] });
+  assert.deepEqual(asked, NOTHING_ASKED);
 });
 
 test("a hook command that names no agent, or one that does not exist, says so on stderr and still exits 0", async (t) => {

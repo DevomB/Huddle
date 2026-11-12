@@ -217,6 +217,8 @@ export interface Asked {
   options: BackgroundOptions[];
   /** Syncs that were waited for, by the budget each was given. */
   waited: number[];
+  /** The checkout each of those was to run in: where its process is started, and whose settings it reads. */
+  waitedIn: string[];
 }
 
 /**
@@ -227,7 +229,7 @@ export interface Asked {
  */
 export function record(t: CleanupHost, waitFor?: (ctx: Ctx, budgetMs: number) => Promise<boolean>): Asked {
   const original = { ...effects };
-  const asked: Asked = { background: [], options: [], waited: [] };
+  const asked: Asked = { background: [], options: [], waited: [], waitedIn: [] };
   effects.spawnBackgroundSync = (paths, self, opts = {}) => {
     asked.background.push({ worktree: paths.worktree, force: opts.force === true });
     asked.options.push(opts);
@@ -235,11 +237,15 @@ export function record(t: CleanupHost, waitFor?: (ctx: Ctx, budgetMs: number) =>
   };
   effects.syncWithin = (ctx, budgetMs) => {
     asked.waited.push(budgetMs);
+    asked.waitedIn.push(ctx.paths.worktree);
     return (waitFor ?? original.syncWithin)(ctx, budgetMs);
   };
   t.after(() => void Object.assign(effects, original));
   return asked;
 }
+
+/** What a record holds when the engine asked for nothing. */
+export const NOTHING_ASKED: Readonly<Asked> = Object.freeze({ background: [], options: [], waited: [], waitedIn: [] });
 
 /** A sync that never comes back. */
 export const never = (): Promise<boolean> => new Promise(() => {});

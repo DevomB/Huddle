@@ -7,11 +7,12 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { test } from "node:test";
 import type { HookEvent, HookEventType } from "../src/adapters/types.ts";
 import type { Io } from "../src/core/io.ts";
 import { OVERLAP_HINT } from "../src/core/render.ts";
+import type { ActorDoc } from "../src/core/types.ts";
 import { DEADLINE_MS, handleEvent, sessionIdOf } from "../src/hooks/engine.ts";
 import { REDACTED } from "../src/hooks/intent.ts";
 import {
@@ -23,6 +24,7 @@ import {
   FULL_HEAD,
   MIN,
   NEVER_FETCHED,
+  NOTHING_ASKED,
   SAY_SO,
   ago,
   aliceBuildsAuth,
@@ -193,6 +195,58 @@ test("prompt with captureIntent off records no intent, and still briefs", async 
   assert.deepEqual(asked.background, [forced(bob)], "forced because the session is new, not because of an intent");
 });
 
+test("captureIntent switched off while a session runs takes back the intent a prompt gave it, at the session's next event", async (t) => {
+  const { h, alice } = await team(t);
+  /** The team's setting as this checkout has it: what a pull of the change leaves behind. */
+  const capture = (on: boolean): Promise<void> => alice.write(".huddle/config.json", `${JSON.stringify({ captureIntent: on })}\n`);
+  const intent = async (): Promise<Array<string | undefined>> => {
+    const session = await sessionOf(alice);
+    return [session?.intent, session?.intentSource];
+  };
+  const shared = async (): Promise<string | undefined> => (await published(h, "alice"))?.sessions[0]?.intent;
+  await fire(alice, "session-start", 0);
+  const asked = record(t);
+
+  // Whichever event of the session comes first, and whoever it is from.
+  const next: Array<[HookEventType, Partial<HookEvent>]> = [
+    ["prompt", { prompt: "now the tests for it" }],
+    ["pre-edit", { paths: ["src/auth.ts"] }],
+    ["post-edit", {}],
+    ["turn-end", {}],
+    ["post-edit", { subagent: true }],
+    ["session-start", {}],
+  ];
+  for (const [index, [type, over]] of next.entries()) {
+    const now = 10 + index * 10;
+    const label = `${type}${over.subagent === true ? " of a subagent" : ""}`;
+    await capture(true);
+    await fire(alice, "prompt", now, { prompt: AUTH_PROMPT });
+    await publish(alice, now + 1);
+    assert.equal(await shared(), AUTH_PROMPT, label);
+
+    await capture(false);
+    const [background, waited] = [asked.background.length, asked.waited.length];
+    await fire(alice, type, now + 2, over);
+    assert.deepEqual(await intent(), ["", "none"], label);
+    // Teammates are not left with it until the throttle allows a sync.
+    if (type === "session-start") assert.equal(asked.waited.length, waited + 1, label);
+    else assert.deepEqual(asked.background.slice(background), [forced(alice)], label);
+    await publish(alice, now + 3);
+    assert.equal(await shared(), "", label);
+  }
+
+  // An intent that was stated with `huddle intent` was put there to be shared. It stays.
+  await capture(true);
+  const stated = await alice.huddle(["intent", "Own the auth module until Friday"], { session: "s-alice", now: at(100) });
+  assert.equal(stated.code, 0, stated.stderr);
+  await capture(false);
+  const background = asked.background.length;
+  await fire(alice, "post-edit", 101);
+  await fire(alice, "prompt", 102, { prompt: "looks good, now write the tests for it" });
+  assert.deepEqual(await intent(), ["Own the auth module until Friday", "manual"]);
+  assert.deepEqual(asked.background.slice(background), [throttled(alice), throttled(alice)]);
+});
+
 test("which prompts replace the intent: not one word, not an empty one, and never one that was stated with huddle intent", async (t) => {
   const { alice } = await team(t);
   await fire(alice, "session-start", 0);
@@ -312,7 +366,7 @@ test("pre-edit warns once when the file is in a teammate's flight, from the cach
   assert.deepEqual(await fire(bob, "pre-edit", 25, edit), { context: authWarning(25) });
   assert.deepEqual(await fire(bob, "pre-edit", 26, edit), {}, "ten edits of one contested file are one warning");
   assert.deepEqual(await fire(bob, "pre-edit", 27, { paths: [join(bob.dir, "src/other.ts")] }), {});
-  assert.deepEqual(asked, { background: [], options: [], waited: [] });
+  assert.deepEqual(asked, NOTHING_ASKED);
   assert.equal((await sessionOf(bob))?.seenAt, at(27), "it is still a sign of life");
   assert.deepEqual(await warnedPaths(bob), ["w:src/auth.ts"]);
 });
@@ -613,7 +667,7 @@ test("in a repository that is not set up for huddle no event does anything at al
   }
   assert.equal(existsSync(paths.stateDir), false, "a state directory was created");
   assert.deepEqual(await plain.snapshot(), before);
-  assert.deepEqual(asked, { background: [], options: [], waited: [] });
+  assert.deepEqual(asked, NOTHING_ASKED);
 
   // .huddle has to be a directory at the top of the worktree. A file of that name is not it, and neither is one further down.
   await plain.write(".huddle", "not a directory\n");
@@ -639,9 +693,10 @@ test("outside a repository, or with a working directory that is gone, no event d
   assert.deepEqual(await handleEvent(start(undefined), ioFor(scratch)), {});
 });
 
-test("an agent that wanders out of the repository keeps its session alive there, and nothing is written where it went", async (t) => {
+test("an agent that wanders out of the repository keeps its session alive there, and nothing is written where it went or learned from it", async (t) => {
   const { h, bob } = await aliceBuildsAuth(t);
   await fire(bob, "session-start", 20);
+  await fire(bob, "prompt", 25, { prompt: "Add the login page" });
   const scratch = join(h.root, "scratch");
   const other = join(h.root, "other");
   await mkdir(scratch);
@@ -656,15 +711,19 @@ test("an agent that wanders out of the repository keeps its session alive there,
   }
   assert.equal(existsSync(join(other, ".git", "huddle")), false, "state was written into a repository that never asked for it");
 
-  // What is typed while it is away is still this session's prompt.
-  await fire(bob, "prompt", 35, { cwd: scratch, prompt: "Add the login page" });
-  assert.equal((await sessionOf(bob))?.intent, "Add the login page");
+  // What is typed while it is away is about the place it went to, and is not this team's to read. The intent stays
+  // what it was when the agent left, and nothing is rushed out.
+  for (const [index, cwd] of [scratch, other].entries()) {
+    assert.deepEqual(await fire(bob, "prompt", 35 + index, { cwd, prompt: "Fix the invoice PDF for the other client" }), {});
+    const session = await sessionOf(bob);
+    assert.deepEqual([session?.intent, session?.intentSource, session?.seenAt], ["Add the login page", "prompt", at(35 + index)]);
+  }
 
   // A relative path is relative to where the agent is, which is not here. A file back home, named in full, is checked.
   assert.deepEqual(await fire(bob, "pre-edit", 40, { cwd: scratch, paths: ["src/auth.ts"] }), {});
   assert.equal((await fire(bob, "pre-edit", 41, { cwd: scratch, paths: [join(bob.dir, "src/auth.ts")] })).context, authWarning(41));
 
-  assert.deepEqual(asked.background, [throttled(bob), throttled(bob), forced(bob)]);
+  assert.deepEqual(asked.background, [throttled(bob), throttled(bob), throttled(bob), throttled(bob)]);
 
   // It ends where it lives.
   assert.deepEqual(await fire(bob, "session-end", 50, { cwd: scratch }), {});
@@ -684,10 +743,11 @@ test("a worktree of the same clone on a branch from before huddle init still cou
   // The agent entered that worktree. Its hooks are still started in the project directory, which is set up.
   assert.deepEqual(await fire(alice, "post-edit", 20, { cwd: oldDir }), {});
   let session = await sessionOf(alice);
-  // Branch and files described the worktree it left; the sync that is forced here fills them in again.
+  // Branch and files described the worktree it left; the sync that is forced here fills them in again. It is started
+  // in the checkout that is set up: see the next test.
   assert.deepEqual([session?.worktree, session?.branch, session?.files, session?.seenAt], [oldDir, "", [], at(20)]);
   assert.equal(session?.intent, AUTH_PROMPT);
-  assert.deepEqual(asked.background, [{ worktree: oldDir, force: true }]);
+  assert.deepEqual(asked.background, [forced(alice)]);
 
   // A subagent that is still in the first worktree does not move the session back.
   await fire(alice, "post-edit", 21, { subagent: true });
@@ -699,6 +759,60 @@ test("a worktree of the same clone on a branch from before huddle init still cou
   // A hook that is started in that worktree itself has no set-up repository to go by.
   assert.deepEqual(await handleEvent(eventOf(alice, "post-edit", { cwd: oldDir, sessionId: "s-other" }), ioFor(oldDir, { now: at(30) })), {});
   assert.equal(await sessionOf(alice, "s-other"), undefined);
+});
+
+test("in a worktree without .huddle a session goes by the checkout its hook was started in: that one's settings, and syncs that start there", async (t) => {
+  // This team does not share prompts, and syncs with a remote of its own. Both are settings in .huddle/config.json on main.
+  const { h, alice } = await team(t, { remote: "team", captureIntent: false });
+  const teamRemote = join(h.root, "team.git");
+  await alice.git("init", "--quiet", "--bare", teamRemote);
+  await alice.git("remote", "add", "team", teamRemote);
+  /** What huddle has put on the team's remote. */
+  const onTeam = async (): Promise<ActorDoc[]> => {
+    const refs = (await alice.git("--git-dir", teamRemote, "for-each-ref", "--format=%(refname)", "refs/huddle")).split("\n").filter(Boolean);
+    return Promise.all(refs.map(async (ref) => JSON.parse(await alice.git("--git-dir", teamRemote, "cat-file", "-p", `${ref}:doc.json`)) as ActorDoc));
+  };
+  /** And on origin, where this team wants nothing of it. */
+  const onOrigin = (): Promise<string> => h.remoteGit("for-each-ref", "--format=%(refname)", "refs/huddle");
+
+  await fire(alice, "session-start", 0);
+  const old = join(alice.dir, "..", "alice-old");
+  await alice.git("worktree", "add", "--quiet", "-b", "old", old, await alice.git("rev-list", "--max-parents=0", "HEAD"));
+  const oldDir = await realpath(old);
+  assert.equal(existsSync(join(oldDir, ".huddle")), false);
+  const asked = record(t);
+
+  // The agent goes into that worktree and is given work there. Its hooks are still started in the project directory.
+  await fire(alice, "pre-edit", 19, { cwd: oldDir, paths: ["customers.sql"] });
+  await fire(alice, "prompt", 20, { cwd: oldDir, prompt: "Migrate the customer table" });
+  await writeFile(join(oldDir, "customers.sql"), "-- a draft\n");
+  await fire(alice, "post-edit", 21, { cwd: oldDir, paths: [join(oldDir, "customers.sql")] });
+  await fire(alice, "turn-end", 22, { cwd: oldDir });
+  const session = await sessionOf(alice);
+  assert.deepEqual([session?.worktree, session?.intent, session?.intentSource], [oldDir, "", "none"], "this team does not share prompts");
+  // Each sync is asked for in the checkout that has the settings. One that starts in the worktree runs on the defaults.
+  assert.deepEqual(asked.background, [forced(alice), throttled(alice), throttled(alice), forced(alice)]);
+  assert.deepEqual([asked.options[1]?.config?.remote, asked.options[1]?.config?.captureIntent], ["team", false]);
+
+  // What the detached process does then, in the directory it was started in.
+  const startedIn = relative(alice.dir, asked.background.at(-1)?.worktree ?? "");
+  assert.deepEqual(await alice.huddle(["sync", "--background", "--force"], { cwd: startedIn, now: at(23) }), { code: 0, stdout: "", stderr: "" });
+  assert.deepEqual(
+    (await onTeam()).map((doc) => doc.sessions.map((one) => [one.branch, one.intent, one.files])),
+    [[["old", "", ["customers.sql"]]]],
+  );
+  assert.equal(await onOrigin(), "", "huddle pushed to a remote this team does not sync with");
+
+  // A new context in that worktree. The sync that a session-start waits for goes by the same settings.
+  await writeFile(join(oldDir, "orders.sql"), "-- a draft\n");
+  await fire(alice, "session-start", 30, { cwd: oldDir });
+  assert.deepEqual(asked.waitedIn, [alice.dir], "that sync is a process of its own outside the tests, and reads the settings where it starts");
+  assert.deepEqual((await onTeam())[0]?.sessions[0]?.files, ["customers.sql", "orders.sql"]);
+  assert.equal(await onOrigin(), "");
+
+  // And so does the sync that says the session has ended.
+  await fire(alice, "session-end", 40, { cwd: oldDir });
+  assert.deepEqual([await sessionsOf(alice), asked.background.at(-1)], [[], forced(alice)]);
 });
 
 test("a session that goes into another set-up clone is recorded there as well, and ends in both", async (t) => {
@@ -806,10 +920,11 @@ test("damaged state files do not stop a hook: local.json, the cache, a seen file
   await writeFile(join(paths.seenDir, seenName ?? "s-bob"), "][");
   assert.deepEqual(await fire(bob, "prompt", 28, { prompt: "continue" }), { context: text(ALONE, NEVER_FETCHED) });
 
-  // The team's config (a merge conflict in it): prompts stop being recorded rather than the hook failing.
+  // The team's config (a merge conflict in it): nobody can tell any more whether this team shares prompts. So none
+  // is recorded and the one that was is taken back, rather than the hook failing.
   await writeFile(paths.teamConfigFile, "<<<<<<< HEAD\n{}\n=======\n");
   assert.deepEqual(await fire(bob, "prompt", 29, { prompt: "Rewrite everything in Rust" }), {});
-  assert.equal((await sessionOf(bob))?.intent, "Add the login page");
+  assert.deepEqual([(await sessionOf(bob))?.intent, (await sessionOf(bob))?.intentSource], ["", "none"]);
   assert.match(await logOf(bob), /\[config\] .*merge conflict markers/);
 });
 
