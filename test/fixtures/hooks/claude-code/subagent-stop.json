@@ -1,0 +1,25 @@
+{
+  "session_id": "48cbc8c5-de5a-4f40-96e1-a29110c22e6e",
+  "transcript_path": "/home/dev/.claude/projects/-home-dev-acme/48cbc8c5-de5a-4f40-96e1-a29110c22e6e.jsonl",
+  "cwd": "/home/dev/acme",
+  "prompt_id": "ec30b516-b70d-4ce0-8821-424c4e77a979",
+  "permission_mode": "auto",
+  "agent_id": "a261484e28648ed30",
+  "agent_type": "general-purpose",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "SubagentStop",
+  "stop_hook_active": false,
+  "agent_transcript_path": "/home/dev/.claude/projects/-home-dev-acme/48cbc8c5-de5a-4f40-96e1-a29110c22e6e/subagents/agent-a261484e28648ed30.jsonl",
+  "background_tasks": [
+    {
+      "id": "a261484e28648ed30",
+      "type": "subagent",
+      "status": "running",
+      "description": "Create sub.txt with hi",
+      "agent_type": "general-purpose"
+    }
+  ],
+  "session_crons": []
+}

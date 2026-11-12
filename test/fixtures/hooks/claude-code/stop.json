@@ -1,0 +1,15 @@
+{
+  "session_id": "6835a033-358b-4497-a94e-356ac1bac1e3",
+  "transcript_path": "/home/dev/.claude/projects/-home-dev-acme/6835a033-358b-4497-a94e-356ac1bac1e3.jsonl",
+  "cwd": "/home/dev/acme",
+  "prompt_id": "880fcd13-47df-4475-b7d0-23e800c91e73",
+  "permission_mode": "auto",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "Stop",
+  "stop_hook_active": false,
+  "last_assistant_message": "HS=6835a033-358b-4497-a94e-356ac1bac1e3\nMARKER-START-7731\nMARKER-PROMPT-4412\nMARKER-PREEDIT-9920",
+  "background_tasks": [],
+  "session_crons": []
+}
