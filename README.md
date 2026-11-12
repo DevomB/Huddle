@@ -243,6 +243,7 @@ Known and not fixed. Read these before you depend on it.
 - Teammates may treat a session as gone between 12 and 15 minutes after it was last active, not exactly 15.
 - Hooks have deadlines: 150 ms before an edit, 300 ms at a prompt, 4 seconds at session start. On a slow or busy machine (a busy Windows machine, a slow disk, a scanner that reads every file first) a hook can run out of time before it has done its work. It then says nothing and writes a line to the debug log, `.git/huddle/log`, which `git huddle doctor` points at. `HUDDLE_HOOK_PATIENCE`, a number from 1 to 20 in the environment of whatever starts the agent, makes every deadline that many times longer. It gives no extra time for the remote.
 - A commit waits at most 1 second for a sync, so the first commit after a long pause may be checked against the older team state.
+- Commands in one clone take turns. A task command (`task add`, `claim`, `done`, `drop`) and `decide` sync with the remote first, and a clone runs one sync at a time. A command that has waited 20 seconds for its turn stops with exit 1 and changes nothing ("another huddle command is still syncing in this clone; nothing was changed"); run it again. On a slow machine, several of these started at once in one clone can each take more than half a minute.
 
 **Sessions and claims**
 - A claim and a task both end with the session that holds them. A one-shot session (`claude -p`) releases everything when it exits.
