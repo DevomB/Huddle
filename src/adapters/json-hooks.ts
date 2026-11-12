@@ -15,7 +15,7 @@ import { constants } from "node:fs";
 import { access, chmod, lstat, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, delimiter, dirname, isAbsolute, join, relative, sep } from "node:path";
 import { CliError } from "../core/io.ts";
-import type { CheckResult, HookEventType, InstallResult } from "./types.ts";
+import type { CheckResult, HookEventType } from "./types.ts";
 
 export type Json = Record<string, unknown>;
 
@@ -533,17 +533,6 @@ export async function fileNamesHook(path: string, agent: string): Promise<boolea
 
 type Standing = "ok" | "differs" | "missing";
 
-/**
- * `broken`: the hooks are there and cannot work as they are, which doctor
- * warns about; an adapter that was never installed is only mentioned.
- * `files`: every file of the adapter that the team commits, changed by this
- * run or not, which init uses to say what is still to be committed and doctor
- * to say what is not committed yet. They are optional fields of the contract
- * that T2.3 adds to types.ts; until that is merged they are spelled out here.
- */
-export type Check = CheckResult & { broken?: boolean; files?: string[] };
-export type Installed = InstallResult & { files?: string[] };
-
 /** How one event's registration stands, plus the bundle its handler runs. */
 function standingOf(file: HookFile, hooks: Json | null, registration: Registration): { standing: Standing; bundle: string | null } {
   const groups = hooks === null ? undefined : hooks[registration.event];
@@ -585,7 +574,7 @@ function staleEvents(file: HookFile, hooks: Json | null): string[] {
 }
 
 export interface Checked {
-  result: Check;
+  result: CheckResult;
   /** The parsed file when it could be read, for checks that are the adapter's own. */
   settings: Json | null;
   /** The events under which a command of the user's also names huddle's hook (see twiceNote). */
