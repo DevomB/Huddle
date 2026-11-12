@@ -34,10 +34,10 @@
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { asRecord, asText, checkHooks, clip, contextOutput, exists, installHooks, onPath } from "./json-hooks.ts";
-import type { HookFile, Json, Registration } from "./json-hooks.ts";
+import { asRecord, asText, checkHooks, clip, contextOutput, exists, installHooks, onPath, plainCommand, twiceNote } from "./json-hooks.ts";
+import type { Check, HookFile, Installed, Json, Registration } from "./json-hooks.ts";
 import { SILENT } from "./types.ts";
-import type { Adapter, CheckResult, HookEvent, HookEventType, HookInput, HookOutcome, HookOutput, InstallOptions, InstallResult } from "./types.ts";
+import type { Adapter, HookEvent, HookEventType, HookInput, HookOutcome, HookOutput, InstallOptions } from "./types.ts";
 
 const NAME = "codex";
 const HOOKS = ".codex/hooks.json";
@@ -215,11 +215,11 @@ function windowsCommand(bundle: string): string {
 const POSIX_COMMAND =
   /^command -v node >\/dev\/null 2>&1 \|\| exit 0; test -f "\$\(git rev-parse --show-toplevel 2>\/dev\/null\)\/([A-Za-z0-9._/-]+)" \|\| exit 0; node "\$\(git rev-parse --show-toplevel\)\/\1" hook codex$/;
 
-/**
- * Any command that runs a file named exactly huddle.mjs as `hook codex`,
- * however the path is written: an older install, or one edited by hand.
- */
-const OURS = /(?:^|[\s"'\\/])huddle\.mjs["']?\s+hook\s+codex(?![\w-])/;
+/** The command of the version before, which checked for node and not for the bundle. Again the whole line. */
+const EARLIER_COMMAND = /^command -v node >\/dev\/null 2>&1 \|\| exit 0; node "\$\(git rev-parse --show-toplevel\)\/[A-Za-z0-9._/-]+" hook codex$/;
+
+/** The plain line a hand might write instead: `node <path>/huddle.mjs hook codex` and nothing else. */
+const PLAIN_COMMAND = plainCommand(NAME);
 
 const HOOKS_FILE: HookFile = {
   path: HOOKS,
@@ -232,9 +232,12 @@ const HOOKS_FILE: HookFile = {
     if (registration.async === true) handler.async = true;
     return handler;
   },
+  agent: NAME,
   isOurs(value) {
     const handler = asRecord(value);
-    return handler !== null && handler.type === "command" && typeof handler.command === "string" && OURS.test(handler.command);
+    if (handler === null || handler.type !== "command" || typeof handler.command !== "string") return false;
+    // The whole command, in a form huddle has written (for any bundle) or the plain one. A longer line that contains it is the user's.
+    return POSIX_COMMAND.test(handler.command) || EARLIER_COMMAND.test(handler.command) || PLAIN_COMMAND.test(handler.command);
   },
   bundleOf(handler) {
     return POSIX_COMMAND.exec(asText(handler.command))?.[1] ?? null;
@@ -244,9 +247,10 @@ const HOOKS_FILE: HookFile = {
 const TRUST_NOTE =
   "Codex runs a project's hooks only after two steps, which each teammate does once: trust the project when Codex asks, then review the hooks by running /hooks in Codex and trusting huddle's. Codex asks for that review again whenever a hook's definition changes.";
 
-async function install(opts: InstallOptions): Promise<InstallResult> {
-  const changed = await installHooks(HOOKS_FILE, opts.repoRoot, opts.bundle);
-  return { changed: changed ? [HOOKS] : [], notes: [TRUST_NOTE] };
+async function install(opts: InstallOptions): Promise<Installed> {
+  const { changed, twice } = await installHooks(HOOKS_FILE, opts.repoRoot, opts.bundle);
+  const also = twiceNote(HOOKS_FILE, twice);
+  return { changed: changed ? [HOOKS] : [], notes: also === null ? [TRUST_NOTE] : [TRUST_NOTE, also], files: [HOOKS] };
 }
 
 // ---------------------------------------------------------------------------
@@ -304,10 +308,12 @@ async function hooksFeatureIn(path: string): Promise<boolean | undefined> {
 }
 
 /** check(), with the surroundings passed in. */
-export async function checkCodex(repoRoot: string, around: Surroundings): Promise<CheckResult> {
-  const { result } = await checkHooks(HOOKS_FILE, repoRoot);
+export async function checkCodex(repoRoot: string, around: Surroundings): Promise<Check> {
+  const { result, twice } = await checkHooks(HOOKS_FILE, repoRoot);
   if (!result.installed) return result;
   const notes = [TRUST_NOTE];
+  const also = twiceNote(HOOKS_FILE, twice);
+  if (also !== null) notes.push(also);
   // The project's config outranks the user's: the first layer that says anything decides.
   const userConfig = join(codexHome(around), "config.toml");
   const inProject = await hooksFeatureIn(join(repoRoot, PROJECT_CONFIG));

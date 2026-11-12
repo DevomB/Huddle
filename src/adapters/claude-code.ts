@@ -28,16 +28,19 @@
 //   moved with /cd, runs none of these hooks. install() and check() say so.
 // - It reads .claude/settings.local.json from the repository root, and in a
 //   linked worktree from the main checkout's root.
+//
+// Cursor loads this file's hooks as well. They do nothing there: see
+// parsePayload().
 
 import { exec, execFile } from "node:child_process";
 import { realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { locateRepo } from "../core/paths.ts";
-import { asRecord, asText, checkHooks, clip, contextOutput, exists, installHooks, onPath, readJsonObject } from "./json-hooks.ts";
-import type { HookFile, Json, Registration } from "./json-hooks.ts";
+import { asRecord, asText, checkHooks, clip, contextOutput, exists, fileNamesHook, installHooks, onPath, plainCommand, readJsonObject, twiceNote } from "./json-hooks.ts";
+import type { Check, HookFile, Installed, Json, Registration } from "./json-hooks.ts";
 import { SILENT } from "./types.ts";
-import type { Adapter, CheckResult, HookEvent, HookEventType, HookInput, HookOutcome, HookOutput, InstallOptions, InstallResult } from "./types.ts";
+import type { Adapter, HookEvent, HookEventType, HookInput, HookOutcome, HookOutput, InstallOptions } from "./types.ts";
 
 const NAME = "claude-code";
 const SETTINGS = ".claude/settings.json";
@@ -174,6 +177,21 @@ function shellChangedPaths(payload: Json): string[] {
 function parsePayload(input: HookInput): HookEvent | null {
   const payload = asRecord(JSON.parse(input.stdin));
   if (payload === null) return null;
+  // Cursor runs the hooks in .claude/settings.json too, unless that is
+  // switched off there (https://cursor.com/docs/reference/third-party-hooks,
+  // read 2026-11-12), and every payload of Cursor's carries `cursor_version`.
+  // Such a session is the Cursor adapter's (cursor.ts): were both adapters to
+  // take it, one Cursor session would be recorded twice, once as each agent.
+  // Not because the answer would be unsafe: that page says Cursor reads
+  // answers in Claude Code's form. Whether Cursor puts `cursor_version` on the
+  // payload of a hook it loaded from this file is not documented. The price
+  // of standing down is a repository with these hooks and without Cursor's:
+  // a Cursor session there is invisible, which check() says (CURSOR_NOTE) and
+  // Cursor's detect() avoids for a default init.
+  // Any value counts, not only the text the page shows: a payload of Claude
+  // Code's own has no such field at all.
+  const cursorVersion = payload.cursor_version;
+  if (cursorVersion !== undefined && cursorVersion !== null && cursorVersion !== "") return null;
   const nativeEvent = asText(payload.hook_event_name);
   const type = TYPE_OF_EVENT.get(nativeEvent);
   const sessionId = asText(payload.session_id).trim();
@@ -293,22 +311,27 @@ const SETTINGS_FILE: HookFile = {
     if (registration.async === true) handler.async = true;
     return handler;
   },
+  agent: NAME,
   isOurs(value) {
     const handler = asRecord(value);
-    if (handler === null || handler.type !== "command") return false;
+    if (handler === null || handler.type !== "command" || typeof handler.command !== "string") return false;
     if (Array.isArray(handler.args)) {
+      // Exec form: node itself, started on a file named exactly huddle.mjs, with these three words and no more.
+      // A wrapper of the user's that is handed the same words is theirs, and so is a line with a word added.
       const [script, verb, agent] = handler.args as unknown[];
-      return typeof script === "string" && /(?:^|[\\/])huddle\.mjs$/.test(script) && verb === "hook" && agent === NAME;
+      const runsNode = /(?:^|[\\/])node(?:\.exe)?$/.test(handler.command);
+      return runsNode && handler.args.length === 3 && typeof script === "string" && /(?:^|[\\/])huddle\.mjs$/.test(script) && verb === "hook" && agent === NAME;
     }
-    // Shell form, as an older version or a hand edit might have left it.
-    // The file has to be named exactly huddle.mjs: "not-huddle.mjs hook claude-code" is somebody else's.
-    return typeof handler.command === "string" && /(?:^|[\s"'\\/])huddle\.mjs["']?\s+hook\s+claude-code(?![\w-])/.test(handler.command);
+    // Shell form, as a hand might have written it: the whole line and nothing else.
+    return SHELL_FORM.test(handler.command);
   },
   bundleOf(handler) {
     const script = Array.isArray(handler.args) ? asText(handler.args[0]) : "";
     return script.startsWith(PROJECT_DIR) ? script.slice(PROJECT_DIR.length) : null;
   },
 };
+
+const SHELL_FORM = plainCommand(NAME);
 
 /** What a teammate has to know for the hooks to run at all. init and doctor print these. */
 const ROOT_NOTE =
@@ -319,9 +342,20 @@ const TRUST_NOTE =
   "In an interactive session Claude Code runs a project's hooks only once its workspace trust dialog has been accepted for the folder. Each teammate is asked the first time they start claude in the repo.";
 const NOTES: readonly string[] = [ROOT_NOTE, NODE_NOTE, TRUST_NOTE];
 
-async function install(opts: InstallOptions): Promise<InstallResult> {
-  const changed = await installHooks(SETTINGS_FILE, opts.repoRoot, opts.bundle);
-  return { changed: changed ? [SETTINGS] : [], notes: [...NOTES] };
+/**
+ * For check() alone: install() runs before Cursor's own install in the same
+ * `huddle init`, and would say this about hooks that are a moment away.
+ */
+const CURSOR_NOTE =
+  "Cursor runs these hooks too, unless that is switched off in Cursor, and huddle's Claude Code hooks stand down when it does: a Cursor session belongs to Cursor's own hooks, which are not installed in this repository. Someone working in Cursor here stays invisible to the team until huddle init --agent cursor has been run and committed.";
+/** Where the Cursor adapter keeps its hooks, and its name in huddle's command (cursor.ts, which this file must not import: it reads this one's). */
+const CURSOR_HOOKS = ".cursor/hooks.json";
+const CURSOR_NAME = "cursor";
+
+async function install(opts: InstallOptions): Promise<Installed> {
+  const { changed, twice } = await installHooks(SETTINGS_FILE, opts.repoRoot, opts.bundle);
+  const also = twiceNote(SETTINGS_FILE, twice);
+  return { changed: changed ? [SETTINGS] : [], notes: also === null ? [...NOTES] : [...NOTES, also], files: [SETTINGS] };
 }
 
 // ---------------------------------------------------------------------------
@@ -409,10 +443,13 @@ function hooksDisabledBy(layers: Array<{ name: string; settings: Json | null | "
 }
 
 /** check(), with the surroundings passed in. */
-export async function checkClaudeCode(repoRoot: string, around: Surroundings): Promise<CheckResult> {
-  const { result, settings } = await checkHooks(SETTINGS_FILE, repoRoot);
+export async function checkClaudeCode(repoRoot: string, around: Surroundings): Promise<Check> {
+  const { result, settings, twice } = await checkHooks(SETTINGS_FILE, repoRoot);
   if (!result.installed) return result;
   const notes = [...NOTES];
+  const also = twiceNote(SETTINGS_FILE, twice);
+  if (also !== null) notes.push(also);
+  if (!(await fileNamesHook(join(repoRoot, CURSOR_HOOKS), CURSOR_NAME))) notes.push(CURSOR_NOTE);
   const userSettings = join(userConfigDir(around), "settings.json");
   // In a worktree the local file that counts is the main checkout's. A file
   // left in the worktree by a release before 2.1.211 is still read, below it.
