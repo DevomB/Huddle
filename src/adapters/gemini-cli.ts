@@ -97,10 +97,10 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, posix, win32 } from "node:path";
 import { CliError } from "../core/io.ts";
-import { asRecord, asText, checkHooks, contextOutput, exists, installHooks, onPath } from "./json-hooks.ts";
-import type { HookFile, Json, Registration } from "./json-hooks.ts";
+import { asRecord, asText, checkHooks, contextOutput, exists, installHooks, onPath, plainCommand, twiceNote } from "./json-hooks.ts";
+import type { Check, HookFile, Installed, Json, Registration } from "./json-hooks.ts";
 import { SILENT } from "./types.ts";
-import type { Adapter, CheckResult, HookEvent, HookInput, HookOutcome, HookOutput, InstallOptions, InstallResult } from "./types.ts";
+import type { Adapter, HookEvent, HookInput, HookOutcome, HookOutput, InstallOptions } from "./types.ts";
 
 const NAME = "gemini-cli";
 const SETTINGS = ".gemini/settings.json";
@@ -316,14 +316,26 @@ function commandFor(bundle: string): string {
 /** The command exactly as commandFor() writes it, with the bundle path captured. */
 const COMMAND = /^node ([A-Za-z0-9._/][A-Za-z0-9._/-]*) hook gemini-cli; exit 0$/;
 
+/** The plain line a hand might write: `node <path>/huddle.mjs hook gemini-cli` and nothing else. */
+const PLAIN_COMMAND = plainCommand(NAME);
+
+/** The same with the exit at its end, which a hand may have spaced differently. */
+const EXIT_AT_THE_END = /\s*;\s*exit\s+0\s*$/;
+
 /**
- * Any command that runs a file named exactly huddle.mjs as `hook gemini-cli`,
- * however the path is written: an older install, or one edited by hand.
+ * Is the whole command huddle's hook and nothing else? In the form this
+ * version writes, for any bundle, or the plain line with or without the exit
+ * at its end (an install edited by hand). A longer line that contains it
+ * (`... && ./notify.sh`, `time node ... | tee log`, an echo that mentions it)
+ * is the user's and is left alone.
  */
-const OURS = /(?:^|[\s"'\\/])huddle\.mjs["']?\s+hook\s+gemini-cli(?![\w-])/;
+function isWholeCommand(command: string): boolean {
+  return COMMAND.test(command) || PLAIN_COMMAND.test(command.replace(EXIT_AT_THE_END, ""));
+}
 
 const SETTINGS_FILE: HookFile = {
   path: SETTINGS,
+  agent: NAME,
   registrations: REGISTRATIONS,
   handlerFor(registration, bundle) {
     if (!SHELL_INERT.test(bundle)) {
@@ -333,7 +345,7 @@ const SETTINGS_FILE: HookFile = {
   },
   isOurs(value) {
     const handler = asRecord(value);
-    return handler !== null && typeof handler.command === "string" && OURS.test(handler.command);
+    return handler !== null && typeof handler.command === "string" && isWholeCommand(handler.command);
   },
   bundleOf(handler) {
     return COMMAND.exec(asText(handler.command))?.[1] ?? null;
@@ -412,20 +424,24 @@ async function startsWithMark(repoRoot: string): Promise<boolean> {
   return text.startsWith(MARK);
 }
 
-async function install(opts: InstallOptions): Promise<InstallResult> {
+async function install(opts: InstallOptions): Promise<Installed> {
   let changed: boolean;
+  let twice: string[];
   try {
-    changed = await installHooks(SETTINGS_FILE, opts.repoRoot, opts.bundle);
+    ({ changed, twice } = await installHooks(SETTINGS_FILE, opts.repoRoot, opts.bundle));
   } catch (error) {
-    // "Not valid JSON" is true and no help to someone whose file Gemini CLI reads without complaint.
-    if (error instanceof CliError && (await commentsAreInTheWay(opts.repoRoot))) {
+    // "Not valid JSON" is true and no help to someone whose file Gemini CLI reads without complaint. Only that
+    // refusal is reworded: one about where the file is (a link out of the checkout, say) stands as it is.
+    if (error instanceof CliError && error.message.includes("is not valid JSON") && (await commentsAreInTheWay(opts.repoRoot))) {
       throw new CliError((await startsWithMark(opts.repoRoot)) ? COMMENTS_AND_MARK_INSTALL : COMMENTS_INSTALL);
     }
     throw error;
   }
   const notes = [START_NOTE, LATE_NOTE];
+  const also = twiceNote(SETTINGS_FILE, twice);
+  if (also !== null) notes.push(also);
   if (await startsWithMark(opts.repoRoot)) notes.unshift(MARK_NOTE);
-  return { changed: changed ? [SETTINGS] : [], notes };
+  return { changed: changed ? [SETTINGS] : [], notes, files: [SETTINGS] };
 }
 
 // ---------------------------------------------------------------------------
@@ -490,10 +506,16 @@ function switchesIn(settings: Json | null | "invalid"): { enabled: boolean | und
 }
 
 /** check(), with the surroundings passed in. */
-export async function checkGeminiCli(repoRoot: string, around: Surroundings): Promise<CheckResult> {
-  const { result, settings } = await checkHooks(SETTINGS_FILE, repoRoot);
-  if (!result.installed) return (await commentsAreInTheWay(repoRoot)) ? { ...result, detail: COMMENTS_CHECK } : result;
+export async function checkGeminiCli(repoRoot: string, around: Surroundings): Promise<Check> {
+  const { result, settings, twice } = await checkHooks(SETTINGS_FILE, repoRoot);
+  if (!result.installed) {
+    // With comments as the only obstacle the hooks in the file may well be running: Gemini CLI reads it. Not known to be broken.
+    const unparsed = result.detail.includes("cannot be read as a JSON object");
+    return unparsed && (await commentsAreInTheWay(repoRoot)) ? { installed: false, detail: COMMENTS_CHECK, notes: [] } : result;
+  }
   const notes = [START_NOTE, LATE_NOTE];
+  const also = twiceNote(SETTINGS_FILE, twice);
+  if (also !== null) notes.push(also);
   const userFile = join(geminiHome(around), "settings.json");
   const system = systemSettingsFiles(around);
   const project = { file: SETTINGS, says: switchesIn(settings) };

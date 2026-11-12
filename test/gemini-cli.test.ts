@@ -669,9 +669,10 @@ async function readJson(file: string): Promise<Json> {
   return JSON.parse(await readFile(file, "utf8")) as Json;
 }
 
+/** A handler as this version writes it, for any bundle. A longer command that contains huddle's is the user's. */
 function isOurs(candidate: unknown): boolean {
   const command = (candidate as Json | null)?.command;
-  return typeof command === "string" && command.includes(" hook gemini-cli");
+  return typeof command === "string" && /^node [\w./-]+ hook gemini-cli; exit 0$/.test(command);
 }
 
 /** The file with every huddle handler taken out again, and the groups and events that leaves empty. */
@@ -851,6 +852,9 @@ test("install: handlers left by an older or hand-edited install are brought up t
       AfterAgent: [{ hooks: [{ name: "huddle-sync", type: "command", command: COMMAND, timeout: 5000 }] }],
       // Under a matcher, which on SessionEnd is compared with the reason.
       SessionEnd: [{ matcher: "exit", hooks: [handler(60000)] }],
+      // Under events this version registers nothing for: alone, and next to a handler of the user's.
+      Notification: [{ hooks: [handler(5000)] }],
+      PreCompress: [{ hooks: [userGuard, handler(5000)] }],
     },
   });
   assert.deepEqual((await geminiCli.install({ repoRoot: root, bundle: BUNDLE })).changed, [".gemini/settings.json"]);
@@ -865,11 +869,143 @@ test("install: handlers left by an older or hand-edited install are brought up t
       AfterTool: [{ matcher: NOT_READ_ONLY, hooks: [handler(5000)] }],
       AfterAgent: [{ hooks: [handler(5000)] }],
       SessionEnd: [{ hooks: [handler(5000)] }],
+      PreCompress: [{ hooks: [userGuard] }],
     },
   });
   const text = await readFile(file, "utf8");
   assert.deepEqual((await geminiCli.install({ repoRoot: root, bundle: BUNDLE })).changed, []);
   assert.equal(await readFile(file, "utf8"), text);
+});
+
+test("check: a handler of huddle's under an event this version does not use is reported, and install takes it out", async (t) => {
+  const around = aroundOf(await emptyDir(t));
+  const { root, file } = await scratchRepo(t);
+  await geminiCli.install({ repoRoot: root, bundle: BUNDLE });
+  await withBundle(root);
+  const settings = await readJson(file);
+  (settings.hooks as Record<string, unknown>).Notification = [{ hooks: [handler(5000)] }];
+  await writeFile(file, JSON.stringify(settings, null, 2));
+  assert.deepEqual(await checkGeminiCli(root, around), {
+    installed: false,
+    broken: true,
+    detail: "huddle hooks in .gemini/settings.json are still there under Notification, which this version does not use. Run huddle init.",
+    notes: [],
+  });
+  assert.deepEqual((await geminiCli.install({ repoRoot: root, bundle: BUNDLE })).changed, [".gemini/settings.json"]);
+  assert.deepEqual(await readJson(file), installed());
+  assert.equal((await checkGeminiCli(root, around)).installed, true);
+});
+
+test("install: a command of the user's that runs huddle's hook among other things, or only names it, is the user's and stays", async (t) => {
+  // The three from the review of this adapter, each with keys of its own that a replacement would have lost.
+  const chained = { name: "notify", type: "command", command: "node .huddle/huddle.mjs hook gemini-cli && ./notify.sh", timeout: 30000 };
+  const timed = { type: "command", command: "time node tools/huddle.mjs hook gemini-cli | tee /tmp/log", description: "how long does it take" };
+  const mention = { type: "command", command: "echo 'TODO: node .huddle/huddle.mjs hook gemini-cli is noisy' >> notes.txt" };
+  const theirs = { hooks: { AfterAgent: [{ hooks: [chained] }], BeforeAgent: [{ hooks: [timed] }], AfterTool: [{ matcher: "write_file", hooks: [mention] }] } };
+  const { root, file } = await scratchRepo(t, theirs);
+  const result = await geminiCli.install({ repoRoot: root, bundle: BUNDLE });
+  assert.deepEqual(result.changed, [".gemini/settings.json"]);
+  const merged = await readJson(file);
+  const hooks = merged.hooks as Record<string, unknown[]>;
+  // Each is where it was, as it was, and huddle's own handler stands next to it.
+  assert.deepEqual(hooks.AfterAgent, [{ hooks: [chained] }, { hooks: [handler(5000)] }]);
+  assert.deepEqual(hooks.BeforeAgent, [{ hooks: [timed] }, { hooks: [handler(5000)] }]);
+  assert.deepEqual(hooks.AfterTool, [
+    { matcher: "write_file", hooks: [mention] },
+    { matcher: NOT_READ_ONLY, hooks: [handler(5000)] },
+  ]);
+  assert.deepEqual(withoutHuddle(merged), theirs, "taking huddle's handlers out again gives back the original");
+  assert.deepEqual(countOurs(merged), ONE_EACH);
+
+  // The user is told that the hook may now run twice, by init and by doctor, every time.
+  const twice =
+    "In .gemini/settings.json, a hook command of your own under AfterAgent, BeforeAgent, AfterTool also names huddle's hook. huddle left it as it is and has its own handler next to it. If yours runs huddle's hook, the hook now runs twice on that event: take it out of yours.";
+  assert.equal(result.notes.length, 3);
+  assert.equal(result.notes[2], twice);
+  const text = await readFile(file, "utf8");
+  const again = await geminiCli.install({ repoRoot: root, bundle: BUNDLE });
+  assert.deepEqual([again.changed, again.notes[2]], [[], twice]);
+  assert.equal(await readFile(file, "utf8"), text);
+  await withBundle(root);
+  const checked = await checkGeminiCli(root, aroundOf(await emptyDir(t)));
+  assert.equal(checked.installed, true);
+  assert.equal(checked.notes.length, 3);
+  assert.equal(checked.notes[2], twice);
+});
+
+test("install: huddle's is the whole command line and nothing else, with the exit at its end or without", async (t) => {
+  const afterAgentOf = async (command: string): Promise<unknown[]> => {
+    const { root, file } = await scratchRepo(t, { hooks: { AfterAgent: [{ hooks: [{ type: "command", command, timeout: 99 }] }] } });
+    await geminiCli.install({ repoRoot: root, bundle: BUNDLE });
+    return ((await readJson(file)).hooks as Record<string, unknown[]>).AfterAgent ?? [];
+  };
+  // Written by this version for another bundle, by an older install or by hand: replaced by the one handler this version writes.
+  const ours = [
+    COMMAND,
+    "node .huddle/huddle.mjs hook gemini-cli",
+    "node .huddle/huddle.mjs hook gemini-cli;exit 0",
+    "node .huddle/huddle.mjs hook gemini-cli ; exit  0 ",
+    "node .huddle/huddle.mjs hook gemini-cli AfterAgent; exit 0",
+    "node huddle.mjs hook gemini-cli",
+    "  node   .huddle/huddle.mjs   hook   gemini-cli  ",
+    'node ".huddle/huddle.mjs" hook gemini-cli; exit 0',
+    'node "$GEMINI_PROJECT_DIR/.huddle/huddle.mjs" hook gemini-cli',
+    "node '/work/my repo/.huddle/huddle.mjs' hook gemini-cli; exit 0",
+    "/usr/local/bin/node .huddle/huddle.mjs hook gemini-cli",
+    "node.exe .huddle\\huddle.mjs hook gemini-cli; exit 0",
+    "node tools/huddle-1.2/huddle.mjs hook gemini-cli; exit 0",
+    // The form this version writes, for a bundle under another file name.
+    "node vendor/huddle-bundle.mjs hook gemini-cli; exit 0",
+  ];
+  for (const command of ours) assert.deepEqual(await afterAgentOf(command), [{ hooks: [handler(5000)] }], command);
+
+  // Anything more on the line, before or after, and the line is the user's: it stays, and huddle's is added.
+  const theirs = [
+    "node .huddle/huddle.mjs hook gemini-cli && ./notify.sh",
+    "node .huddle/huddle.mjs hook gemini-cli || exit 0",
+    "node .huddle/huddle.mjs hook gemini-cli | tee -a hooks.log",
+    "node .huddle/huddle.mjs hook gemini-cli > /dev/null",
+    "node .huddle/huddle.mjs hook gemini-cli 2>&1; exit 0",
+    "node .huddle/huddle.mjs hook gemini-cli &",
+    "node .huddle/huddle.mjs hook gemini-cli;",
+    "node .huddle/huddle.mjs hook gemini-cli; exit 1",
+    "node .huddle/huddle.mjs hook gemini-cli; exit 0; ./notify.sh",
+    "node .huddle/huddle.mjs hook gemini-cli; ./notify.sh; exit 0",
+    "node .huddle/huddle.mjs hook gemini-cli; exit 0; exit 0",
+    "time node tools/huddle.mjs hook gemini-cli | tee /tmp/log",
+    "./fmt.sh; node .huddle/huddle.mjs hook gemini-cli; exit 0",
+    "echo node .huddle/huddle.mjs hook gemini-cli; exit 0",
+    "sh -c 'node .huddle/huddle.mjs hook gemini-cli'",
+    "node $(pwd)/.huddle/huddle.mjs hook gemini-cli",
+    "node --inspect .huddle/huddle.mjs hook gemini-cli; exit 0",
+    // Not the form this version writes, and not a file named huddle.mjs.
+    "node vendor/huddle-bundle.mjs hook gemini-cli",
+  ];
+  for (const command of theirs) {
+    assert.deepEqual(await afterAgentOf(command), [{ hooks: [{ type: "command", command, timeout: 99 }] }, { hooks: [handler(5000)] }], command);
+  }
+});
+
+test("install: a .gemini that is a link out of the checkout is refused in a sentence, and nothing is written there", { skip: process.platform === "win32" }, async (t) => {
+  const { root } = await scratchRepo(t);
+  const outside = await emptyDir(t);
+  await symlink(outside, join(root, ".gemini"));
+  await assert.rejects(geminiCli.install({ repoRoot: root, bundle: BUNDLE }), (error: unknown) => {
+    assert.ok(error instanceof CliError, `a message for the user, not a crash: ${String(error)}`);
+    assert.match(error.message, /^\.gemini\/settings\.json is, through a symbolic link, a file outside this checkout/);
+    return true;
+  });
+  assert.deepEqual(await readdir(outside), []);
+  const checked = await checkGeminiCli(root, aroundOf(await emptyDir(t)));
+  assert.equal(checked.installed, false);
+  assert.match(checked.detail, /outside this checkout/);
+
+  // Where the file is comes first: comments in a file out there are not what the user is told about.
+  const commented = '// shared between my projects\n{ "hooks": {} }\n';
+  await writeFile(join(outside, "settings.json"), commented);
+  await assert.rejects(geminiCli.install({ repoRoot: root, bundle: BUNDLE }), /outside this checkout/);
+  assert.equal(await readFile(join(outside, "settings.json"), "utf8"), commented);
+  assert.match((await checkGeminiCli(root, aroundOf(await emptyDir(t)))).detail, /outside this checkout/);
 });
 
 test("install: hooks for another agent, or that merely look similar, are not huddle's", async (t) => {
@@ -997,7 +1133,7 @@ test("install and check: a settings file with a byte order mark in front keeps i
   assert.deepEqual(checked.notes, first.notes, "init and doctor say the same");
   // Installing again changes nothing and says it again.
   const second = await geminiCli.install({ repoRoot: root, bundle: BUNDLE });
-  assert.deepEqual(second, { changed: [], notes: first.notes });
+  assert.deepEqual(second, { changed: [], notes: first.notes, files: [".gemini/settings.json"] });
 
   // It comes before the note about hooks being off: that one does not matter until the file can be read.
   await writeFile(file, `${MARK}${JSON.stringify({ ...installed(), hooksConfig: { enabled: false } })}`);
@@ -1207,6 +1343,7 @@ test("check: reports what install left, and what is still missing", async (t) =>
   await geminiCli.install({ repoRoot: root, bundle: BUNDLE });
   assert.deepEqual(await checkGeminiCli(root, around), {
     installed: false,
+    broken: true,
     detail: "hooks in .gemini/settings.json run .huddle/huddle.mjs, which is not in this checkout. Run huddle init.",
     notes: [],
   });
@@ -1248,6 +1385,7 @@ test("check: goes by the bundle the handlers run, wherever it is, and flags a co
   await withBundle(root);
   assert.deepEqual(await checkGeminiCli(root, around), {
     installed: false,
+    broken: true,
     detail: "hooks in .gemini/settings.json run tools/huddle-1.2/huddle.mjs, which is not in this checkout. Run huddle init.",
     notes: [],
   });
@@ -1262,6 +1400,7 @@ test("check: goes by the bundle the handlers run, wherever it is, and flags a co
   await writeFile(file, JSON.stringify(settings));
   assert.deepEqual(await checkGeminiCli(root, around), {
     installed: false,
+    broken: true,
     detail: "huddle hooks in .gemini/settings.json are not what this version installs for BeforeAgent. Run huddle init.",
     notes: [],
   });
@@ -1277,7 +1416,32 @@ test("check: a file with no huddle hooks, or that cannot be read, is not install
     assert.deepEqual(await checkGeminiCli(root, around), { installed: false, detail: "no huddle hooks in .gemini/settings.json. Run huddle init.", notes: [] });
   }
   const { root } = await scratchRepo(t, "{ nope");
-  assert.deepEqual(await checkGeminiCli(root, around), { installed: false, detail: ".gemini/settings.json cannot be read as a JSON object. Fix the file, then run huddle init.", notes: [] });
+  assert.deepEqual(await checkGeminiCli(root, around), {
+    installed: false,
+    detail: ".gemini/settings.json cannot be read as a JSON object, so huddle cannot add its hooks to it. There are none in it now.",
+    notes: [],
+  });
+
+  // With huddle's hooks in it, a file that cannot be read is hooks that do not run: doctor warns.
+  const installedInto = await scratchRepo(t);
+  await geminiCli.install({ repoRoot: installedInto.root, bundle: BUNDLE });
+  await withBundle(installedInto.root);
+  const whole = await readFile(installedInto.file, "utf8");
+  await writeFile(installedInto.file, whole.slice(0, -3));
+  assert.deepEqual(await checkGeminiCli(installedInto.root, around), {
+    installed: false,
+    broken: true,
+    detail: ".gemini/settings.json cannot be read as a JSON object, and huddle's hooks are in it. Fix the file, then run huddle init.",
+    notes: [],
+  });
+  // A comment added to the file huddle wrote is another matter: Gemini CLI reads that file and the hooks in it run. huddle
+  // cannot check them, says why, and does not call them broken.
+  await writeFile(installedInto.file, `// our team's settings\n${whole}`);
+  assert.deepEqual(await checkGeminiCli(installedInto.root, around), {
+    installed: false,
+    detail: ".gemini/settings.json has comments in it, and huddle cannot read it with them. Take the comments out, then run huddle init.",
+    notes: [],
+  });
 });
 
 test("check: says so when Gemini CLI has hooks turned off, the project's settings outranking the user's", async (t) => {
