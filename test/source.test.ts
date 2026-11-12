@@ -9,6 +9,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { UNSAFE_RANGES } from "../src/core/docs.ts";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 
@@ -20,26 +21,21 @@ function sourceFiles(dir: string): string[] {
   });
 }
 
-const HIDDEN_RANGES: [number, number][] = [
-  [0x0000, 0x0008],
-  [0x000b, 0x000c],
-  [0x000e, 0x001f],
-  [0x007f, 0x009f],
-  [0x200b, 0x200f],
-  [0x2028, 0x202e],
-  [0x2066, 0x2069],
-  [0xfeff, 0xfeff],
-];
+// Everything the document gate removes (see UNSAFE_RANGES in docs.ts), except the
+// tab and the line endings a source file is made of.
+const ALLOWED_IN_SOURCE = new Set([0x09, 0x0a, 0x0d]);
+const isHidden = (codePoint: number) =>
+  !ALLOWED_IN_SOURCE.has(codePoint) && UNSAFE_RANGES.some(([from, to]) => codePoint >= from && codePoint <= to);
 
 test("no source file contains control, invisible or bidi characters", () => {
   const offenders: string[] = [];
   for (const dir of ["src", "test", "scripts"]) {
     for (const file of sourceFiles(join(root, dir))) {
-      const lines = readFileSync(file, "utf8").split("\n");
+      const lines = readFileSync(file, "utf8").split(/\r?\n/);
       lines.forEach((line, index) => {
         for (const ch of line) {
           const codePoint = ch.codePointAt(0)!;
-          if (HIDDEN_RANGES.some(([from, to]) => codePoint >= from && codePoint <= to)) {
+          if (isHidden(codePoint)) {
             offenders.push(`${relative(root, file)}:${index + 1} U+${codePoint.toString(16).padStart(4, "0")}`);
           }
         }

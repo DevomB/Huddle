@@ -4,6 +4,7 @@ import { build } from "esbuild";
 import { chmodSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { banner } from "./banner.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
@@ -18,7 +19,7 @@ await build({
   target: "node20",
   minify: false,
   legalComments: "none",
-  banner: { js: "#!/usr/bin/env node\n// git-huddle " + pkg.version + " - https://github.com/DevomB/huddle - generated file, do not edit" },
+  banner: { js: banner(pkg.version) },
   define: { __HUDDLE_VERSION__: JSON.stringify(pkg.version) },
   logLevel: "warning",
 });
