@@ -1,0 +1,16 @@
+{
+  "session_id": "7c1f0c4e-52b3-4a8e-9d6a-1b2e3f405a6b",
+  "transcript_path": "/home/dev/.gemini/tmp/acme/chats/session-2026-11-12T09-30-7c1f0c4e.json",
+  "cwd": "/home/dev/acme",
+  "hook_event_name": "AfterTool",
+  "timestamp": "2026-11-12T09:30:08.000Z",
+  "tool_name": "run_shell_command",
+  "tool_input": {
+    "command": "npm test",
+    "description": "Run the test suite."
+  },
+  "tool_response": {
+    "llmContent": "Output: 42 passing\nProcess Group PGID: 48213",
+    "returnDisplay": "42 passing"
+  }
+}

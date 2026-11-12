@@ -4,7 +4,7 @@
 // clone and never committed. Team config is committed at .huddle/config.json.
 
 import { createHash } from "node:crypto";
-import { mkdir, readFile } from "node:fs/promises";
+import { mkdir, readFile, realpath, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { git } from "./git.ts";
 import { CliError } from "./io.ts";
@@ -57,6 +57,66 @@ export async function locateRepo(cwd: string): Promise<RepoPaths | null> {
 export async function requireRepo(cwd: string): Promise<RepoPaths> {
   const paths = await locateRepo(cwd);
   if (!paths) throw new CliError("not inside a git repository");
+  return paths;
+}
+
+/** `huddle init` was run in this checkout (or someone made the directory by hand to opt it in). */
+export async function isSetUp(paths: RepoPaths): Promise<boolean> {
+  try {
+    return (await stat(paths.teamDir)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/** The same directory, also when one of the two was reached through a symlink. False when either is gone. */
+export async function sameDirectory(a: string, b: string): Promise<boolean> {
+  if (resolve(a) === resolve(b)) return true;
+  try {
+    return (await realpath(a)) === (await realpath(b));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The checkouts of this clone as git lists them, the main one first. Git is
+ * asked in the common git directory, so this also answers when the worktree a
+ * process was started in has been removed since. A checkout whose directory is
+ * gone, or is not a checkout of this clone any more, is left out. Empty when
+ * git cannot say.
+ */
+export async function listCheckouts(paths: RepoPaths): Promise<RepoPaths[]> {
+  const result = await git(["worktree", "list", "--porcelain"], { cwd: paths.commonDir });
+  if (!result.ok) return [];
+  const found: RepoPaths[] = [];
+  for (const block of result.stdout.split(/\r?\n\r?\n/)) {
+    const lines = block.split(/\r?\n/);
+    const dir = lines.find((line) => line.startsWith("worktree "))?.slice("worktree ".length);
+    // A bare repository's own entry is not a checkout. A quoted path has a newline or the like in it, and is passed over.
+    if (!dir || dir.startsWith('"') || lines.includes("bare")) continue;
+    const checkout = await locateRepo(dir);
+    if (checkout !== null && (await sameDirectory(checkout.commonDir, paths.commonDir))) found.push(checkout);
+  }
+  return found;
+}
+
+/**
+ * The checkout whose settings a command run in `paths` goes by.
+ *
+ * That is `paths` when it is set up. A worktree on a branch from before
+ * `huddle init` has no .huddle, and the defaults are not the team's: with them,
+ * a team that syncs with another remote than origin would have its sessions
+ * pushed to origin. Such a worktree goes by a set-up checkout of the same
+ * clone, the main one first. (A hook goes by the checkout its agent was started
+ * in: hooks/engine.ts.) When no checkout of the clone is set up, it is `paths`
+ * again: in a repository nobody ran init in, huddle works on the defaults.
+ */
+export async function settingsHome(paths: RepoPaths): Promise<RepoPaths> {
+  if (await isSetUp(paths)) return paths;
+  for (const checkout of await listCheckouts(paths)) {
+    if (await isSetUp(checkout)) return checkout;
+  }
   return paths;
 }
 

@@ -3,13 +3,13 @@
 
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { openContext } from "../src/core/context.ts";
 import type { Io } from "../src/core/io.ts";
 import { withLock } from "../src/core/store.ts";
-import { contentHash, foreignSessions, shouldPublish, spawnBackgroundSync, syncWithin } from "../src/core/sync.ts";
+import { contentHash, deferredSyncDue, deferSync, foreignSessions, shouldPublish, spawnBackgroundSync, syncWithin } from "../src/core/sync.ts";
 import { DEFAULT_CONFIG } from "../src/core/types.ts";
 import type { ActorDoc, Cache, LocalState, Session } from "../src/core/types.ts";
 import { BUNDLE, createHarness } from "./harness.ts";
@@ -875,4 +875,311 @@ test("spawnBackgroundSync never throws and does nothing when it would be throttl
   await sleep(300);
   assert.equal(await remoteRefs(h), before);
   assert.ok(await syncIdle(alice));
+});
+
+// ---------------------------------------------------------------------------
+// A background sync that is skipped is made up for (the deferred sync)
+// ---------------------------------------------------------------------------
+
+/** Lets a `huddle` call start detached processes, which the harness otherwise turns off. */
+const LIVE = { HUDDLE_NO_BACKGROUND: "" };
+
+interface Waiting {
+  token: string;
+  dueAt: number;
+}
+
+async function pendingFile(clone: Clone): Promise<string> {
+  return join((await clone.paths()).stateDir, "sync-pending");
+}
+
+async function waiting(clone: Clone): Promise<Waiting | null> {
+  try {
+    return JSON.parse(await readFile(await pendingFile(clone), "utf8")) as Waiting;
+  } catch {
+    return null;
+  }
+}
+
+/** The deferred sync has run and its process is done, so the harness can remove the clone. */
+const settled = async (clone: Clone) => (await syncIdle(clone)) && (await waiting(clone)) === null;
+
+test("a background sync skipped by the throttle is made up for when the interval ends, by one process however many were skipped", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  await ok(alice, ["intent", "one"], at(0));
+  await ok(alice, ["sync"], at(0));
+  const first = await remoteRefs(h);
+
+  // 12 s later something changes and its background sync falls inside the 15 s interval.
+  // That is a plain `git commit` with huddle's hooks: no end of turn follows it.
+  await ok(alice, ["intent", "two"], at(12));
+  await ok(alice, ["sync", "--background"], at(12), LIVE);
+  assert.equal(await remoteRefs(h), first, "a sync 12 s after the last one pushed");
+  const one = await waiting(alice);
+  assert.ok(one, "the skipped sync left nothing behind to make up for it");
+  const left = one.dueAt - Date.now();
+  assert.ok(left > 0 && left <= 3000, `the deferred sync is due in ${left} ms; the interval ends in 3000`);
+
+  // A burst (a rebase runs the hook once per commit): the one that is waiting covers them all.
+  await ok(alice, ["sync", "--background"], at(12), LIVE);
+  await ok(alice, ["sync", "--background"], at(12), LIVE);
+  assert.equal((await waiting(alice))?.token, one.token, "a second deferred sync was started while one was waiting");
+
+  await until("the deferred sync to publish", async () => (await remoteRefs(h)) !== first);
+  await until("the deferred sync to finish", () => settled(alice));
+  assert.equal((await actorDocs(h))[0]!.sessions[0]!.intent, "two");
+  assert.ok(one.dueAt <= Date.now(), "the deferred sync ran before the interval was over");
+});
+
+test("a deferred sync stands down when a sync ran while it waited", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  await ok(alice, ["intent", "one"], at(0));
+  await ok(alice, ["sync"], at(0));
+  await ok(alice, ["intent", "two"], at(13));
+  await ok(alice, ["sync", "--background"], at(13), LIVE);
+  const one = await waiting(alice);
+  assert.ok(one);
+
+  // The end of a turn: a forced sync publishes "two" and takes the deferred sync's job.
+  await ok(alice, ["sync", "--background", "--force"], at(13));
+  assert.equal((await actorDocs(h))[0]!.sessions[0]!.intent, "two");
+  assert.equal(await waiting(alice), null, "the round left the deferred sync waiting");
+  const second = await remoteRefs(h);
+
+  // Were the waiting process to sync after all, it would publish this.
+  await ok(alice, ["intent", "three"], at(13));
+  await sleep(Math.max(0, one.dueAt - Date.now()) + 1500);
+  assert.equal(await remoteRefs(h), second, "the deferred sync ran although a sync had run while it waited");
+  assert.ok(await syncIdle(alice));
+});
+
+test("deferredSyncDue: true at the due time while the file holds the token, false as soon as it does not", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  await ok(alice, ["sync"], at(0)); // creates the state directory
+  const paths = await alice.paths();
+  const file = await pendingFile(alice);
+  const write = (token: string, inMs: number) => writeFile(file, JSON.stringify({ token, dueAt: Date.now() + inMs }));
+
+  await rm(file, { force: true });
+  assert.equal(await deferredSyncDue(paths, "mine"), false, "no file");
+  await write("theirs", 0);
+  assert.equal(await deferredSyncDue(paths, "mine"), false, "another process's file");
+  await writeFile(file, "{");
+  assert.equal(await deferredSyncDue(paths, "mine"), false, "a file that cannot be read");
+
+  await write("mine", 400);
+  let started = Date.now();
+  assert.equal(await deferredSyncDue(paths, "mine"), true);
+  assert.ok(Date.now() - started >= 350, `came back after ${Date.now() - started} ms, before the due time`);
+
+  // A round ran while it waited: the file is gone, or a later skipped sync has put its own there.
+  for (const during of [() => rm(file), () => write("theirs", 5000)]) {
+    await write("mine", 400);
+    started = Date.now();
+    const due = deferredSyncDue(paths, "mine");
+    await sleep(100);
+    await during();
+    assert.equal(await due, false);
+    assert.ok(Date.now() - started >= 350, "it waits out its time before it looks again");
+  }
+
+  // The process that stands down leaves the other one's file where it is, and syncs nothing.
+  const theirs = await readFile(file, "utf8");
+  const before = await remoteRefs(h);
+  await ok(alice, ["intent", "not this process's to publish"], at(1));
+  await ok(alice, ["sync", "--background", "--deferred", "mine"], at(1), LIVE);
+  assert.equal(await readFile(file, "utf8"), theirs, "a deferred sync that stood down took the waiting one's file with it");
+  assert.equal(await remoteRefs(h), before);
+  await rm(file);
+});
+
+test("a background sync skipped because the lock was held runs once the lock is free", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  await ok(alice, ["intent", "behind the lock"], at(0));
+  const paths = await alice.paths();
+
+  const held = await withLock(paths, "sync", async () => {
+    // What `huddle decide` or `huddle task` does: holds the lock without running a round.
+    const r = await alice.huddle(["sync", "--background"], { now: at(1), env: LIVE, timeoutMs: 12_000 });
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(await remoteRefs(h), "", "the skipped sync published");
+    assert.ok(await waiting(alice), "the skipped sync left nothing behind to make up for it");
+  });
+  assert.ok(held.acquired, "the test could not take the sync lock");
+
+  await until("the deferred sync to publish", async () => (await remoteRefs(h)) !== "");
+  await until("the deferred sync to finish", () => settled(alice));
+  assert.equal((await actorDocs(h))[0]!.sessions[0]!.intent, "behind the lock");
+});
+
+test("spawnBackgroundSync with the settings at hand defers a throttled sync instead of dropping it", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  const paths = await alice.paths();
+  const now = new Date();
+  await ok(alice, ["intent", "x"], now.toISOString());
+  await ok(alice, ["sync"], now.toISOString());
+  const before = await remoteRefs(h);
+  await ok(alice, ["intent", "y"], now.toISOString());
+
+  const saved = process.env.HUDDLE_NO_BACKGROUND;
+  delete process.env.HUDDLE_NO_BACKGROUND;
+  try {
+    // The hook engine's call after an edit, 1 s after the last sync, with a 3 s interval.
+    spawnBackgroundSync(paths, BUNDLE, { config: { ...DEFAULT_CONFIG, syncIntervalSeconds: 3 }, now: new Date(now.getTime() + 1000) });
+    const one = await waiting(alice);
+    assert.ok(one, "the throttled sync was dropped");
+    const left = one.dueAt - Date.now();
+    assert.ok(left > 0 && left <= 2000, `due in ${left} ms; 2000 ms of the interval are left`);
+    assert.equal(await remoteRefs(h), before);
+    await until("the deferred sync to publish", async () => (await remoteRefs(h)) !== before);
+    assert.equal((await actorDocs(h))[0]!.sessions[0]!.intent, "y");
+  } finally {
+    process.env.HUDDLE_NO_BACKGROUND = saved;
+    await until("the deferred sync to finish", () => settled(alice));
+  }
+});
+
+test("a deferred sync that died is replaced; one that may still be alive is not", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  await ok(alice, ["intent", "one"], at(0));
+  await ok(alice, ["sync"], at(0));
+  const first = await remoteRefs(h);
+  const file = await pendingFile(alice);
+  await ok(alice, ["intent", "two"], at(13));
+
+  // Due a moment ago: its process may be waiting for the lock right now. Left alone.
+  await writeFile(file, JSON.stringify({ token: "alive", dueAt: Date.now() - 2000 }));
+  await ok(alice, ["sync", "--background"], at(13), LIVE);
+  assert.equal((await waiting(alice))?.token, "alive");
+  // A file that is being written at this moment cannot be read yet. Left alone too.
+  await writeFile(file, "");
+  await ok(alice, ["sync", "--background"], at(13), LIVE);
+  assert.equal(await readFile(file, "utf8"), "");
+
+  // Due a minute ago and still there: its process is gone. The next skipped sync takes over.
+  await writeFile(file, JSON.stringify({ token: "dead", dueAt: Date.now() - 60_000 }));
+  await ok(alice, ["sync", "--background"], at(13), LIVE);
+  const taken = await waiting(alice);
+  assert.ok(taken && taken.token !== "dead", "the dead deferred sync was not replaced");
+  await until("the deferred sync to publish", async () => (await remoteRefs(h)) !== first);
+  await until("the deferred sync to finish", () => settled(alice));
+  assert.equal((await actorDocs(h))[0]!.sessions[0]!.intent, "two");
+
+  // The same for a file that cannot be read and has been lying there for a minute.
+  await ok(alice, ["intent", "three"], at(27));
+  await writeFile(file, "{");
+  const old = new Date(Date.now() - 60_000);
+  await utimes(file, old, old);
+  const second = await remoteRefs(h);
+  await ok(alice, ["sync", "--background"], at(27), LIVE);
+  assert.ok((await waiting(alice))?.token, "the unreadable leftover was not replaced");
+  await until("the deferred sync to publish", async () => (await remoteRefs(h)) !== second);
+  await until("the deferred sync to finish", () => settled(alice));
+  assert.equal((await actorDocs(h))[0]!.sessions[0]!.intent, "three");
+});
+
+test("a deferred sync is the clone's: it runs although the worktree it was started in was removed while it waited", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  await ok(alice, ["intent", "one"], at(0));
+  await ok(alice, ["sync"], at(0));
+  const first = await remoteRefs(h);
+
+  // An event in a linked worktree falls inside the interval and starts the process that waits.
+  const linked = await alice.addWorktree("linked");
+  await ok(linked, ["sync", "--background"], at(12), LIVE);
+  const one = await waiting(alice);
+  assert.ok(one, "the skipped sync left nothing behind to make up for it");
+
+  // An event in the main checkout finds it waiting and leaves its own sync to it.
+  await ok(alice, ["intent", "two"], at(12));
+  await ok(alice, ["sync", "--background"], at(12), LIVE);
+  assert.equal((await waiting(alice))?.token, one.token);
+  assert.equal(await remoteRefs(h), first);
+
+  // The linked worktree is removed before the interval is over (an agent's worktree, cleaned up when it is done).
+  await alice.git("worktree", "remove", "--force", linked.dir);
+  assert.equal(existsSync(linked.dir), false);
+
+  await until("the deferred sync to publish", async () => (await remoteRefs(h)) !== first);
+  await until("the deferred sync to finish", () => settled(alice));
+  assert.equal((await actorDocs(h))[0]!.sessions[0]!.intent, "two");
+  assert.doesNotMatch(await readFile((await alice.paths()).logFile, "utf8").catch(() => ""), /deferred sync/, "the deferred sync logged a failure");
+});
+
+test("a deferred sync that cannot be started leaves no claim behind to hold the next one off", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  const paths = await alice.paths();
+  const now = new Date();
+  await ok(alice, ["intent", "x"], now.toISOString());
+  await ok(alice, ["sync"], now.toISOString());
+  const before = await remoteRefs(h);
+  await ok(alice, ["intent", "y"], now.toISOString());
+  const settings = { ...DEFAULT_CONFIG, syncIntervalSeconds: 3 };
+  const later = new Date(now.getTime() + 1000);
+
+  const saved = process.env.HUDDLE_NO_BACKGROUND;
+  delete process.env.HUDDLE_NO_BACKGROUND;
+  try {
+    // No process can be started with this script path: spawn throws before there is a child to hear an error from.
+    deferSync(paths, "no\0such/huddle.mjs", settings, later);
+    assert.equal(await waiting(alice), null, "the claim of a deferred sync that was never started is still there");
+    assert.match(await readFile(paths.logFile, "utf8"), /could not defer a background sync/);
+
+    // So the next skipped sync is deferred at once, and not after the grace time of a process that never was.
+    deferSync(paths, BUNDLE, settings, later);
+    assert.ok(await waiting(alice), "the next deferred sync was held off");
+    await until("the deferred sync to publish", async () => (await remoteRefs(h)) !== before);
+    assert.equal((await actorDocs(h))[0]!.sessions[0]!.intent, "y");
+  } finally {
+    process.env.HUDDLE_NO_BACKGROUND = saved;
+    await until("the deferred sync to finish", () => settled(alice));
+  }
+});
+
+test("a command in a worktree whose branch has no .huddle goes by the settings of a set-up checkout of the clone", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  // The team syncs with `team`. `origin` is something else: a personal fork, say.
+  const fork = join(h.root, "fork.git");
+  await alice.git("init", "--quiet", "--bare", "--initial-branch=main", fork);
+  await alice.git("remote", "rename", "origin", "team");
+  await alice.git("remote", "add", "origin", fork);
+  await alice.git("push", "--quiet", "origin", "main");
+  const onFork = () => alice.git("ls-remote", fork, "refs/huddle/*");
+  const old = await alice.addWorktree("old"); // a branch from before `huddle init`
+  await alice.write(".huddle/config.json", `${JSON.stringify({ remote: "team" })}\n`);
+  await alice.commit("huddle init");
+  assert.equal(existsSync(join(old.dir, ".huddle")), false);
+
+  // On the defaults this session would be pushed to origin, where the team does not look and someone else might.
+  await ok(old, ["intent", "work on the old branch"], at(0));
+  const synced = await ok(old, ["sync"], at(0));
+  assert.match(synced.stdout, /^synced with team: /);
+  assert.equal(await onFork(), "");
+  assert.deepEqual(
+    (await actorDocs(h)).map((doc) => doc.sessions.map((session) => [session.branch, session.intent])),
+    [[["old", "work on the old branch"]]],
+  );
+
+  // The same for the sync a hook leaves to a detached process, and for the one that makes up for a skipped one.
+  await ok(old, ["intent", "still on the old branch"], at(12));
+  const before = await remoteRefs(h);
+  await ok(old, ["sync", "--background"], at(12), LIVE);
+  assert.ok(await waiting(alice));
+  await until("the deferred sync to publish", async () => (await remoteRefs(h)) !== before);
+  await until("the deferred sync to finish", () => settled(alice));
+  assert.equal(await onFork(), "");
+  assert.equal((await actorDocs(h))[0]!.sessions[0]!.intent, "still on the old branch");
+
+  // In a clone nobody ran init in, a command works on the defaults, as before.
+  const bob = await h.clone("bob");
+  assert.match((await ok(bob, ["sync"], at(20))).stdout, /^synced with origin: /);
 });

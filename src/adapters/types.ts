@@ -17,20 +17,47 @@ export interface HookEvent {
    * worktree reports that worktree here, and branch and files come from it.
    */
   cwd: string;
-  /** `prompt` events: the user's prompt, uncut. The engine keeps the first 200 characters as the intent. */
+  /**
+   * `prompt` events: the user's prompt, uncut. The engine keeps the first 200
+   * characters as the intent. Absent when nobody typed anything (a prompt that
+   * a machine wrote, or an adapter that uses the event only as a point at which
+   * its agent can be briefed): the intent then stays as it is, and the session
+   * is briefed all the same.
+   */
   prompt?: string;
   /**
    * `pre-edit` and `post-edit` events: the files being edited, exactly as the
    * agent gave them (usually absolute; backslashes on Windows). The engine
-   * makes them repo-relative with files.toRepoPath.
+   * makes them repo-relative with files.toRepoPath. Both events are checked
+   * for overlap with teammates' work, and a warning is given once: after a
+   * pre-edit that showed it, the post-edit of the same files has nothing to
+   * add. An agent that can only be spoken to after a tool call gets it there.
    */
   paths?: string[];
+  /**
+   * `post-edit` events: the session is briefed here as well, the way it is at
+   * a prompt (the full briefing if it has none yet, else what changed). For
+   * an agent whose prompt hook has no way to speak to the model (Cursor's
+   * beforeSubmitPrompt): its updates come after a tool call or not at all.
+   * The update follows the warning about the event's paths, if there is one,
+   * in the same context, and the event gets a prompt's time budget. Not on a
+   * subagent's event, and no other event type looks at it.
+   */
+  brief?: boolean;
   /** `session-start`: the agent's own word for why (startup, resume, clear, compact, ...). */
   source?: string;
   /** `session-end`: the agent's own word for why. */
   reason?: string;
   /** The event came from a subagent of the session. */
   subagent?: boolean;
+  /**
+   * The event names no session: it comes from the worktree itself (a git
+   * hook). `sessionId` is ignored. The engine acts as the session a CLI
+   * command typed in the same place would act as (session.resolveSession),
+   * and treats the event like a subagent's: it keeps that session alive and
+   * is warned before an edit, and nothing else.
+   */
+  ambient?: boolean;
   /** Whatever the adapter needs to get back in format(), such as the native event name. The engine ignores it. */
   native?: unknown;
 }
@@ -39,7 +66,9 @@ export interface HookEvent {
  * What the engine wants done. Data only: the adapter decides how to encode it.
  * `turn-end` and `session-end` always produce an empty outcome, and an adapter
  * must print nothing for them (on Claude Code, output on Stop keeps the agent
- * going instead of stopping).
+ * going instead of stopping). Each of the other four events can come with a
+ * context. An adapter that cannot show it on that event says so with
+ * HookOutput.unshown.
  */
 export interface HookOutcome {
   /** Text to put in front of the agent: a briefing or an overlap warning. Absent or "" means print nothing. */
@@ -75,6 +104,13 @@ export interface HookOutput {
    * adapter must build each line from values it has validated.
    */
   appendLines?: Array<{ path: string; line: string }>;
+  /**
+   * format() was given a context and this agent offers a hook no way to show
+   * it on this event (Cursor's beforeSubmitPrompt can only let a prompt pass
+   * or block it). The engine then records nothing as shown for the event, so
+   * the same news comes up again at the next event that can carry it.
+   */
+  unshown?: boolean;
 }
 
 export interface InstallOptions {
@@ -89,10 +125,31 @@ export interface InstallResult {
   changed: string[];
   /** Things the user still has to do by hand (trust a project, review hooks, ...). */
   notes: string[];
+  /**
+   * Every file of this adapter that the team commits, repo-relative, whether
+   * this run changed it or not. `huddle init` uses it to name what is still
+   * to be committed. An adapter with such files should set it: without it
+   * init goes by `changed`, and a file that an earlier run wrote and nobody
+   * committed is not named again.
+   */
+  files?: string[];
 }
 
 export interface CheckResult {
   installed: boolean;
+  /**
+   * Optional: true when hooks are there but cannot work as they are (some are
+   * missing, a settings file is not valid). `huddle doctor` warns about that;
+   * an adapter that was simply never installed is only mentioned.
+   */
+  broken?: boolean;
+  /**
+   * Optional, when `installed`: the files that hold this adapter's hooks and
+   * that the team commits, repo-relative. `huddle doctor` warns when one of
+   * them is not committed, because teammates then do not get the hooks by
+   * pulling. Hooks that live outside the worktree (.git/hooks) are not listed.
+   */
+  files?: string[];
   /** One line for `huddle doctor`. */
   detail: string;
   /** Manual steps the user may still need, shown by doctor. */
