@@ -394,16 +394,38 @@ async function commentsAreInTheWay(repoRoot: string): Promise<boolean> {
 const COMMENTS_INSTALL = `${SETTINGS} has comments in it. Gemini CLI reads such a file, but huddle cannot keep the comments when it writes its hooks into it and will not overwrite it: take the comments out, then run huddle init again.`;
 const COMMENTS_CHECK = `${SETTINGS} has comments in it, and huddle cannot read it with them. Take the comments out, then run huddle init.`;
 
+/**
+ * A byte order mark in front of a settings file. huddle reads past it and
+ * keeps it when it writes the file. Gemini CLI cannot use such a file:
+ * v0.68.0 reads it as text, takes the comments out (strip-json-comments
+ * 3.1.1, which leaves the mark where it is) and hands the rest to JSON.parse,
+ * which rejects the mark; config/settings.ts reports that as an error in the
+ * configuration. So the user is told, wherever the file is installed into or
+ * checked.
+ */
+const MARK = String.fromCodePoint(0xfeff);
+const MARK_NOTE = `${SETTINGS} starts with a byte order mark. Gemini CLI cannot parse a settings file that has one and reports an error in its configuration: save the file without the mark.`;
+const COMMENTS_AND_MARK_INSTALL = `${SETTINGS} has comments in it. huddle cannot keep the comments when it writes its hooks into it and will not overwrite it: take the comments out, then run huddle init again. The file also starts with a byte order mark, which Gemini CLI cannot parse: save it without the mark.`;
+
+async function startsWithMark(repoRoot: string): Promise<boolean> {
+  const text = await readFile(join(repoRoot, SETTINGS), "utf8").catch(() => "");
+  return text.startsWith(MARK);
+}
+
 async function install(opts: InstallOptions): Promise<InstallResult> {
   let changed: boolean;
   try {
     changed = await installHooks(SETTINGS_FILE, opts.repoRoot, opts.bundle);
   } catch (error) {
     // "Not valid JSON" is true and no help to someone whose file Gemini CLI reads without complaint.
-    if (error instanceof CliError && (await commentsAreInTheWay(opts.repoRoot))) throw new CliError(COMMENTS_INSTALL);
+    if (error instanceof CliError && (await commentsAreInTheWay(opts.repoRoot))) {
+      throw new CliError((await startsWithMark(opts.repoRoot)) ? COMMENTS_AND_MARK_INSTALL : COMMENTS_INSTALL);
+    }
     throw error;
   }
-  return { changed: changed ? [SETTINGS] : [], notes: [START_NOTE, LATE_NOTE] };
+  const notes = [START_NOTE, LATE_NOTE];
+  if (await startsWithMark(opts.repoRoot)) notes.unshift(MARK_NOTE);
+  return { changed: changed ? [SETTINGS] : [], notes };
 }
 
 // ---------------------------------------------------------------------------
@@ -491,6 +513,8 @@ export async function checkGeminiCli(repoRoot: string, around: Surroundings): Pr
   if (decides?.says.enabled === false) {
     notes.unshift(`Hooks are turned off for Gemini CLI here: hooksConfig.enabled is false in ${decides.file}. huddle's hooks will not run until that is removed.`);
   }
+  // First of all: with the mark in front, Gemini CLI does not get as far as any of the above.
+  if (await startsWithMark(repoRoot)) notes.unshift(MARK_NOTE);
   return { ...result, notes };
 }
 

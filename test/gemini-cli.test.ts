@@ -943,8 +943,6 @@ test("install: a settings file with comments is left as it is, and the user is t
     '{\r\n  // the docs: https://geminicli.com/docs/hooks/\r\n  "ui": { "theme": "GitHub" }\r\n}\r\n',
     '{ "mcpServers": { "tracker": { "url": "https://tracker.example/*v2*/api" } } /* a "quoted" word */ }',
     '/* nothing set yet */ {}',
-    // With a byte order mark in front, as some editors on Windows write it.
-    '\uFEFF// team settings\n{ "hooks": {} }\n',
   ];
   for (const content of commented) {
     const { root, file } = await scratchRepo(t, content);
@@ -972,6 +970,69 @@ test("install: a settings file with comments is left as it is, and the user is t
   const { root, file } = await scratchRepo(t, '{ "mcpServers": { "tracker": { "url": "https://tracker.example//api/*v2*/" } } }\n');
   assert.deepEqual((await geminiCli.install({ repoRoot: root, bundle: BUNDLE })).changed, [".gemini/settings.json"]);
   assert.deepEqual((await readJson(file)).mcpServers, { tracker: { url: "https://tracker.example//api/*v2*/" } });
+});
+
+const MARK = String.fromCodePoint(0xfeff);
+const MARK_NOTE =
+  ".gemini/settings.json starts with a byte order mark. Gemini CLI cannot parse a settings file that has one and reports an error in its configuration: save the file without the mark.";
+
+test("install and check: a settings file with a byte order mark in front keeps it, and both say that Gemini CLI cannot parse it", async (t) => {
+  // Some editors on Windows write one. Gemini CLI hands it to JSON.parse, which does not take it.
+  assert.throws(() => JSON.parse(`${MARK}{}`), SyntaxError);
+  const around = aroundOf(await emptyDir(t));
+  const content = `${MARK}{\n  "ui": { "theme": "GitHub" }\n}\n`;
+  const { root, file } = await scratchRepo(t, content);
+  await withBundle(root);
+
+  const first = await geminiCli.install({ repoRoot: root, bundle: BUNDLE });
+  assert.deepEqual(first.changed, [".gemini/settings.json"]);
+  const written = await readFile(file, "utf8");
+  assert.ok(written.startsWith(`${MARK}{`), "the mark is where it was");
+  assert.deepEqual(JSON.parse(written.slice(1)), { ui: { theme: "GitHub" }, ...installed() });
+  assert.equal(first.notes.length, 3);
+  assert.equal(first.notes[0], MARK_NOTE, "first: Gemini CLI does not get past it");
+
+  const checked = await checkGeminiCli(root, around);
+  assert.equal(checked.installed, true);
+  assert.deepEqual(checked.notes, first.notes, "init and doctor say the same");
+  // Installing again changes nothing and says it again.
+  const second = await geminiCli.install({ repoRoot: root, bundle: BUNDLE });
+  assert.deepEqual(second, { changed: [], notes: first.notes });
+
+  // It comes before the note about hooks being off: that one does not matter until the file can be read.
+  await writeFile(file, `${MARK}${JSON.stringify({ ...installed(), hooksConfig: { enabled: false } })}`);
+  const off = (await checkGeminiCli(root, around)).notes;
+  assert.equal(off.length, 4);
+  assert.equal(off[0], MARK_NOTE);
+  assert.match(off[1] ?? "", /turned off/);
+
+  // Without the mark nothing is said about one.
+  await writeFile(file, written.slice(1));
+  assert.equal((await checkGeminiCli(root, around)).notes.includes(MARK_NOTE), false);
+  assert.equal((await geminiCli.install({ repoRoot: root, bundle: BUNDLE })).notes.includes(MARK_NOTE), false);
+  // Nor when the file is not there, or cannot be read at all.
+  await rm(file);
+  assert.deepEqual((await checkGeminiCli(root, around)).notes, []);
+});
+
+test("install: comments behind a byte order mark are refused without the claim that Gemini CLI reads the file", async (t) => {
+  const content = `${MARK}// team settings\n{ "hooks": {} }\n`;
+  const { root, file } = await scratchRepo(t, content);
+  await assert.rejects(geminiCli.install({ repoRoot: root, bundle: BUNDLE }), (error: unknown) => {
+    assert.ok(error instanceof CliError, `a message for the user, not a crash: ${String(error)}`);
+    assert.equal(
+      error.message,
+      ".gemini/settings.json has comments in it. huddle cannot keep the comments when it writes its hooks into it and will not overwrite it: take the comments out, then run huddle init again. The file also starts with a byte order mark, which Gemini CLI cannot parse: save it without the mark.",
+    );
+    return true;
+  });
+  assert.equal(await readFile(file, "utf8"), content, "untouched");
+  await withBundle(root);
+  assert.deepEqual(await checkGeminiCli(root, aroundOf(await emptyDir(t))), {
+    installed: false,
+    detail: ".gemini/settings.json has comments in it, and huddle cannot read it with them. Take the comments out, then run huddle init.",
+    notes: [],
+  });
 });
 
 test("install: comments are taken out the way Gemini CLI does it, and strings are left alone", () => {
