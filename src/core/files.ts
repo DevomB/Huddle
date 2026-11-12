@@ -3,7 +3,7 @@
 // not refresh (rewrite) the index.
 
 import { realpathSync } from "node:fs";
-import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { isAbsolute, parse, relative, resolve, sep } from "node:path";
 import { LIMITS } from "./docs.ts";
 import { git } from "./git.ts";
 import type { RepoPaths } from "./paths.ts";
@@ -121,31 +121,61 @@ async function unpushedFiles(worktree: string, config: Config): Promise<string[]
  * itself or outside the worktree.
  */
 export function toRepoPath(paths: RepoPaths, cwd: string, path: string): string | null {
-  if (path === "") return null;
+  if (path === "" || path.length > MAX_PATH_CHARS) return null;
   const absolute = isAbsolute(path) ? resolve(path) : resolve(cwd, path);
-  // The worktree path from git has symlinks resolved; the path we were given
-  // may not (macOS /tmp, a symlinked checkout). Try it as given, then resolved.
-  for (const candidate of [absolute, resolveExisting(absolute)]) {
+  const inside = (candidate: string): string | null => {
     const rel = relative(paths.worktree, candidate);
-    if (rel !== "" && !isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`)) return rel.split(sep).join("/");
-  }
-  return null;
+    return rel !== "" && !isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`) ? rel.split(sep).join("/") : null;
+  };
+  // The worktree path from git has symlinks resolved; the path we were given
+  // may not (macOS /tmp, a symlinked checkout). Try it as given, and only then
+  // resolved: resolving asks the file system, and this runs before every edit.
+  return inside(absolute) ?? inside(resolveExisting(absolute));
 }
 
-/** Resolves symlinks in the longest existing prefix of `path`; the rest (a file not created yet) is kept as is. */
-function resolveExisting(path: string): string {
-  const missing: string[] = [];
-  let current = path;
-  for (;;) {
+/** No operating system takes a longer path (Windows: 32,767 characters; Linux 4,096 bytes). Anything longer is not a file. */
+const MAX_PATH_CHARS = 32_767;
+
+/**
+ * Resolves symlinks in the longest existing prefix of `path` (absolute and
+ * normalized); the rest, a file not created yet, is kept as is.
+ *
+ * A prefix that resolves has only resolving ones before it, so the longest is
+ * found by halving: about 15 looks at the file system for the longest path
+ * there is, and never one per missing directory. All of it is synchronous, and
+ * a hook calls this with whatever an agent handed it and a deadline of 150 ms.
+ */
+export function resolveExisting(path: string, real: (prefix: string) => string = realpathSync): string {
+  const root = parse(path).root;
+  const parts = path.slice(root.length).split(sep).filter(Boolean);
+  // ends[k] is where the prefix of k components ends in `path`.
+  const ends = [root.length];
+  for (const part of parts) ends.push((ends.at(-1) ?? 0) + (ends.length > 1 ? sep.length : 0) + part.length);
+  const attempt = (count: number): string | null => {
     try {
-      return resolve(realpathSync(current), ...missing.reverse());
+      return real(count === 0 ? root : path.slice(0, ends[count]));
     } catch {
-      const parent = dirname(current);
-      if (parent === current) return path;
-      missing.push(current.slice(parent.length).replace(/^[\\/]/, ""));
-      current = parent;
+      return null;
+    }
+  };
+
+  let resolved = attempt(parts.length);
+  if (resolved !== null) return resolved;
+  resolved = attempt(0);
+  if (resolved === null) return path;
+  // Prefix `low` resolves (to `resolved`) and prefix `high` does not.
+  let low = 0;
+  let high = parts.length;
+  while (high - low > 1) {
+    const middle = (low + high) >> 1;
+    const found = attempt(middle);
+    if (found === null) high = middle;
+    else {
+      low = middle;
+      resolved = found;
     }
   }
+  return resolve(resolved, parts.slice(low).join(sep));
 }
 
 /**
