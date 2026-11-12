@@ -28,7 +28,10 @@ export interface HookEvent {
   /**
    * `pre-edit` and `post-edit` events: the files being edited, exactly as the
    * agent gave them (usually absolute; backslashes on Windows). The engine
-   * makes them repo-relative with files.toRepoPath.
+   * makes them repo-relative with files.toRepoPath. Both events are checked
+   * for overlap with teammates' work, and a warning is given once: after a
+   * pre-edit that showed it, the post-edit of the same files has nothing to
+   * add. An agent that can only be spoken to after a tool call gets it there.
    */
   paths?: string[];
   /** `session-start`: the agent's own word for why (startup, resume, clear, compact, ...). */
@@ -53,7 +56,9 @@ export interface HookEvent {
  * What the engine wants done. Data only: the adapter decides how to encode it.
  * `turn-end` and `session-end` always produce an empty outcome, and an adapter
  * must print nothing for them (on Claude Code, output on Stop keeps the agent
- * going instead of stopping).
+ * going instead of stopping). Each of the other four events can come with a
+ * context. An adapter that cannot show it on that event says so with
+ * HookOutput.unshown.
  */
 export interface HookOutcome {
   /** Text to put in front of the agent: a briefing or an overlap warning. Absent or "" means print nothing. */

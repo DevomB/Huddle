@@ -7,7 +7,7 @@
 //   session-start   one sync, waited for; then the full briefing              4 s
 //   prompt          record the intent, brief on what changed, background sync 300 ms
 //   pre-edit        warn when a target path overlaps a teammate's work        150 ms
-//   post-edit       background sync                                           150 ms
+//   post-edit       background sync; the same warning if it was not given yet 150 ms
 //   turn-end        background sync, not throttled                            150 ms
 //   session-end     remove the session, background sync, not throttled        1 s
 //
@@ -611,7 +611,8 @@ function capWarned(items: Record<string, string>): Record<string, string> {
 }
 
 /**
- * The warning for the paths about to be edited, from the cache: no network.
+ * The warning for the paths of an edit, one that is about to be made or one
+ * that was just made, from the cache: no network.
  *
  * A path is warned about when a session overlaps it that this session has not
  * been told about for that path yet. So ten edits of one contested file give
@@ -716,8 +717,27 @@ async function refreshFirst(run: Run): Promise<boolean> {
   }
 }
 
+/**
+ * What there is to say about `targets`, while `recorded` (the session, and
+ * the sync that follows from it) runs alongside: the check does not need it,
+ * and the budget is short. A check that fails costs the warning and nothing
+ * else.
+ */
+async function checked(run: Run, targets: string[], recorded: Promise<void>): Promise<Prepared> {
+  let prepared: Prepared = { outcome: {} };
+  if (targets.length > 0) {
+    try {
+      prepared = await overlapWarning(run, targets);
+    } catch (error) {
+      log(run.paths, "hook", `${run.event.type}: could not check for overlap`, error);
+    }
+  }
+  await recorded;
+  return prepared;
+}
+
 async function preEdit(run: Run): Promise<Prepared> {
-  const { event, paths, io } = run;
+  const { event, io } = run;
   const targets = targetPaths(run);
   // A commit may wait for the team state; an agent's edit never does.
   const patient = event.ambient === true && targets.length > 0;
@@ -726,21 +746,29 @@ async function preEdit(run: Run): Promise<Prepared> {
     if (patient && (await refreshFirst(run))) return;
     if (isNews(touched)) effects.spawnBackgroundSync(run.home, io.self, { force: true });
   });
-  // Otherwise the session is recorded alongside the check, not before it: the check does not need it, and the budget is short.
+  // A commit's check comes after its wait. An agent's runs alongside.
   if (patient) await recorded;
-  let prepared: Prepared = { outcome: {} };
-  if (targets.length > 0) {
-    try {
-      prepared = await overlapWarning(run, targets);
-    } catch (error) {
-      log(paths, "hook", "pre-edit: could not check for overlap", error);
-    }
-  }
-  await recorded;
-  return prepared;
+  return checked(run, targets, recorded);
 }
 
-/** post-edit, and every event of a subagent except pre-edit: the session is alive, and a sync may be due. */
+/**
+ * post-edit: the session is alive, a sync may be due, and the paths the event
+ * names are checked the way a pre-edit checks them, with the same memory.
+ * After a pre-edit of the same paths that leaves nothing to say. It is there
+ * for the agents whose hooks cannot speak to the model before an edit (Gemini
+ * CLI, Cursor): for them the warning comes right after the edit, in the event
+ * that also starts the edit's sync. And it makes up for a pre-edit that ran
+ * out of time.
+ */
+async function postEdit(run: Run): Promise<Prepared> {
+  return checked(
+    run,
+    targetPaths(run),
+    touch(run).then((touched) => syncAfter(run, touched)),
+  );
+}
+
+/** Every event of a subagent, and every event that names no session, except pre-edit: the session is alive, and a sync may be due. */
 async function heartbeat(run: Run): Promise<Prepared> {
   syncAfter(run, await touch(run));
   return { outcome: {} };
@@ -822,7 +850,7 @@ async function prepare(event: HookEvent, io: Io, deadline: Deadline, trace: Trac
     case "pre-edit":
       return preEdit(run);
     case "post-edit":
-      return heartbeat(run);
+      return postEdit(run);
     case "turn-end":
       return turnEnd(run);
     case "session-end":

@@ -565,13 +565,13 @@ test("post-edit keeps the session alive and leaves the sync to the throttle, unl
   const { bob } = await aliceBuildsAuth(t);
   await publish(bob, 15);
   const asked = record(t);
-  const edit = { paths: [join(bob.dir, "src/auth.ts")] };
+  const mine = { paths: [join(bob.dir, "src/login.ts")] };
 
-  // The session is new: published at once. And no warning after the fact, even for a contested file.
-  assert.deepEqual(await fire(bob, "post-edit", 20, edit), {});
+  // The session is new: published at once.
+  assert.deepEqual(await fire(bob, "post-edit", 20, mine), {});
   assert.deepEqual(asked.background, [forced(bob)]);
 
-  assert.deepEqual(await fire(bob, "post-edit", 21, edit), {});
+  assert.deepEqual(await fire(bob, "post-edit", 21, mine), {});
   assert.deepEqual(await fire(bob, "post-edit", 22, {}), {}, "a shell command names no files");
   assert.deepEqual(asked.background, [forced(bob), throttled(bob), throttled(bob)]);
   // The throttle is asked with the event's clock and the team's config, so that no process is started for nothing.
@@ -580,6 +580,40 @@ test("post-edit keeps the session alive and leaves the sync to the throttle, unl
   assert.deepEqual(asked.waited, []);
   assert.equal((await sessionOf(bob))?.seenAt, at(22));
   assert.deepEqual(await seenKeys(bob), [], "nothing was shown, so nothing is remembered");
+});
+
+test("post-edit gives the warning that no pre-edit gave: once, with the edit's sync, and never to a subagent", async (t) => {
+  const { bob } = await aliceBuildsAuth(t);
+  await fire(bob, "session-start", 20);
+  const asked = record(t);
+  const edit = { paths: [join(bob.dir, "src/auth.ts")] };
+
+  // An agent that cannot be spoken to before a tool call (Gemini CLI, Cursor), or a pre-edit that ran out of time:
+  // nothing warned the session before this edit. So it is warned now, in the event that also starts the edit's sync.
+  assert.deepEqual(await fire(bob, "post-edit", 25, edit), { context: authWarning(25) });
+  assert.deepEqual(asked.background, [throttled(bob)]);
+  assert.deepEqual(await warnedPaths(bob), ["w:src/auth.ts"]);
+  // Told is told, whichever event did it.
+  assert.deepEqual(await fire(bob, "post-edit", 26, edit), {});
+  assert.deepEqual(await fire(bob, "pre-edit", 27, edit), {});
+
+  // The other order is Claude Code's and Codex's: after a pre-edit that warned, the post-edit has nothing to add.
+  await fire(bob, "session-start", 30);
+  assert.deepEqual(await fire(bob, "pre-edit", 31, edit), { context: authWarning(31) });
+  assert.deepEqual(await fire(bob, "post-edit", 32, edit), {});
+
+  // A subagent was warned before its edit, as it is before every edit. Its post-edit stays a sign of life, and
+  // uses up nothing that the session itself has yet to be told.
+  await fire(bob, "session-start", 40);
+  assert.deepEqual(await fire(bob, "post-edit", 41, { ...edit, subagent: true }), {});
+  assert.deepEqual(await warnedPaths(bob), []);
+  assert.deepEqual(await fire(bob, "post-edit", 42, edit), { context: authWarning(42) });
+
+  // A file that nobody else is working on, and paths as agents give them.
+  assert.deepEqual(await fire(bob, "post-edit", 43, { paths: [join(bob.dir, "README.md")] }), {});
+  await fire(bob, "session-start", 50);
+  assert.deepEqual(await fire(bob, "post-edit", 51, { cwd: join(bob.dir, "src"), paths: ["auth.ts", "../src/auth.ts"] }), { context: authWarning(51) });
+  assert.equal(asked.waited.length, 3, "only the three session-starts waited for the network");
 });
 
 test("turn-end has the turn's work published at once, whatever the throttle says, and does not wait for it", async (t) => {
@@ -926,6 +960,31 @@ test("damaged state files do not stop a hook: local.json, the cache, a seen file
   assert.deepEqual(await fire(bob, "prompt", 29, { prompt: "Rewrite everything in Rust" }), {});
   assert.deepEqual([(await sessionOf(bob))?.intent, (await sessionOf(bob))?.intentSource], ["", "none"]);
   assert.match(await logOf(bob), /\[config\] .*merge conflict markers/);
+});
+
+test("an edit whose check for overlap fails loses the warning and nothing else: the session is kept alive, and its sync is started", async (t) => {
+  const { bob } = await aliceBuildsAuth(t);
+  await fire(bob, "session-start", 20);
+  const asked = record(t);
+  const edit = { paths: [join(bob.dir, "src/auth.ts")] };
+  const paths = await bob.paths();
+
+  // Something sits where the clone's id is kept, so nobody can say which of the sessions in the cache are this
+  // clone's own and which are teammates': there is no check. Keeping the session alive needs no id.
+  await rm(paths.actorFile);
+  await mkdir(join(paths.actorFile, "in the way"), { recursive: true });
+
+  assert.deepEqual(await fire(bob, "post-edit", 25, edit), {});
+  assert.equal((await sessionOf(bob))?.seenAt, at(25));
+  assert.deepEqual(asked.background, [throttled(bob)]);
+  assert.deepEqual(await fire(bob, "pre-edit", 26, edit), {});
+  assert.equal((await sessionOf(bob))?.seenAt, at(26));
+  assert.deepEqual(asked.background, [throttled(bob)], "a pre-edit of a session that is known starts no sync, checked or not");
+  const log = await logOf(bob);
+  assert.match(log, /\[hook\] post-edit: could not check for overlap/);
+  assert.match(log, /\[hook\] pre-edit: could not check for overlap/);
+  assert.doesNotMatch(log, /an event failed/);
+  assert.deepEqual(await warnedPaths(bob), [], "what was never said is not remembered as said");
 });
 
 test("a state directory that cannot be used costs the briefing, never the hook", async (t) => {
