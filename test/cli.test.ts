@@ -2,7 +2,7 @@
 // is still a stub exits 1 with "not implemented: <command>".
 
 import assert from "node:assert/strict";
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { createHarness } from "./harness.ts";
@@ -92,13 +92,19 @@ test("every command answers --help and -h with its own usage, exits 0 and does n
     assert.equal(r.stderr, "", line);
     assert.match(r.stdout, new RegExp(`^\\S.*\\n\\nUsage: huddle ${args[0]}\\b`), line);
   }
-  // A text after "--" is the text, also when it is "--help".
-  const literal = await clone.huddle(["decide", "--", "--help"], { env: { HUDDLE_TIMEOUT_MS: "200" } });
-  assert.doesNotMatch(literal.stdout, /Usage:/);
 
-  // Asking for help made no session, wrote no state for the ones asked, and touched nothing of git's.
-  assert.equal((await h.remoteGit("for-each-ref", "--format=%(refname)", "refs/huddle/actors")).trim(), "");
+  // Asking for help made no session and wrote no state at all: huddle's own directory in the clone was never
+  // made. (The remote would not show a session either way: the harness runs without background syncs.)
+  assert.equal(existsSync((await clone.paths()).stateDir), false, "huddle's state directory");
+  // And nothing reached the remote, and nothing of git's was touched.
+  assert.equal((await h.remoteGit("for-each-ref", "--format=%(refname)", "refs/huddle")).trim(), "");
   assert.deepEqual(await clone.snapshot(), before);
+
+  // A text after "--" is the text, also when it is "--help": this one is a real decision, and is recorded.
+  const literal = await clone.huddle(["decide", "--", "--help"]);
+  assert.equal(literal.code, 0, literal.stderr);
+  assert.match(literal.stdout, /^decision [a-z2-7]{8} recorded: --help$/m);
+  assert.doesNotMatch(literal.stdout, /Usage:/);
 
   // `hook` is run by agents, with a payload on stdin: it stays silent and exits 0 whatever it is given.
   const hook = await clone.huddle(["hook", "--help"]);

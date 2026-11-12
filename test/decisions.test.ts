@@ -656,36 +656,51 @@ const tok = (...parts: string[]) => parts.join("");
 const FAKE_TOKEN = tok("gh", "p_", "x".repeat(36));
 const FAKE_PASSWORD = tok("hunter", "2", "!!");
 
-test("a decision that holds something shaped like a credential is published without it, and the author is told", async (t) => {
+test("a decision that holds something shaped like a credential is not recorded, and the author sees what would have been published", async (t) => {
   const h = await createHarness(t);
   const alice = await h.clone("alice");
   const bob = await h.clone("bob");
+  // A decision of an earlier day, which the refused ones would have replaced.
+  const first = /^decision ([a-z2-7]{8}) recorded/.exec((await ok(alice, ["decide", "CI pushes with the deploy key"], at(0))).stdout)?.[1] ?? "";
+  const logsBefore = JSON.stringify(await remoteLogs(h));
 
-  const r = await ok(alice, ["decide", `CI pushes with ${FAKE_TOKEN} and the staging login is ${tok("pass", "word=", FAKE_PASSWORD)}`], at(0));
-  assert.match(r.stdout, /^decision [a-z2-7]{8} recorded: CI pushes with \[redacted\] and the staging login is password=\[redacted\]$/m);
-  assert.match(r.stdout, /^\(something in it looked like a credential and was replaced by \[redacted\] before it was published\)$/m);
+  const refused = await alice.huddle(["decide", "--supersedes", first, `CI pushes with ${FAKE_TOKEN} and the staging login is ${tok("pass", "word=", FAKE_PASSWORD)}`], { now: at(1) });
+  assert.equal(refused.code, 2, refused.stderr);
+  assert.equal(refused.stdout, "");
+  assert.match(refused.stderr, /part of this looks like a credential, so the decision was NOT recorded/);
+  assert.match(refused.stderr, /^ {2}CI pushes with \[redacted\] and the staging login is password=\[redacted\]$/m, "the author sees which part it was");
+  assert.equal(refused.stderr.includes(FAKE_TOKEN) || refused.stderr.includes(FAKE_PASSWORD), false, "and is not shown it again");
 
-  // Nowhere it could be read from: the remote, this clone's cache, a teammate's list.
-  const onRemote = JSON.stringify(await remoteLogs(h));
+  // Nothing of it anywhere it could be read from, with or without the part taken out: the remote, this clone's cache, a teammate's list.
+  assert.equal(JSON.stringify(await remoteLogs(h)), logsBefore, "the decision it was to replace still stands");
   const cached = await readFile((await alice.paths()).cacheFile, "utf8");
-  await ok(bob, ["sync"], at(1));
-  const listed = (await ok(bob, ["decisions"], at(1))).stdout;
-  for (const [where, text] of Object.entries({ onRemote, cached, listed })) {
-    assert.equal(text.includes(FAKE_TOKEN), false, `the token is in ${where}`);
-    assert.equal(text.includes(FAKE_PASSWORD), false, `the password is in ${where}`);
-    assert.match(text, /CI pushes with \[redacted\]/, where);
+  await ok(bob, ["sync"], at(2));
+  const listed = (await ok(bob, ["decisions"], at(2))).stdout;
+  for (const [where, text] of Object.entries({ cached, listed })) {
+    assert.equal(text.includes(FAKE_TOKEN) || text.includes(FAKE_PASSWORD) || text.includes("redacted"), false, where);
   }
+  assert.match(listed, /CI pushes with the deploy key/);
 
-  // A decision with nothing of the kind is published as typed, and nothing is said about redaction.
-  const plain = await ok(alice, ["decide", "API errors use problem+json, version 2"], at(2));
+  // What only looks like one is refused the same way, since a rule with its content taken out is a rule nobody can follow.
+  // The message says what does get through, and that is true.
+  const commit = "3a18f6d4b2907e5c".repeat(3).slice(0, 40);
+  const whole = await alice.huddle(["decide", `The baseline is commit ${commit}`], { now: at(3) });
+  assert.equal(whole.code, 2);
+  assert.match(whole.stderr, /^ {2}The baseline is commit \[redacted\]$/m);
+  assert.match(whole.stderr, /a short commit id is taken/);
+  const short = await ok(alice, ["decide", `The baseline is commit ${commit.slice(0, 12)}`], at(4));
+  assert.match(short.stdout, new RegExp(`^decision [a-z2-7]{8} recorded: The baseline is commit ${commit.slice(0, 12)}$`, "m"));
+
+  // A decision with nothing of the kind is published as typed.
+  const plain = await ok(alice, ["decide", "API errors use problem+json, version 2"], at(5));
   assert.match(plain.stdout, /^decision [a-z2-7]{8} recorded: API errors use problem\+json, version 2$/m);
-  assert.doesNotMatch(plain.stdout, /redacted/);
 
-  // The length limit is judged on what would be published, and the note is not printed for a decision that was refused.
-  const long = await alice.huddle(["decide", `${"x ".repeat(260)}${FAKE_TOKEN}`], { now: at(3) });
+  // The length limit is judged on what was typed, and is what the author hears about first:
+  // 470 characters, a space and a token are over it as typed and would be within it with the token taken out.
+  const long = await alice.huddle(["decide", `${"x".repeat(470)} ${FAKE_TOKEN}`], { now: at(6) });
   assert.equal(long.code, 2);
-  assert.match(long.stderr, /a decision is at most 500 characters/);
-  assert.doesNotMatch(long.stdout + long.stderr, /looked like a credential/);
+  assert.match(long.stderr, /a decision is at most 500 characters; this one is 511\./);
+  assert.doesNotMatch(long.stderr, /credential/);
 });
 
 // ---------------------------------------------------------------------------

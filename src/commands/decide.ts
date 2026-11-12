@@ -18,16 +18,25 @@ const USAGE = 'huddle decide [--supersedes <id>] [--] "<choice others must follo
 export async function run(args: string[], io: Io): Promise<number> {
   const { values, positionals } = parse(args, { supersedes: { type: "string", multiple: true } }, USAGE);
   const typed = cleanText(positionals.join(" "), Number.MAX_SAFE_INTEGER);
-  // A decision is read by everyone who can read the repository, and stays. What looks like a
-  // credential is not published, as with an intent (hooks/intent.ts; best effort).
-  const whole = scrubSecrets(typed);
-  const text = cleanText(whole, LIMITS.decisionText);
-  if (text === "") throw new UsageError(`the decision is empty\nUsage: ${USAGE}`);
+  if (typed === "") throw new UsageError(`the decision is empty\nUsage: ${USAGE}`);
   // A rule that others must follow is not cut short behind the author's back.
-  const length = Array.from(whole).length;
+  const length = Array.from(typed).length;
   if (length > LIMITS.decisionText) {
     throw new UsageError(`a decision is at most ${LIMITS.decisionText} characters; this one is ${length}. Say it shorter, or split it into two.`);
   }
+  // A decision is read by everyone who can read the repository, and it is never removed. What
+  // looks like a credential is not published (hooks/intent.ts; best effort). An intent is
+  // published with that part taken out, because the next prompt replaces it. A decision is the
+  // rule itself: with a part taken out it is a rule nobody can follow, for good. So it is refused.
+  const scrubbed = scrubSecrets(typed);
+  if (scrubbed !== typed) {
+    throw new UsageError(
+      "part of this looks like a credential, so the decision was NOT recorded: a decision is read by everyone who can read the repository and is never removed. " +
+        `What huddle would have published:\n  ${scrubbed}\n` +
+        "Say it without that part. A full commit id, a digest and a UUID look like a credential to huddle too: a short commit id is taken, and so is the name of the file or the setting that holds the value.",
+    );
+  }
+  const text = typed;
   const named = values.supersedes ?? [];
   if (named.length > 1) throw new UsageError(`a decision replaces one other decision; --supersedes was given ${named.length} times\nUsage: ${USAGE}`);
   const supersedes = named[0]?.trim();
@@ -38,9 +47,7 @@ export async function run(args: string[], io: Io): Promise<number> {
   const ctx = await openContext(io);
   const me = await resolveSession(ctx);
   const result = await addDecision(ctx, text, supersedes === undefined ? { agent: me.agent } : { agent: me.agent, supersedes });
-  const code = report(result, { remote: ctx.config.remote, supersedes }, io);
-  if (result.ok && whole !== typed) io.out("(something in it looked like a credential and was replaced by [redacted] before it was published)");
-  return code;
+  return report(result, { remote: ctx.config.remote, supersedes }, io);
 }
 
 /** "[id] text (user / agent)", the way `huddle decisions` lists one. */
