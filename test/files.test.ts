@@ -2,10 +2,10 @@
 
 import assert from "node:assert/strict";
 import { realpathSync } from "node:fs";
-import { mkdir, rm, symlink } from "node:fs/promises";
+import { mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
-import { currentBranch, DETACHED, filesInFlight, resolveBase, resolveExisting, toRepoPath, toRepoPattern } from "../src/core/files.ts";
+import { currentBranch, DETACHED, filesInFlight, resolveBase, resolveExisting, toRepoPath, toRepoPattern, workInFlight } from "../src/core/files.ts";
 import { DEFAULT_CONFIG } from "../src/core/types.ts";
 import { createHarness } from "./harness.ts";
 
@@ -209,6 +209,30 @@ test("filesInFlight outside a repository is empty rather than an error", async (
   const h = await createHarness(t);
   assert.deepEqual(await filesInFlight(h.root, config), []);
   assert.deepEqual(await filesInFlight(join(h.root, "nowhere"), config), []);
+});
+
+test("workInFlight says when git could not list the files: an empty list is then not \"nothing in flight\"", async (t) => {
+  const h = await createHarness(t);
+  const clone = await h.clone("alice");
+  await clone.write("src/a.ts", "x\n");
+  const healthy = await workInFlight(clone.dir, config);
+  assert.deepEqual([healthy.all, healthy.complete], [["src/a.ts"], true]);
+
+  // A clone that has fetched nothing has no unpushed commits to list: that is complete, not a failure.
+  const fresh = await h.clone("bob");
+  await fresh.git("update-ref", "-d", "refs/remotes/origin/main");
+  await fresh.git("update-ref", "-d", "refs/remotes/origin/HEAD").catch(() => "");
+  assert.equal((await workInFlight(fresh.dir, config)).complete, true);
+
+  // A damaged index: `git status` fails, so the dirty files are unknown.
+  await writeFile(join(clone.dir, ".git", "index"), "not an index");
+  const broken = await workInFlight(clone.dir, config);
+  assert.equal(broken.complete, false);
+  assert.deepEqual(broken.all, []);
+
+  // Not a repository at all (a worktree that was removed): nothing could be listed.
+  const gone = join(h.root, "no-such-worktree");
+  assert.equal((await workInFlight(gone, config)).complete, false);
 });
 
 test("toRepoPath makes agent-supplied paths repo-relative and rejects paths outside the worktree", async (t) => {
