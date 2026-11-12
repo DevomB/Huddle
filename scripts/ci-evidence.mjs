@@ -4,11 +4,13 @@
 //     Prints the platform under test and writes <out-dir>/platform.json:
 //     OS build, architecture, shell, Node and git versions, GITHUB_SHA.
 //
-//   node scripts/ci-evidence.mjs summary <dir>
+//   node scripts/ci-evidence.mjs summary <dir> [--expect linux=3,win32=3]
 //     Reads every platform.json and test-results.xml (Node's junit reporter)
 //     under <dir>, one directory per job, and prints per platform: the
 //     platform record, the totals, every skipped test with its reason, and
-//     every failure. Exits 1 if a platform has a failure or no results.
+//     every failure. Exits 1 if a platform has a failure, a shard with no
+//     finished results (a cancelled or timed-out shard leaves a junit file
+//     without totals), or, with --expect, fewer finished shards than expected.
 
 import { execFileSync } from "node:child_process";
 import { mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
@@ -16,6 +18,9 @@ import os from "node:os";
 import { join } from "node:path";
 
 const [mode, dir, shellVersion] = process.argv.slice(2);
+const expectArg = process.argv.includes("--expect") ? process.argv[process.argv.indexOf("--expect") + 1] ?? "" : "";
+/** platform → finished shards it must have, from --expect linux=3,win32=3. */
+const expected = new Map(expectArg.split(",").filter(Boolean).map((pair) => { const [name, count] = pair.split("="); return [name, Number(count) || 1]; }));
 
 if (mode === "platform" && dir) {
   const run = (cmd, args) => {
@@ -103,10 +108,11 @@ function summary(root) {
     }
     const entry = byPlatform.get(platform.platform) ?? { platforms: [], shards: 0, missing: [], totals: {}, skipped: [], failed: [] };
     entry.platforms.push(platform);
-    if (xml === null) entry.missing.push(platform.job ?? job);
+    const parsed = xml === null ? null : parseJunit(xml);
+    // Node's reporter writes the totals last: a shard without them did not finish (cancelled, timed out, crashed).
+    if (parsed === null || parsed.totals.tests === undefined) entry.missing.push(`${platform.job ?? job}${xml === null ? "" : " (results without totals: the run did not finish)"}`);
     else {
       entry.shards += 1;
-      const parsed = parseJunit(xml);
       for (const [key, value] of Object.entries(parsed.totals)) entry.totals[key] = (entry.totals[key] ?? 0) + value;
       entry.skipped.push(...parsed.skipped);
       entry.failed.push(...parsed.failed);
@@ -114,6 +120,13 @@ function summary(root) {
     byPlatform.set(platform.platform, entry);
   }
   let bad = byPlatform.size === 0;
+  for (const [name, count] of expected) {
+    const got = byPlatform.get(name)?.shards ?? 0;
+    if (got < count) {
+      console.log(`MISSING: ${name} has ${got} finished shard(s) of ${count}`);
+      bad = true;
+    }
+  }
   for (const [name, entry] of byPlatform) {
     const p = entry.platforms[0];
     console.log(`\n=== ${name} (${entry.shards} shard result(s))`);
