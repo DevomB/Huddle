@@ -77,7 +77,7 @@ function parseJunit(xml) {
     const skip = /<skipped\b([^>]*)\/?>/.exec(body);
     if (skip) skipped.push({ name, reason: attr(skip[1], "message"), type: attr(skip[1], "type") });
     const fail = /<failure\b([^>]*)>/.exec(body);
-    if (fail) failed.push({ name, message: attr(fail[1], "message").split("\n")[0].slice(0, 300) });
+    if (fail) failed.push({ name, message: unescape(attr(fail[1], "message")).split("\n")[0].slice(0, 300) });
   }
   return { totals, skipped, failed };
 }

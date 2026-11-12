@@ -13,36 +13,76 @@ Each agent publishes what it is working on (its files, its branch and a one-line
 
 huddle is advisory. It warns; it never blocks an edit or a commit.
 
-**Status:** version 0.1.0, private, not on npm. Developed and tested on Linux with Node 22. See [Limits](#limits) before relying on it.
+**Status:** version 0.1.0, an MVP: private, not on npm. Supported: **Linux and native Windows** (no WSL needed), Node 22, git, one remote every teammate can push to, CLI coordination and the Claude Code hooks. What was tested, on which versions, is under [Where it has been run](#where-it-has-been-run). See [Limits](#limits) before relying on it.
 
 ## Quick start
 
-Requirements: git 2.29 or later, Node 20 or later, and a remote that every teammate can push to.
+Requirements: Node 22, git, and a remote that every teammate can push to. On Windows: [Git for Windows](https://git-scm.com/downloads/win) and PowerShell 7 (the commands below also work in CMD where noted). Nothing needs administrator rights, symlink privilege or a change of PowerShell execution policy.
 
-huddle is not published yet, so build it from this repository:
+huddle is not published, so make a local package from this repository once. `npm pack` builds the bundle first (`prepack`) and writes `git-huddle-0.1.0.tgz`, which holds one file of JavaScript with no dependencies, the license, this README and `package.json`.
+
+Linux:
 
 ```sh
 git clone <this repository> huddle && cd huddle
-npm ci && npm run build          # writes dist/huddle.mjs, one file, no dependencies
+npm ci && npm pack
+npm install --global ./git-huddle-0.1.0.tgz
 ```
 
-Then, in the repository your team works in:
+Windows, PowerShell 7:
+
+```powershell
+git clone <this repository> huddle; cd huddle
+npm ci; npm pack
+npm install --global .\git-huddle-0.1.0.tgz
+```
+
+Then, in the repository your team works in, from its top directory. The recommended setup keeps prompts private (see [What is shared](#what-is-shared-and-with-whom)):
 
 ```sh
-node /path/to/huddle/dist/huddle.mjs init
-git add <the files init names>   # init prints the exact command
-git commit -m "Set up huddle" && git push
+huddle init --no-capture-intent
+git add <the files init names>   # init prints the exact command, for your shell
+git commit -m "Set up huddle"
+git push
 node .huddle/huddle.mjs doctor   # checks the remote, push access, hooks
 ```
 
-`init` copies the bundle into `.huddle/huddle.mjs`, writes `.huddle/config.json`, adds a short block to `AGENTS.md`, and installs hooks for the agents it finds. Teammates get all of that with their next `git pull`. Nobody else installs anything: the hooks run the copy in the repository.
+On Windows, npm installs `huddle.cmd` and `huddle.ps1` side by side. If PowerShell says running scripts is disabled on this system, it chose the `.ps1` and your execution policy blocked it: type `huddle.cmd init --no-capture-intent` instead. That needs no policy change. In CMD, `huddle init --no-capture-intent` runs `huddle.cmd` directly. Without installing the package at all, `npm ci && npm run build` and then `node <path to huddle>/dist/huddle.mjs init --no-capture-intent` does the same.
+
+`init` copies the bundle into `.huddle/huddle.mjs`, writes `.huddle/config.json`, adds a short block to `AGENTS.md`, and installs hooks for the agents it finds. Teammates get all of that with their next `git pull`. Nobody else installs anything: the hooks and every teammate's commands run the copy in the repository, as `node .huddle/huddle.mjs <command>` (the same line in a POSIX shell, PowerShell and CMD).
+
+With prompt capture off, agents say what they are doing with `node .huddle/huddle.mjs intent "<one line>"`, as the `AGENTS.md` block tells them to; people do the same.
 
 If your repository ignores an agent's directory (`.claude/` in `.gitignore` is common), git leaves that agent's hook file out of the commit without saying so, and your teammates get no hooks. `init` and `doctor` both tell you when that is the case, with the rule and the way out.
 
-Two things each teammate still does once, in their own clone:
+Things each teammate still does once, in their own clone:
 
 - **Trust the hooks**, where their agent asks. Claude Code asks through its workspace trust dialog. Codex asks twice: trust the project, then review the hooks with `/hooks`. Cursor runs a project's hooks only in a workspace that is trusted. Gemini CLI runs a project's hooks only in a folder it trusts, and warns the first time that the project brings a hook named huddle.
-- **Run `node .huddle/huddle.mjs init --agent git`** if they want the plain git hooks. Those live in `.git/hooks`, which git does not share. With `--agent git` it installs those and nothing else, so there is nothing to commit. A plain `init` would also set up any other agent it finds on that machine. When the repository keeps its hooks in a committed directory (`core.hooksPath` set to `.githooks`, or husky's `.husky`), huddle's lines go there instead, and teammates get them with the rest.
+- **Start the agent at the top of the repository.** Claude Code and Gemini CLI read hooks from the directory a session starts in: a session started in a subdirectory runs none of them.
+- **Run `node .huddle/huddle.mjs init --agent git`** if they want the plain git hooks. Those live in `.git/hooks`, which git does not share. With `--agent git` it installs those and nothing else, so there is nothing to commit. A plain `init` would also set up any other agent it finds on that machine. When the repository keeps its hooks in a committed directory (`core.hooksPath` set to `.githooks`, or husky's `.husky`), huddle's lines go there instead, and teammates get them with the rest. On Windows, Git for Windows runs these hooks with its own `sh`; you keep using huddle from PowerShell.
+- **Have push access** to the remote, and `node` on the `PATH` of whatever starts the agent or git.
+
+Claude Code on native Windows: see Anthropic's [native Windows setup](https://code.claude.com/docs/en/setup#install-on-native-windows). huddle's Claude Code hooks are exec form (the program `node` and an argument list, no shell), so they need `node.exe` on the `PATH`, not Git Bash. A hook that cannot start is a non-blocking error for Claude Code ([hooks reference](https://code.claude.com/docs/en/hooks#command-hook-fields)): huddle never sets it to block.
+
+Teammates see each other within about 15 to 30 seconds. huddle polls the remote; there is no push channel.
+
+## See it work: the two-clone demo
+
+```sh
+npm ci && npm run build && npm run demo
+```
+
+The same command works in PowerShell 7 (or `npm ci; npm run build; npm run demo`). It needs nothing but Node and git, and touches nothing outside a new directory in the system temp directory, whose name has a space and non-ASCII letters in it. There it makes one bare remote and clones for Alice and Bob, all with synthetic names and content, and prints one line per step:
+
+1. Alice runs `init` from your build, commits and pushes the setup; Bob pulls it and runs the vendored bundle.
+2. Alice sets an intent and changes `src/auth.ts`; Bob's `status --json` shows her name, branch, intent and file.
+3. Bob's `check src/auth.ts` exits 3 and names Alice.
+4. A third clone that never synced gets `unknown:` and exit 1 from the same check, never a clear result.
+5. Bob's Claude Code hooks, as `init` committed them, brief him at session start and warn at an edit of `src/auth.ts`. This is a **replay** of recorded Claude Code payloads with the paths rewritten to the demo's (drive letter and backslashes on Windows), run without a shell as Claude Code runs exec-form hooks. It is not a live Claude session. With the bundle or `node` missing, the hook fails without blocking.
+6. Alice's decision reaches Bob. Alice and Bob claim one task at the same moment: exactly one wins, the other gets exit 3 and the winner's name.
+7. A linked worktree of Bob's clone sees the same overlap. Bob's commit of `src/auth.ts` goes through, with the overlap warning from the git hook, after the hook that was already there.
+
+It ends with `PASS: <n> steps` and exit 0, or with `FAIL <n> <step>`, what it saw, and exit 1. `--keep` leaves the directory for a look; `--evidence <dir>` writes a JSON record.
 
 ## What your agent sees
 
@@ -136,14 +176,14 @@ Run them as `node .huddle/huddle.mjs <command>` from the top of the repository; 
 | `doctor [--json] [--offline]` | Checks that huddle can work here and says what to fix. Exit 1 when something is broken. |
 | `status [--json] [--cached]` | Who is working on what. |
 | `intent "<text>"`, `intent --clear`, `intent` | Says what this session is doing, in one line. A typed intent is not replaced by a prompt. |
-| `check [--json] [<path>...]` | Checks paths for overlap with teammates. With no path, the files this worktree has in flight. Exit 3 on overlap. |
+| `check [--json] [--refresh] [<path>...]` | Checks paths for overlap with teammates. With no path, the files this worktree has in flight. Exit 3 on overlap; exit 0 only when the team state is fresh and complete and nothing overlaps; otherwise exit 1 and a line that starts with `unknown:` and says what to do (`huddle sync`, or `check --refresh`). `--json` adds `verdict` (`overlap`, `clear`, `unknown`), `freshness` and `warnings`. |
 | `claim <glob>...`, `claim`, `release [<glob>...]` | Marks files as yours before you touch them, by glob. With no glob, `claim` lists your claims and `release` drops them all. A claim lasts as long as its session. |
 | `decide [--supersedes <id>] "<text>"` | Records a choice the others must follow. |
 | `decisions [--json] [--cached]` | The decisions in force, newest first. |
 | `task add "<title>"`, `task list`, `task claim <id>`, `task done <id>`, `task drop <id>` | A shared task list where a claim has exactly one winner. |
 | `sync [--force]` | Publishes this clone's sessions and refreshes the team's state now. |
 
-Exit codes: 0 ok, 1 error, 2 a mistake in the command, 3 an overlap or someone else got there first.
+Exit codes: 0 ok, 1 error or an unknown outcome, 2 a mistake in the command, 3 an overlap or someone else got there first. A task command whose write may or may not have reached the remote says so and exits 1; `huddle sync` and then `huddle task list` show what happened.
 
 ## How it works
 
@@ -178,7 +218,7 @@ Everyone who can read the repository on the remote can read all of this:
 
 Never file contents or diffs.
 
-Prompt capture is on by default because it is what makes the tool work with no cooperation from the agent. `huddle init --no-capture-intent` turns it off for the team; `init` says so every time it runs. In an intent, text that looks like a credential is replaced by `[redacted]` before it is stored. A decision that holds such text is refused, because a decision is never removed. Both go by the look of the text, on a best-effort basis: do not rely on it.
+Prompt capture is on by default because it is what makes the tool work with no cooperation from the agent. **The recommended setup turns it off:** `huddle init --no-capture-intent` for the team, and agents and people say what they are doing with `huddle intent "<one line>"`. `init` says which way it is set every time it runs. One person can turn it off for their clone alone with `{ "captureIntent": false }` in `<git dir>/huddle/config.json`. If a settings file that exists cannot be read, is not valid JSON, or holds a `captureIntent` that is neither `true` nor `false`, capture is off until it is fixed, whatever the other file says, and `huddle doctor` names the file. In an intent, text that looks like a credential is replaced by `[redacted]` before it is stored. A decision that holds such text is refused, because a decision is never removed. Both go by the look of the text, on a best-effort basis: do not rely on it.
 
 What huddle shows your agent was written by your teammates' tools. Every briefing is labelled as information and not instructions, each item is one line, control and invisible characters are removed, and `<` and `>` in a teammate's text are shown as `‹` and `›` so that it cannot write the tags an agent's context is framed with. huddle never executes anything it receives. A teammate can still write text that tries to instruct your agent; anyone who can do that can also push code to your repository.
 
@@ -193,12 +233,16 @@ Known and not fixed. Read these before you depend on it.
 
 **Sessions and claims**
 - A claim and a task both end with the session that holds them. A one-shot session (`claude -p`) releases everything when it exits.
-- Each agent session is its own huddle session, also when two agents share a worktree. But on Codex, Cursor and Gemini CLI, a huddle command the agent runs itself (`huddle intent`, `huddle claim`) acts as the session last active in that worktree, which can be the other agent's. On Claude Code they do not mix: its hooks give each session's shell its own `HUDDLE_SESSION`.
+- Taking over a task is activity-based reclamation, not a lock on the work. A teammate can claim a task only when its owner's session is known to have expired (not seen for the TTL). When huddle cannot tell, because this clone never synced or the owner's state cannot be read, the claim is refused with exit 1. An owner who keeps working without any huddle activity for longer than the TTL can lose the task.
+- A person running huddle commands by hand gets one session per worktree. Set `HUDDLE_SESSION` to keep a chosen session id across shells.
+- Give each agent session its own worktree (`git worktree add`) or clone. Each agent session is its own huddle session, also when two agents share a worktree. But on Codex, Cursor and Gemini CLI, a huddle command the agent runs itself (`huddle intent`, `huddle claim`) acts as the session last active in that worktree, which can be the other agent's. On Claude Code they do not mix: its hooks give each session's shell its own `HUDDLE_SESSION`.
 - An intent typed with `huddle intent` stays until it is changed or cleared, however stale. Committing by hand in a worktree keeps a dead agent session there looking alive.
 - Decisions and tasks need the remote: offline, they are refused, not queued.
 
-**Where it has been run**
-- Linux with Node 22 and git 2.56 only. macOS and Windows have not been tried.
+<a id="where-it-has-been-run"></a>**Where it has been run**
+- Linux: Fedora, Node 22.23, git 2.56; and GitHub's hosted Ubuntu runner, Node 22, plus the bundle on Node 20.
+- Native Windows: GitHub's hosted `windows-latest` runner, Windows Server 2025 Datacenter (10.0.26100), x64, PowerShell 7.6, Node 22.23, Git for Windows 2.56, `core.autocrlf=true`. The test suite, the package install with `huddle.cmd` from PowerShell and CMD, and the two-clone demo run there. That is a server image in CI, not a Windows desktop, and no live Claude Code session has run on Windows: its hooks were exercised by replaying recorded payloads.
+- macOS has not been tried. WSL is not part of the support statement.
 - Against local remotes, and against a private GitHub repository over SSH for the basic operations. Organization repositories with push rules, GitLab, Bitbucket and HTTPS credential helpers are untested. `doctor` tells you when the remote refuses `refs/huddle/*`.
 - Everyone needs push access to one remote. It does not work for fork-based projects.
 
@@ -212,7 +256,17 @@ Known and not fixed. Read these before you depend on it.
 **Housekeeping**
 - Nothing is ever cleaned up on the remote: the refs of clones that are gone, and of finished tasks, stay.
 - A repository copied together with its `.git` directory publishes under the same identity as the original. `doctor` reports it; the cure is to delete `<git dir>/huddle/actor` in the copy.
-- There is no uninstall command. To remove huddle: delete `.huddle/`, the block in `AGENTS.md`, huddle's entries in `.claude/settings.json`, `.codex/hooks.json`, `.cursor/hooks.json` and `.gemini/settings.json`, and the three marked lines in each git hook. That leaves huddle's refs on the remote, which `git ls-remote <remote> 'refs/huddle/*'` lists and `git push <remote> --delete <ref>` removes, and its local state in `<git dir>/huddle/` in each clone.
+- There is no uninstall command. See [Removing huddle](#removing-huddle).
+
+## Removing huddle
+
+By hand, so that nothing else is touched:
+
+1. In the repository: delete `.huddle/`; remove the block from `<!-- huddle:begin -->` to `<!-- huddle:end -->` in `AGENTS.md`; in `.claude/settings.json`, `.codex/hooks.json`, `.cursor/hooks.json` and `.gemini/settings.json`, remove only the hook entries whose command runs `.huddle/huddle.mjs`, and keep every other tool's entries. Commit and push that.
+2. In each clone that ran `init --agent git`: in each hook in `.git/hooks` (or the committed hooks directory), remove the three lines from `# >>> huddle >>>` to `# <<< huddle <<<`. The rest of each hook stays. A hook file huddle created says so on that first line; delete the file.
+3. Local state: `<git dir>/huddle/` in each clone. Deleting it affects that clone only.
+4. Shared state on the remote stays until someone deletes it on purpose: `git ls-remote <remote> "refs/huddle/*"` lists it, and `git push <remote> --delete <ref>` removes one ref. It is the whole team's, so agree before you delete it. Deleting refs does not erase copies other clones already fetched.
+5. The package: `npm uninstall --global git-huddle`.
 
 ## Comparison
 
@@ -236,6 +290,10 @@ npm ci
 npm run build       # dist/huddle.mjs
 npm run typecheck
 npm test            # builds first; node --test on real git clones in a temp directory
+npm run smoke:pack  # packs a clean copy of the tracked files, installs the tarball, runs the bins
+npm run demo        # the two-clone demo against dist/huddle.mjs
 ```
+
+The same commands run in PowerShell 7 on Windows. The tests import TypeScript directly, so they need Node 22 with type stripping (22.18 or later); the bundle they test also runs on Node 20. CI runs all of it on Linux and native Windows for every push to `main` and to the MVP branches.
 
 Zero runtime dependencies. `plan.md` is the design and the task list.
