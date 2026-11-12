@@ -189,6 +189,22 @@ describe("check: overlap, clear or unknown", () => {
     assert.equal(data.overlaps[0]?.path, "zz/last.ts");
   });
 
+  test("with no path, a worktree whose own files in flight cannot be listed is unknown, not clear", async () => {
+    const kate = await h.clone("kate");
+    assert.equal((await kate.huddle(["sync", "--force"], { now: at(70) })).code, 0);
+    const baseline = await check(kate, [], at(71));
+    assert.deepEqual([baseline.result.code, baseline.data.verdict], [0, "clear"], baseline.result.stdout + baseline.result.stderr);
+    // A corrupt index makes "git status" fail; the committed listing still works.
+    writeFileSync(join(kate.dir, ".git", "index"), "not an index");
+    const { result, data } = await check(kate, [], at(72));
+    assert.deepEqual([result.code, data.verdict], [1, "unknown"], result.stdout + result.stderr);
+    assert.ok(data.warnings.some((warning) => /own files in flight could not be listed/.test(warning)), data.warnings.join("\n"));
+    assert.match(result.stderr, /own files in flight could not be listed/);
+    const text = await kate.huddle(["check"], { now: at(72) });
+    assert.equal(text.code, 1, text.stdout + text.stderr);
+    assert.match(text.stdout, /^unknown: .*own files in flight could not be listed/);
+  });
+
   test("a path given in the platform's own absolute form maps to the repository path, case kept", async () => {
     const hank = await h.clone("hank");
     const native = join(hank.dir, "src", "Auth.ts"); // backslashes and a drive letter on Windows
