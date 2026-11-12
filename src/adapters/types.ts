@@ -17,7 +17,13 @@ export interface HookEvent {
    * worktree reports that worktree here, and branch and files come from it.
    */
   cwd: string;
-  /** `prompt` events: the user's prompt, uncut. The engine keeps the first 200 characters as the intent. */
+  /**
+   * `prompt` events: the user's prompt, uncut. The engine keeps the first 200
+   * characters as the intent. Absent when nobody typed anything (a prompt that
+   * a machine wrote, or an adapter that uses the event only as a point at which
+   * its agent can be briefed): the intent then stays as it is, and the session
+   * is briefed all the same.
+   */
   prompt?: string;
   /**
    * `pre-edit` and `post-edit` events: the files being edited, exactly as the
@@ -31,6 +37,14 @@ export interface HookEvent {
   reason?: string;
   /** The event came from a subagent of the session. */
   subagent?: boolean;
+  /**
+   * The event names no session: it comes from the worktree itself (a git
+   * hook). `sessionId` is ignored. The engine acts as the session a CLI
+   * command typed in the same place would act as (session.resolveSession),
+   * and treats the event like a subagent's: it keeps that session alive and
+   * is warned before an edit, and nothing else.
+   */
+  ambient?: boolean;
   /** Whatever the adapter needs to get back in format(), such as the native event name. The engine ignores it. */
   native?: unknown;
 }
@@ -75,6 +89,13 @@ export interface HookOutput {
    * adapter must build each line from values it has validated.
    */
   appendLines?: Array<{ path: string; line: string }>;
+  /**
+   * format() was given a context and this agent offers a hook no way to show
+   * it on this event (Cursor's beforeSubmitPrompt can only let a prompt pass
+   * or block it). The engine then records nothing as shown for the event, so
+   * the same news comes up again at the next event that can carry it.
+   */
+  unshown?: boolean;
 }
 
 export interface InstallOptions {
