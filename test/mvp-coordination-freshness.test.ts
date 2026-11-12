@@ -136,7 +136,7 @@ describe("check: overlap, clear or unknown", () => {
     }
   });
 
-  test("end to end: a match on a generated coverage glob is an overlap 'via coverage', and the text says it is conservative", { todo: "waits for worker 1: docs.ts parseDoc keeping Session.partial (CONTRACT 4.1)" }, async () => {
+  test("end to end: a match on a generated coverage glob is an overlap 'via coverage', and the text says it is conservative", async () => {
     const frank = await h.clone("frank");
     const gina = await h.clone("gina");
     const ctx = await openContext({ cwd: frank.dir, env: { ...(process.env as Record<string, string>), HUDDLE_NOW: at(40) }, self: BUNDLE, out() {}, err() {}, readStdin: async () => "" });

@@ -8,7 +8,7 @@
 // exactly that. Recording a decision needs the network for that reason.
 
 import type { Ctx } from "./context.ts";
-import { cleanText, LIMITS, newId, normalizeDoc, serializeDoc } from "./docs.ts";
+import { cleanText, DocTooLargeError, LIMITS, newId, normalizeDoc, serializeDoc } from "./docs.ts";
 import { log } from "./log.ts";
 import { ensureStateDir } from "./paths.ts";
 import { readCache, writeCache } from "./store.ts";
@@ -111,7 +111,7 @@ function fits(identity: Identity, decisions: Decision[]): boolean {
   try {
     return Buffer.byteLength(serializeDoc(logOf(identity, decisions)), "utf8") <= LIMITS.docBytes;
   } catch (error) {
-    if (error instanceof Error && (error.name === "DocTooLargeError" || error.constructor.name === "DocTooLargeError")) return false;
+    if (error instanceof DocTooLargeError) return false;
     throw error;
   }
 }
