@@ -69,3 +69,38 @@ test("every command that is still a stub exits 1 with `not implemented: <command
     assert.equal(r.stdout, "");
   }
 });
+
+// Self-adjusting like the stub test above: a command joins this one when it stops being a stub.
+test("every command answers --help and -h with its own usage, exits 0 and does nothing else", async (t) => {
+  const h = await createHarness(t);
+  const clone = await h.clone("alice");
+  const before = await clone.snapshot();
+  const asked: string[][] = [];
+  for (const name of COMMANDS) {
+    if (name === "hook") continue; // a hook never prints usage: below
+    if (readFileSync(`${commandsDir}${name}.ts`, "utf8").includes(`notImplemented("${name}"`)) continue;
+    asked.push([name, "--help"], [name, "-h"]);
+  }
+  // After a subcommand and after other arguments too: help is asked for, whatever else is on the line.
+  asked.push(["task", "add", "--help"], ["task", "claim", "abcd2345", "-h"], ["intent", "some text", "--help"], ["claim", "src/**", "-h"], ["decide", "--supersedes", "abcd2345", "--help"]);
+  assert.ok(asked.length >= 20, "the commands of the first milestones are all implemented");
+
+  for (const args of asked) {
+    const r = await clone.huddle(args);
+    const line = `huddle ${args.join(" ")}`;
+    assert.equal(r.code, 0, `${line}: ${r.stderr}`);
+    assert.equal(r.stderr, "", line);
+    assert.match(r.stdout, new RegExp(`^\\S.*\\n\\nUsage: huddle ${args[0]}\\b`), line);
+  }
+  // A text after "--" is the text, also when it is "--help".
+  const literal = await clone.huddle(["decide", "--", "--help"], { env: { HUDDLE_TIMEOUT_MS: "200" } });
+  assert.doesNotMatch(literal.stdout, /Usage:/);
+
+  // Asking for help made no session, wrote no state for the ones asked, and touched nothing of git's.
+  assert.equal((await h.remoteGit("for-each-ref", "--format=%(refname)", "refs/huddle/actors")).trim(), "");
+  assert.deepEqual(await clone.snapshot(), before);
+
+  // `hook` is run by agents, with a payload on stdin: it stays silent and exits 0 whatever it is given.
+  const hook = await clone.huddle(["hook", "--help"]);
+  assert.deepEqual({ code: hook.code, stdout: hook.stdout }, { code: 0, stdout: "" });
+});

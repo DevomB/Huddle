@@ -8,6 +8,7 @@ import { cleanText, LIMITS } from "../core/docs.ts";
 import { EXIT, UsageError } from "../core/io.ts";
 import type { Io } from "../core/io.ts";
 import { resolveSession } from "../core/session.ts";
+import { scrubSecrets } from "../hooks/intent.ts";
 import { ID_RE } from "../core/types.ts";
 
 export const summary = "Record a decision others must follow: huddle decide \"<text>\"";
@@ -16,11 +17,14 @@ const USAGE = 'huddle decide [--supersedes <id>] [--] "<choice others must follo
 
 export async function run(args: string[], io: Io): Promise<number> {
   const { values, positionals } = parse(args, { supersedes: { type: "string", multiple: true } }, USAGE);
-  const typed = positionals.join(" ");
-  const text = cleanText(typed, LIMITS.decisionText);
+  const typed = cleanText(positionals.join(" "), Number.MAX_SAFE_INTEGER);
+  // A decision is read by everyone who can read the repository, and stays. What looks like a
+  // credential is not published, as with an intent (hooks/intent.ts; best effort).
+  const whole = scrubSecrets(typed);
+  const text = cleanText(whole, LIMITS.decisionText);
   if (text === "") throw new UsageError(`the decision is empty\nUsage: ${USAGE}`);
   // A rule that others must follow is not cut short behind the author's back.
-  const length = Array.from(cleanText(typed, Number.MAX_SAFE_INTEGER)).length;
+  const length = Array.from(whole).length;
   if (length > LIMITS.decisionText) {
     throw new UsageError(`a decision is at most ${LIMITS.decisionText} characters; this one is ${length}. Say it shorter, or split it into two.`);
   }
@@ -34,7 +38,9 @@ export async function run(args: string[], io: Io): Promise<number> {
   const ctx = await openContext(io);
   const me = await resolveSession(ctx);
   const result = await addDecision(ctx, text, supersedes === undefined ? { agent: me.agent } : { agent: me.agent, supersedes });
-  return report(result, { remote: ctx.config.remote, supersedes }, io);
+  const code = report(result, { remote: ctx.config.remote, supersedes }, io);
+  if (result.ok && whole !== typed) io.out("(something in it looked like a credential and was replaced by [redacted] before it was published)");
+  return code;
 }
 
 /** "[id] text (user / agent)", the way `huddle decisions` lists one. */
