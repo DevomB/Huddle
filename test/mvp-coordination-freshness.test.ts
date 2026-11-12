@@ -5,7 +5,7 @@
 // which puts a space and a non-ASCII letter in every directory name.
 
 import assert from "node:assert/strict";
-import { writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { openContext } from "../src/core/context.ts";
@@ -169,6 +169,24 @@ describe("check: overlap, clear or unknown", () => {
     assert.deepEqual(data.overlaps[0]?.sessions.map((s) => [s.user, s.via, s.match, s.total]), [["frank", "coverage", "lib/**", 250]]);
     const text = await gina.huddle(["check", "lib/deep/two.ts"], { now: at(41) });
     assert.match(text.stdout, /has 250 files in flight, more than it lists, and lib\/\*\* covers the rest \(conservative/);
+  });
+
+  test("with no path, every file in flight is checked, not only the ones that fit a published document", async () => {
+    const ivan = await h.clone("ivan");
+    const jane = await h.clone("jane");
+    const ctx = await openContext({ cwd: ivan.dir, env: { ...(process.env as Record<string, string>), HUDDLE_NOW: at(60) }, self: BUNDLE, out() {}, err() {}, readStdin: async () => "" });
+    const session = { id: "ivan-1", agent: "manual", branch: "main", intent: "Tail", intentSource: "manual" as const, files: ["zz/last.ts"], claims: [], startedAt: at(60), seenAt: at(60) };
+    const doc: ActorDoc = { v: 0, kind: "actor", actor: ctx.identity.actor, user: "ivan", host: "h", updatedAt: at(60), sessions: [session] };
+    assert.equal((await ctx.transport.publish(actorRef(ctx.identity.actor), doc, "own")).ok, true);
+    // More files in flight than LIMITS.files (200); the one that overlaps sorts last, past the cut.
+    mkdirSync(join(jane.dir, "a"), { recursive: true });
+    mkdirSync(join(jane.dir, "zz"), { recursive: true });
+    for (let i = 0; i < 200; i++) writeFileSync(join(jane.dir, "a", `${String(i).padStart(4, "0")}.ts`), "x\n");
+    writeFileSync(join(jane.dir, "zz", "last.ts"), "x\n");
+    const { result, data } = await check(jane, ["--refresh"], at(61));
+    assert.equal(data.checked, 201);
+    assert.equal(result.code, 3, result.stdout + result.stderr);
+    assert.equal(data.overlaps[0]?.path, "zz/last.ts");
   });
 
   test("a path given in the platform's own absolute form maps to the repository path, case kept", async () => {

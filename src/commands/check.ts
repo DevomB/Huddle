@@ -7,7 +7,7 @@
 
 import { parse } from "../core/args.ts";
 import { openContext } from "../core/context.ts";
-import { filesInFlight, toRepoPath } from "../core/files.ts";
+import { toRepoPath, workInFlight } from "../core/files.ts";
 import { EXIT, UsageError } from "../core/io.ts";
 import type { Io } from "../core/io.ts";
 import { renderOverlaps } from "../core/render.ts";
@@ -32,7 +32,8 @@ export async function run(args: string[], io: Io): Promise<number> {
 
   let targets: string[];
   if (positionals.length === 0) {
-    targets = await filesInFlight(ctx.paths.worktree, ctx.config);
+    // Every file in flight: the published list stops at LIMITS.files, and a file past it can overlap too.
+    targets = (await workInFlight(ctx.paths.worktree, ctx.config)).all;
   } else {
     targets = positionals.map((raw) => {
       const path = toRepoPath(ctx.paths, io.cwd, raw);
