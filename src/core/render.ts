@@ -189,12 +189,14 @@ function decisionLines(decisions: ViewDecision[], fresh: boolean, detail: Level)
 
 /**
  * "Tasks: 2 open, 3 taken." A claim whose owner is gone counts as open,
- * because it can be claimed again. "" when nothing is pending.
+ * because it can be claimed again. A claim whose owner cannot be seen either
+ * way counts as taken, because it cannot. "" when nothing is pending.
  */
 function taskSummary(view: TeamView): string {
   const counts = countTasks(view);
   const open = counts.open + counts.stale;
-  return open + counts.taken === 0 ? "" : `Tasks: ${open} open, ${counts.taken} taken.`;
+  const taken = counts.taken + counts.unclear;
+  return open + taken === 0 ? "" : `Tasks: ${open} open, ${taken} taken.`;
 }
 
 // ----------------------------------------------------------------- briefing
@@ -411,6 +413,7 @@ function taskLine(task: ViewTask, view: TeamView): string {
   const mine = task.owner !== null && task.owner.actor === view.self.actor && task.owner.session === view.self.session;
   if (state === "taken") return `- [${id}] taken by ${mine ? "you" : owner}: ${title}`;
   if (state === "stale") return `- [${id}] claimed by ${owner}, whose session is gone, so it can be claimed again: ${title}`;
+  if (state === "unclear") return `- [${id}] claimed by ${owner}, whose session cannot be seen from here (run huddle sync), so it cannot be claimed: ${title}`;
   return `- [${id}] done${task.owner === null ? "" : ` by ${owner}`}: ${title}`;
 }
 
@@ -425,7 +428,7 @@ function decisionLog(view: TeamView, notice: boolean): string[] {
 
 function taskList(view: TeamView, notice: boolean): string[] {
   const counts = countTasks(view);
-  const parts = (["open", "taken", "stale", "done"] as const).filter((state) => counts[state] > 0).map((state) => `${counts[state]} ${state}`);
+  const parts = (["open", "taken", "stale", "unclear", "done"] as const).filter((state) => counts[state] > 0).map((state) => `${counts[state]} ${state}`);
   return [`Tasks: ${parts.join(", ")}.${notice ? ` ${NOTICE}` : ""}`, ...view.tasks.map((task) => taskLine(task, view))];
 }
 

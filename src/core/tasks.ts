@@ -26,7 +26,7 @@ import type { SyncResult } from "./sync.ts";
 import { actorRef, taskRef } from "./types.ts";
 import type { FailReason, Owner, PublishResult, Sha, TaskDoc } from "./types.ts";
 import { buildView } from "./view.ts";
-import type { ViewTask } from "./view.ts";
+import type { OwnerPresence, ViewTask } from "./view.ts";
 
 /** Which session is acting; with ctx.identity it makes the Owner. */
 export type Who = Pick<Owner, "session" | "agent">;
@@ -59,11 +59,13 @@ export type TaskResult =
        * means the change may have been made: every other reason is a change
        * that was not made.
        */
-      reason: FailReason | SyncFailure | "not-found" | "not-owner" | "already-claimed" | "already-done" | "unknown";
+      reason: FailReason | SyncFailure | "not-found" | "not-owner" | "already-claimed" | "already-done" | "owner-unknown" | "unknown";
       /** The task as it stands now, when known. On a lost claim, task.owner is the winner. With "unknown": the task as it was sent. */
       task?: TaskDoc;
-      /** With a claimed `task`: whether its owner's session is live. False means the task may be claimed. */
+      /** With a claimed `task`: whether its owner's session is live. */
       ownerLive?: boolean;
+      /** With a claimed `task`: where its owner stands. Only "expired" means the task may be claimed. "owner-unknown" is a refused takeover. */
+      ownerPresence?: OwnerPresence | null;
     };
 
 /** A random id colliding with an existing task is a one in 2^40 event; this many tries is plenty. */
@@ -80,7 +82,7 @@ function owns(task: TaskDoc, me: Owner): boolean {
 }
 
 /** A view task without its computed liveness: the document as it is stored. */
-function stored(task: ViewTask): TaskDoc {
+function stored(task: TaskDoc): TaskDoc {
   return {
     v: 0,
     kind: "task",
@@ -189,7 +191,7 @@ async function reconcile(ctx: Ctx, who: Who, sent: TaskDoc, expect: Sha | "absen
   const task = stored(now.task);
   if (made(task)) return { ok: true, task, confirmed: "read-back" };
   if (now.sha === expect) return unknown; // unchanged so far; our push may still land
-  return { ok: false, reason: "lost-race", task, ownerLive: now.task.ownerLive };
+  return { ok: false, reason: "lost-race", task, ownerLive: now.task.ownerLive, ownerPresence: now.task.ownerPresence };
 }
 
 /**
@@ -211,7 +213,9 @@ async function swap(ctx: Ctx, who: Who, next: TaskDoc, expect: Sha, made: (now: 
 
   await refresh(ctx); // if this fails, the task below is the best we know
   const now = await lookup(ctx, next.id, who.session);
-  return now ? { ok: false, reason: "lost-race", task: stored(now.task), ownerLive: now.task.ownerLive } : { ok: false, reason: "lost-race" };
+  return now
+    ? { ok: false, reason: "lost-race", task: stored(now.task), ownerLive: now.task.ownerLive, ownerPresence: now.task.ownerPresence }
+    : { ok: false, reason: "lost-race" };
 }
 
 /**
@@ -284,9 +288,11 @@ export async function addTask(ctx: Ctx, title: string, who: Who, opts: { id?: st
 }
 
 /**
- * Open tasks can be claimed, and so can claimed tasks whose owner session is
- * no longer live. Claiming a task this session already holds succeeds and
- * changes nothing.
+ * Open tasks can be claimed, and so can claimed tasks whose owner session has
+ * expired (view.ts, OwnerPresence): activity-based reclamation, not an
+ * execution lock. An owner that cannot be seen either way is never taken as
+ * gone: that is "owner-unknown". Claiming a task this session already holds
+ * succeeds and changes nothing.
  */
 export async function claimTask(ctx: Ctx, id: string, who: Who): Promise<TaskResult> {
   const me = ownerOf(ctx, who);
@@ -301,8 +307,10 @@ export async function claimTask(ctx: Ctx, id: string, who: Who): Promise<TaskRes
   if (task.status === "done") return { ok: false, reason: "already-done", task };
   if (task.status === "claimed") {
     if (owns(task, me)) return { ok: true, task };
-    if (found.task.ownerLive) return { ok: false, reason: "already-claimed", task, ownerLive: true };
-    // Claimed, but by a session that is gone: it may be claimed again.
+    const presence = found.task.ownerPresence;
+    if (presence === "live") return { ok: false, reason: "already-claimed", task, ownerLive: true, ownerPresence: presence };
+    if (presence !== "expired") return { ok: false, reason: "owner-unknown", task, ownerLive: false, ownerPresence: "unknown" };
+    // Claimed, but by a session that has expired: it may be claimed again.
   }
   const mine = (now: TaskDoc): boolean => now.status === "claimed" && owns(now, me);
   const claimed = await swap(ctx, who, { ...task, status: "claimed", owner: me, updatedAt: ctx.now.toISOString() }, found.sha, mine);
@@ -323,7 +331,9 @@ export async function finishTask(ctx: Ctx, id: string, who: Who): Promise<TaskRe
   if (!found) return { ok: false, reason: "not-found" };
   const task = stored(found.task);
   if (task.status === "done") return { ok: false, reason: "already-done", task };
-  if (task.status === "claimed" && !owns(task, me)) return { ok: false, reason: "not-owner", task, ownerLive: found.task.ownerLive };
+  if (task.status === "claimed" && !owns(task, me)) {
+    return { ok: false, reason: "not-owner", task, ownerLive: found.task.ownerLive, ownerPresence: found.task.ownerPresence };
+  }
   const finished = await swap(ctx, who, { ...task, status: "done", owner: me, updatedAt: ctx.now.toISOString() }, found.sha, (now) => now.status === "done" && owns(now, me));
   return settle(finished, () => false);
 }
@@ -339,7 +349,7 @@ export async function dropTask(ctx: Ctx, id: string, who: Who): Promise<TaskResu
   const task = stored(found.task);
   if (task.status === "done") return { ok: false, reason: "already-done", task };
   if (task.status === "open") return { ok: true, task };
-  if (!owns(task, me)) return { ok: false, reason: "not-owner", task, ownerLive: found.task.ownerLive };
+  if (!owns(task, me)) return { ok: false, reason: "not-owner", task, ownerLive: found.task.ownerLive, ownerPresence: found.task.ownerPresence };
   const reopened = (now: TaskDoc): boolean => now.status === "open";
   const dropped = await swap(ctx, who, { ...task, status: "open", owner: null, updatedAt: ctx.now.toISOString() }, found.sha, reopened);
   return settle(dropped, reopened);
