@@ -13,7 +13,7 @@ import type { HookEvent, HookEventType } from "../src/adapters/types.ts";
 import type { Io } from "../src/core/io.ts";
 import { OVERLAP_HINT, shownText } from "../src/core/render.ts";
 import type { ActorDoc } from "../src/core/types.ts";
-import { DEADLINE_MS, handleEvent, sessionIdOf } from "../src/hooks/engine.ts";
+import { DEADLINE_MS, handleEvent, lifetimeMs, sessionIdOf } from "../src/hooks/engine.ts";
 import { REDACTED } from "../src/hooks/intent.ts";
 import {
   ALONE,
@@ -1372,15 +1372,31 @@ test("HUDDLE_HOOK_PATIENCE makes every deadline that many times longer, and coun
       // Never before its deadline. How long after is up to the machine, with ten of them at once.
       assert.ok(run.ms >= deadline - 5, `with ${JSON.stringify(patience)} it came back after ${Math.round(run.ms)} ms; its deadline is then ${deadline} ms`);
     }
-    // What the log says is the deadline each event really had: none of them had more than it should.
-    const log = await logOf(alice);
+    // What the log says is the deadline each event really had: none of them had more than it should. An event writes
+    // that line into the log of the repository it is in, so it has to have found the repository by then. With eleven
+    // of them starting git at once, on a slow or busy machine (a hosted Windows runner, a workstation running several
+    // suites) one that had not yet says nothing: so no deadline may be counted more often than it was given, and none
+    // may appear that was given to nobody.
+    const gaveUp = [...(await logOf(alice)).matchAll(/\[hook\] pre-edit: gave up at its deadline of (\S+) ms/g)].map((found) => Number(found[1]));
     for (const [deadline, times] of [[150, 9], [225, 1], [300, 1]] as const) {
-      assert.equal(log.split(`[hook] pre-edit: gave up at its deadline of ${deadline} ms`).length - 1, times, `${deadline} ms`);
+      const counted = gaveUp.filter((ms) => ms === deadline).length;
+      assert.ok(counted <= times, `${deadline} ms was the deadline of ${counted} events, and was given to ${times}`);
     }
+    assert.deepEqual(gaveUp.filter((ms) => ![150, 225, 300].includes(ms)), [], "a deadline nobody was given");
+    t.diagnostic(`${gaveUp.length} of ${cases.length} events had found their repository when their deadline passed, and logged it`);
   } finally {
     await release();
     await sleep(400);
   }
+
+  // The same rule without a clock: the limit on the whole hook process is the longest deadline times patience, plus
+  // a margin that patience does not touch.
+  const limit = (patience: string): number => lifetimeMs({ env: { HUDDLE_HOOK_PATIENCE: patience } } as unknown as Io);
+  const margin = 2 * limit("1") - limit("2");
+  const longest = limit("1") - margin;
+  assert.ok(margin > 0 && longest > 0);
+  for (const [patience, deadline] of cases) assert.equal(limit(patience), margin + (deadline / 150) * longest, JSON.stringify(patience));
+  assert.equal(limit("20"), margin + 20 * longest, "20 is the most");
 });
 
 test("patience is for this machine and not for the remote: a sync is waited for no longer than without it", async (t) => {

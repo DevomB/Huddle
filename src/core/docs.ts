@@ -9,7 +9,7 @@
 
 import { randomBytes } from "node:crypto";
 import { ID_RE, parseRef } from "./types.ts";
-import type { ActorDoc, Decision, DecisionDoc, Doc, Iso, Owner, Ref, Session, TaskDoc } from "./types.ts";
+import type { ActorDoc, Decision, DecisionDoc, Doc, Iso, Owner, Ref, Session, SessionPartial, TaskDoc } from "./types.ts";
 
 export const LIMITS = {
   /** doc.json larger than this is not parsed at all. */
@@ -118,22 +118,255 @@ function cleanId(value: unknown): string | null {
   return typeof value === "string" && ID_RE.test(value) ? value : null;
 }
 
-function cleanPaths(value: unknown, max: number): string[] {
-  if (!Array.isArray(value)) return [];
-  const seen = new Set<string>();
-  for (const item of value) {
-    const path = cleanPath(item);
-    if (path) seen.add(path);
-    if (seen.size >= max) break;
-  }
-  return [...seen];
-}
-
 function record(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
 }
 
-function normalizeSession(value: unknown): Session | null {
+// ---------------------------------------------------------------------------
+// Files and claims on the wire: exact where they fit, covered where they do not
+// ---------------------------------------------------------------------------
+//
+// A session's files in flight can be more than a document carries: more than
+// LIMITS.files, paths that cleanPath would change or drop, or more bytes than
+// LIMITS.docBytes leaves for them next to the other sessions. Leaving the rest
+// out would turn files a teammate cannot see into a clean overlap check. So the
+// files that do not go out exactly go out as generated coverage globs instead
+// (`dir/**`, widening up to `**`), which say "something under here". They are
+// listed in `partial.cover` and are also among `claims`, so a reader that does
+// not know `partial` still warns for them. Coverage is always a superset of
+// what was cut. A user's own claims are never mixed with it in local.json:
+// there, `claims` holds only the user's and `partial.cover` the generated ones.
+
+/** True when `value` goes on the wire exactly as it is: cleanPath leaves it unchanged. */
+export function wireExact(value: string): boolean {
+  return value !== "" && cleanPath(value) === value;
+}
+
+/** The glob that covers everything. Also the last resort of every widening. */
+export const COVER_ALL = "**";
+
+/**
+ * A file or a glob to cover, as the directories above it, plus the file name
+ * when it is a file (or a glob that is not a whole directory).
+ */
+interface CoverItem {
+  dirs: string[];
+  file: string | null;
+}
+
+function itemOf(pathOrGlob: string): CoverItem | null {
+  const segments = pathOrGlob.split("/").filter((segment) => segment !== "");
+  const last = segments.at(-1);
+  if (last === undefined) return null;
+  if (last === "**") return { dirs: segments.slice(0, -1), file: null };
+  return { dirs: segments.slice(0, -1), file: last };
+}
+
+/**
+ * The glob for an item with at most `depth` directories kept: "a/b/**" for a
+ * file under a/b, or the file name itself for a file at the top of the repo.
+ * Widened (fewer directories kept) until the glob goes on the wire exactly;
+ * "**" in the end. Keeping fewer directories only ever matches more.
+ */
+function coverGlob(item: CoverItem, depth: number): string {
+  for (let keep = Math.min(depth, item.dirs.length); keep >= 1; keep--) {
+    const glob = `${item.dirs.slice(0, keep).join("/")}/**`;
+    if (wireExact(glob)) return glob;
+  }
+  if (depth >= 1 && item.dirs.length === 0 && item.file !== null && wireExact(item.file)) return item.file;
+  return COVER_ALL;
+}
+
+/** How many directories a cover glob keeps: "a/b/**" 2, a top-level file name 1, "**" 0. */
+function globDepth(glob: string): number {
+  const item = itemOf(glob);
+  if (!item || glob === COVER_ALL) return 0;
+  return item.file === null ? item.dirs.length : Math.max(1, item.dirs.length);
+}
+
+/** Drops globs that another one in the set already covers ("a/b/**" under "a/**"). Sorted. */
+function minimalCover(globs: Set<string>): string[] {
+  if (globs.has(COVER_ALL)) return [COVER_ALL];
+  const dirs = new Set([...globs].filter((glob) => glob.endsWith("/**")).map((glob) => glob.slice(0, -3)));
+  const kept: string[] = [];
+  for (const glob of globs) {
+    const item = itemOf(glob);
+    if (!item) continue;
+    // Covered when one of the directories strictly above it is itself covered.
+    const above = item.file === null ? item.dirs.length - 1 : item.dirs.length;
+    let covered = false;
+    for (let keep = 1; keep <= above && !covered; keep++) covered = dirs.has(item.dirs.slice(0, keep).join("/"));
+    if (!covered) kept.push(glob);
+  }
+  return kept.sort();
+}
+
+/**
+ * Coverage for `items` in at most `slots` globs (at least one), keeping at
+ * most `maxDepth` directories: the narrowest that fits, widening level by
+ * level, `["**"]` in the end.
+ */
+function coverFor(items: Iterable<CoverItem>, slots: number, maxDepth = Infinity): string[] {
+  // Only the directories matter, and a file name only at the top: many files, few distinct items.
+  const distinct = new Map<string, CoverItem>();
+  let deepest = 0;
+  for (const item of items) {
+    const key = item.dirs.length > 0 ? `d:${item.dirs.join("/")}` : `f:${item.file ?? ""}`;
+    if (distinct.has(key)) continue;
+    distinct.set(key, item.dirs.length > 0 ? { dirs: item.dirs, file: null } : item);
+    if (item.dirs.length > deepest) deepest = item.dirs.length;
+  }
+  if (distinct.size === 0) return [];
+  for (let depth = Math.min(Math.max(deepest, 1), maxDepth); depth >= 1; depth--) {
+    const globs = new Set<string>();
+    for (const item of distinct.values()) globs.add(coverGlob(item, depth));
+    const cover = minimalCover(globs);
+    if (cover.length <= Math.max(1, slots)) return cover;
+  }
+  return [COVER_ALL];
+}
+
+function strings(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+/** What a session's files and claims are made of, before they are cut to fit. */
+interface Sources {
+  /** Files that go on the wire exactly, deduplicated, in the order given. */
+  exact: string[];
+  /** Files that do not (cleanPath would change or drop them): they can only be covered. */
+  lossy: string[];
+  /** Generated globs from an earlier cut: from local state, or from a published document. */
+  cover: string[];
+  /** The user's claims, each one exact on the wire (one that was not is widened until it is). */
+  claims: string[];
+  /** How many files were in flight, as far as anyone counted. */
+  total: number;
+  /** The input said `partial`, so it was not complete even if nothing here shows why. */
+  partial: boolean;
+}
+
+function sourcesOf(files: unknown, claims: unknown, partial: unknown): Sources {
+  const given = record(partial);
+  const cover = new Set<string>();
+  for (const glob of strings(given?.cover)) if (glob.trim() !== "") cover.add(glob);
+
+  const exact = new Set<string>();
+  const lossy = new Set<string>();
+  for (const file of strings(files)) {
+    if (wireExact(file)) exact.add(file);
+    else if (file.trim() !== "") lossy.add(file);
+  }
+
+  const user = new Set<string>();
+  for (const claim of strings(claims)) {
+    if (cover.has(claim)) continue; // generated, not the user's
+    if (wireExact(claim)) user.add(claim);
+    else {
+      // A claim that would not survive the trip (from an older version that let it in): its widening does.
+      const item = itemOf(claim.replace(/\\/g, "/"));
+      if (item) user.add(coverGlob(item, Infinity));
+    }
+  }
+
+  const counted = typeof given?.total === "number" && Number.isSafeInteger(given.total) && given.total >= 0 ? given.total : 0;
+  return {
+    exact: [...exact],
+    lossy: [...lossy],
+    cover: [...cover],
+    claims: [...user],
+    total: Math.max(counted, exact.size + lossy.size),
+    partial: given !== null,
+  };
+}
+
+/** How far a session is cut down: how many exact files it keeps, how deep its coverage goes, whether its own claims give way to "**". */
+interface Cut {
+  exact: number;
+  depth: number;
+  dropClaims: boolean;
+}
+
+const UNCUT: Cut = { exact: LIMITS.files, depth: Infinity, dropClaims: false };
+
+type Shaped = Pick<Session, "files" | "claims"> & { partial?: SessionPartial };
+
+function shape(sources: Sources, cut: Cut): Shaped {
+  const files = sources.exact.slice(0, Math.max(0, Math.min(cut.exact, LIMITS.files)));
+  const items: CoverItem[] = [];
+  for (const file of sources.exact.slice(files.length)) items.push(itemOf(file)!);
+  for (const file of sources.lossy) {
+    const item = itemOf(file.replace(/\\/g, "/"));
+    items.push(item ?? { dirs: [], file: null }); // nothing usable to keep: "**"
+  }
+  for (const glob of sources.cover) {
+    const item = itemOf(glob);
+    if (item) items.push(item);
+  }
+
+  const total = Math.max(sources.total, files.length);
+  const over = sources.claims.length > LIMITS.claims;
+  if (cut.dropClaims || over || (items.length > 0 && sources.claims.length >= LIMITS.claims)) {
+    // No room left for coverage next to the user's claims: one glob that covers both.
+    return { files, claims: [COVER_ALL], partial: { total, cover: [COVER_ALL] } };
+  }
+  if (items.length === 0) {
+    // Complete, unless the input said otherwise and we cannot tell what is missing (a reader then knows it is incomplete).
+    const claims = sources.claims;
+    return sources.partial && total > files.length ? { files, claims, partial: { total, cover: [] } } : { files, claims };
+  }
+  const cover = coverFor(items, LIMITS.claims - sources.claims.length, cut.depth);
+  const generated = new Set(cover);
+  return {
+    files,
+    claims: [...sources.claims.filter((claim) => !generated.has(claim)), ...cover],
+    partial: { total, cover },
+  };
+}
+
+/**
+ * The published form of a local session: exact files that fit, and generated
+ * coverage for the rest, also listed in `claims` (see the section comment).
+ * `local.files` and `local.claims` are what local.json holds: the files in
+ * flight (files.ts already cut them to LIMITS.files and put the rest in
+ * `partial`) and the user's own claims. Fields other than files, claims and
+ * partial are copied as they are; normalizeDoc cleans them on the way out.
+ */
+export function wireSession(local: Session): Session {
+  const shaped = shape(sourcesOf(local.files, local.claims, local.partial), UNCUT);
+  const session: Session = {
+    id: local.id,
+    agent: local.agent,
+    branch: local.branch,
+    intent: local.intent,
+    intentSource: local.intentSource,
+    files: shaped.files,
+    claims: shaped.claims,
+    startedAt: local.startedAt,
+    seenAt: local.seenAt,
+  };
+  if (shaped.partial) session.partial = shaped.partial;
+  return session;
+}
+
+/**
+ * Files in flight as local.json keeps them: at most LIMITS.files exact paths,
+ * in the order given, and `partial` with coverage for everything else (null
+ * when nothing was left out). Coverage here uses all LIMITS.claims slots;
+ * publishing widens it further when the user's claims need room.
+ */
+export function cutFiles(all: readonly string[]): { files: string[]; partial: SessionPartial | null } {
+  const shaped = shape(sourcesOf(all, [], undefined), UNCUT);
+  return { files: shaped.files, partial: shaped.partial ?? null };
+}
+
+/** A session from the wire or from us, with text cleaned and files and claims shaped by `cut`. */
+interface Normalized {
+  session: Session;
+  sources: Sources;
+}
+
+function normalizeSessionParts(value: unknown): Normalized | null {
   const raw = record(value);
   if (!raw) return null;
   const id = cleanText(raw.id, LIMITS.sessionId);
@@ -142,17 +375,85 @@ function normalizeSession(value: unknown): Session | null {
   if (!id || !startedAt || !seenAt) return null;
   const intent = cleanText(raw.intent, LIMITS.intent);
   const source = raw.intentSource;
-  return {
+  const sources = sourcesOf(raw.files, raw.claims, raw.partial);
+  return { session: withShape({
     id,
     agent: cleanText(raw.agent, LIMITS.name) || "unknown",
     branch: cleanText(raw.branch, LIMITS.branch),
     intent,
     intentSource: intent === "" ? "none" : source === "prompt" || source === "manual" ? source : "none",
-    files: cleanPaths(raw.files, LIMITS.files),
-    claims: cleanPaths(raw.claims, LIMITS.claims),
+    files: [],
+    claims: [],
     startedAt,
     seenAt,
-  };
+  }, shape(sources, UNCUT)), sources };
+}
+
+function withShape(session: Session, shaped: Shaped): Session {
+  const out: Session = { ...session, files: shaped.files, claims: shaped.claims };
+  delete out.partial;
+  if (shaped.partial) out.partial = shaped.partial;
+  return out;
+}
+
+/** The serialized size of a document, in UTF-8 bytes. */
+function docBytes(doc: Doc): number {
+  return Buffer.byteLength(docText(doc), "utf8");
+}
+
+function docText(doc: Doc): string {
+  return JSON.stringify(doc, null, 2) + "\n";
+}
+
+/** What one session adds to its actor document's size: its text indented two levels down, plus the separator. */
+function sessionBytes(session: Session): number {
+  const text = JSON.stringify(session, null, 2);
+  let lines = 1;
+  for (let i = text.indexOf("\n"); i !== -1; i = text.indexOf("\n", i + 1)) lines++;
+  return Buffer.byteLength(text, "utf8") + 4 * lines + 2;
+}
+
+/**
+ * Cuts the sessions of an actor document until it fits LIMITS.docBytes,
+ * always the largest session first, one step at a time: halve its exact
+ * files (the rest goes into coverage), then widen its coverage a level, then
+ * let its own claims give way to "**". Every session stays in the document.
+ * Fifty sessions with nothing but "**" fit (a test proves it), so this always
+ * ends with a document that fits.
+ */
+function fitActor(doc: ActorDoc, parts: Normalized[]): ActorDoc {
+  if (docBytes(doc) <= LIMITS.docBytes) return doc;
+  const cuts: Cut[] = parts.map(() => ({ ...UNCUT }));
+  const sessions = [...doc.sessions];
+  const sizes = sessions.map(sessionBytes);
+  const base = docBytes({ ...doc, sessions: [] });
+  const done = new Set<number>();
+  let total = base + sizes.reduce((sum, size) => sum + size, 0);
+  for (;;) {
+    if (total <= LIMITS.docBytes || done.size === sessions.length) {
+      const fitted: ActorDoc = { ...doc, sessions };
+      if (docBytes(fitted) <= LIMITS.docBytes || done.size === sessions.length) return fitted;
+      total = LIMITS.docBytes + 1; // the estimate was short; keep cutting
+    }
+    let largest = -1;
+    for (let i = 0; i < sessions.length; i++) {
+      if (!done.has(i) && (largest === -1 || sizes[i]! > sizes[largest]!)) largest = i;
+    }
+    const session = sessions[largest]!;
+    const cut = cuts[largest]!;
+    const coverDepth = Math.max(0, ...(session.partial?.cover ?? []).map(globDepth));
+    if (session.files.length > 0) cut.exact = session.files.length >> 1;
+    else if (!cut.dropClaims && coverDepth > 0) cut.depth = coverDepth - 1;
+    else if (!cut.dropClaims && !(session.claims.length === 1 && session.claims[0] === COVER_ALL)) cut.dropClaims = true;
+    else {
+      done.add(largest);
+      continue;
+    }
+    sessions[largest] = withShape(session, shape(parts[largest]!.sources, cut));
+    const size = sessionBytes(sessions[largest]!);
+    total += size - sizes[largest]!;
+    sizes[largest] = size;
+  }
 }
 
 function normalizeOwner(value: unknown): Owner | null {
@@ -206,6 +507,7 @@ export function normalizeDoc(value: unknown): Doc | null {
     const actor = cleanId(raw.actor);
     const updatedAt = cleanIso(raw.updatedAt);
     if (!actor || !updatedAt) return null;
+    const parts = items(raw.sessions, LIMITS.sessions, normalizeSessionParts);
     const doc: ActorDoc = {
       v: 0,
       kind: "actor",
@@ -213,9 +515,9 @@ export function normalizeDoc(value: unknown): Doc | null {
       user: cleanText(raw.user, LIMITS.name) || "unknown",
       host: cleanText(raw.host, LIMITS.name) || "unknown",
       updatedAt,
-      sessions: items(raw.sessions, LIMITS.sessions, normalizeSession),
+      sessions: parts.map((part) => part.session),
     };
-    return doc;
+    return fitActor(doc, parts);
   }
 
   if (raw.kind === "decisions") {
@@ -289,14 +591,37 @@ export function parseDoc(text: string, ref?: Ref): Doc | null {
 }
 
 /**
+ * A document that does not fit LIMITS.docBytes, so that no reader would take
+ * it. Thrown by serializeDoc before anything is written. Actor documents never
+ * get here: they are cut to fit (see fitActor). A decision log can.
+ */
+export class DocTooLargeError extends Error {
+  kind: Doc["kind"];
+  bytes: number;
+  limit: number;
+  constructor(kind: Doc["kind"], bytes: number) {
+    super(`the ${kind} document would be ${bytes} bytes, more than the ${LIMITS.docBytes} a reader accepts`);
+    this.name = "DocTooLargeError";
+    this.kind = kind;
+    this.bytes = bytes;
+    this.limit = LIMITS.docBytes;
+  }
+}
+
+/**
  * The doc.json text for a document. Normalizes first, so what we publish obeys
- * the same caps we enforce on what we read. Throws when the document is not
- * valid: publishing garbage is a bug on our side.
+ * the same caps we enforce on what we read, and parseDoc(serializeDoc(doc))
+ * always succeeds. Throws DocTooLargeError when the text would be larger than
+ * a reader accepts, and a plain Error when the document is not valid:
+ * publishing garbage is a bug on our side.
  */
 export function serializeDoc(doc: Doc): string {
   const normalized = normalizeDoc(doc);
   if (!normalized) throw new Error(`cannot serialize an invalid ${String((doc as { kind?: unknown }).kind)} document`);
-  return JSON.stringify(normalized, null, 2) + "\n";
+  const text = docText(normalized);
+  const bytes = Buffer.byteLength(text, "utf8");
+  if (bytes > LIMITS.docBytes) throw new DocTooLargeError(normalized.kind, bytes);
+  return text;
 }
 
 const BASE32 = "abcdefghijklmnopqrstuvwxyz234567";

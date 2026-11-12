@@ -460,7 +460,10 @@ describe("local.json across processes", () => {
       third.said(`${third.child.pid}-25\n`).then(() => third.child.kill("SIGKILL")),
     ]);
     for (const result of await Promise.all(dying.map((d) => d.done))) {
-      assert.equal(result.code, null, `a die-holding worker was not killed: ${result.stderr}`);
+      // A process that kills itself: no exit code on POSIX (it ended by a signal); on Windows,
+      // where the "signal" is TerminateProcess, exit code 1 and nothing on stderr.
+      if (process.platform === "win32") assert.ok(result.code === 1 && result.stderr === "", `a die-holding worker was not killed: ${result.code} ${result.stderr}`);
+      else assert.equal(result.code, null, `a die-holding worker was not killed: ${result.stderr}`);
     }
     const finished = await Promise.all(bumpers.map((b) => b.done));
     const killed = await Promise.all(victims.map((v) => v.done));

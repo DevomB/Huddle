@@ -7,7 +7,8 @@ import { cleanText, LIMITS } from "../core/docs.ts";
 import { CliError, EXIT, UsageError } from "../core/io.ts";
 import type { Io } from "../core/io.ts";
 import { renderTasks, shownText } from "../core/render.ts";
-import { currentView, resolveSession } from "../core/session.ts";
+import { envelope, readTeam, refreshOutcome, resolveSession } from "../core/session.ts";
+import type { RefreshOutcome } from "../core/view.ts";
 import { sync } from "../core/sync.ts";
 import { addTask, claimTask, dropTask, finishTask } from "../core/tasks.ts";
 import type { SyncFailure, TaskResult, Who } from "../core/tasks.ts";
@@ -167,17 +168,14 @@ async function list(args: string[], io: Io): Promise<number> {
   if (positionals.length > 0) throw new UsageError(`unexpected argument "${positionals[0]}"\nUsage: ${USAGE}`);
   const ctx = await openContext(io);
 
-  // Refreshed like `huddle status`: throttled, and a failure just means cached data.
-  let warning = "";
-  if (!values.cached) {
-    const result = await sync(ctx);
-    if (result.error === "offline") warning = `could not reach remote "${ctx.config.remote}"; showing the last known state`;
-    else if (result.error === "denied") warning = `remote "${ctx.config.remote}" refused a push to refs/huddle/*; run "huddle doctor"`;
-  }
+  // Refreshed like `huddle status`: throttled, and a failure just means cached data, which the warnings say.
+  let refresh: RefreshOutcome = "none";
+  if (!values.cached) refresh = refreshOutcome(await sync(ctx));
   const me = await resolveSession(ctx);
-  const view = await currentView(ctx, me.id);
-  io.out(values.json ? JSON.stringify({ fetchedAt: view.fetchedAt, tasks: view.tasks }, null, 2) : renderTasks(view));
-  if (warning) io.err(`huddle: ${warning}`);
+  const team = await readTeam(ctx, me.id, refresh);
+  const view = team.view;
+  io.out(values.json ? JSON.stringify({ fetchedAt: view.fetchedAt, tasks: view.tasks, ...envelope(team) }, null, 2) : renderTasks(view));
+  for (const warning of team.warnings) io.err(`huddle: ${warning}`);
   return EXIT.OK;
 }
 

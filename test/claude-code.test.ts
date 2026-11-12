@@ -590,17 +590,16 @@ function assertStandingNotes(notes: readonly string[]): void {
 }
 
 /**
- * What doctor adds to the three in a repository without huddle's Cursor hooks:
- * Cursor runs these hooks, they stand down for it, and so a Cursor session
- * here is seen by nobody. Not one of init's notes: a default init installs
- * Cursor's hooks a moment later.
+ * What doctor adds to the three: Cursor runs these hooks, they stand down for
+ * it, and this version of huddle has no hooks for Cursor, so a Cursor session
+ * here is seen by nobody. Not one of init's notes.
  */
 function assertCheckNotes(notes: readonly string[]): void {
   assert.equal(notes.length, 4, notes.join("\n"));
   assertStandingNotes(notes.slice(0, 3));
   assert.equal(
     notes[3],
-    "Cursor runs these hooks too, unless that is switched off in Cursor, and huddle's Claude Code hooks stand down when it does: a Cursor session belongs to Cursor's own hooks, which are not installed in this repository. Someone working in Cursor here stays invisible to the team until huddle init --agent cursor has been run and committed.",
+    "Cursor runs these hooks too, unless that is switched off in Cursor, and huddle's Claude Code hooks stand down when it does: this version of huddle does not support Cursor. Someone working in Cursor here stays invisible to the team.",
   );
 }
 
@@ -1141,7 +1140,7 @@ test("check: settings with no huddle hooks, or that cannot be read, are not inst
   }
 });
 
-test("check: the note about Cursor is there until huddle's Cursor hooks are, and init does not give it", async (t) => {
+test("check: says that a Cursor session here is invisible, whatever is in .cursor, and init does not say it", async (t) => {
   const around = { env: {}, home: await emptyHome(t) };
   const { root } = await scratchRepo(t);
   const result = await claudeCode.install({ repoRoot: root, bundle: BUNDLE });
@@ -1149,18 +1148,31 @@ test("check: the note about Cursor is there until huddle's Cursor hooks are, and
   assertStandingNotes(result.notes);
   assertCheckNotes((await checkClaudeCode(root, around)).notes);
 
-  // A Cursor hooks file of the user's own changes nothing: huddle's hooks are not in it.
+  // No hooks file of Cursor's changes that: this version of huddle has no hooks for Cursor, and "cursor" is not an agent it knows.
+  assert.equal(getAdapter("cursor"), undefined);
   await mkdir(join(root, ".cursor"));
-  await writeFile(join(root, ".cursor", "hooks.json"), JSON.stringify({ version: 1, hooks: { stop: [{ command: "./notify.sh" }, { command: "node .huddle/huddle.mjs hook codex" }] } }));
+  await writeFile(join(root, ".cursor", "hooks.json"), JSON.stringify({ version: 1, hooks: { stop: [{ command: "./notify.sh" }, { command: "node .huddle/huddle.mjs hook cursor" }] } }));
   assertCheckNotes((await checkClaudeCode(root, around)).notes);
   await writeFile(join(root, ".cursor", "hooks.json"), "{ not json");
   assertCheckNotes((await checkClaudeCode(root, around)).notes);
-
-  // With them installed there is nothing left to say.
-  await rm(join(root, ".cursor", "hooks.json"));
-  await getAdapter("cursor")?.install({ repoRoot: root, bundle: BUNDLE });
-  assertStandingNotes((await checkClaudeCode(root, around)).notes);
   assertStandingNotes((await claudeCode.install({ repoRoot: root, bundle: BUNDLE })).notes);
+});
+
+test("a payload of Cursor's is not Claude Code's: the adapter stands down for it, and a Cursor session is not recorded as a Claude Code one", () => {
+  const asClaude = (stdin: string): HookEvent | null => claudeCode.parse({ args: [], stdin, env: {}, cwd: PROJECT });
+  let handled = 0;
+  for (const file of readdirSync(FIXTURES).filter((name) => name.endsWith(".json"))) {
+    const text = readFileSync(join(FIXTURES, file), "utf8");
+    const payload = JSON.parse(text) as Json;
+    if (asClaude(text) !== null) handled++;
+    // Cursor puts its version on every payload. Whatever stands there: the page shows a text, and a number or a list would be Cursor's just the same.
+    for (const version of ["1.7.2", 17, 1.7, true, false, 0, ["1.7.2"], { major: 1 }]) {
+      assert.equal(asClaude(JSON.stringify({ ...payload, cursor_version: version })), null, `${file} ${JSON.stringify(version)}`);
+    }
+    // Only a version that is there counts: Claude Code's own payloads are untouched.
+    for (const absent of ["", null]) assert.deepEqual(asClaude(JSON.stringify({ ...payload, cursor_version: absent })), asClaude(text), `${file} ${JSON.stringify(absent)}`);
+  }
+  assert.ok(handled > 10, "the Claude Code fixtures themselves are still handled");
 });
 
 test("check: a doubled or shell-form handler is reported as not what this version installs", async (t) => {

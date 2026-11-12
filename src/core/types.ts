@@ -25,7 +25,7 @@ export interface ActorDoc {
 export interface Session {
   /** Agent session id from the hook payload; HUDDLE_SESSION or a per-worktree id for manual use. */
   id: string;
-  /** "claude-code" | "codex" | "gemini-cli" | "cursor" | "opencode" | "manual" | ... */
+  /** "claude-code" | "codex" | "git" | "manual", or whatever name another version of huddle published. */
   agent: string;
   branch: string;
   /** Max 200 chars. */
