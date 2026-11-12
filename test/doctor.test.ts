@@ -1,7 +1,7 @@
 // T2.3: huddle doctor.
 
 import assert from "node:assert/strict";
-import { chmod, cp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 import { redactUrl } from "../src/commands/doctor.ts";
@@ -78,6 +78,42 @@ test("a healthy repo passes, and says what it checked", async (t) => {
   assert.match(r.stdout, /prompt capture is on: the first 200 characters of each prompt are shared/);
   assert.match(r.stdout, /\nhuddle can work here\.\n$/);
   assert.doesNotMatch(r.stdout, /FAIL/);
+});
+
+test("hooks that are installed and cannot work are a warning that says what to do; hooks nobody installed are not", { skip: process.platform === "win32" ? "file modes" : false }, async (t) => {
+  const { alice } = await setUp(t);
+  const gitHooks = async () => find((await doctorJson(alice)).report, "hooks: git hooks");
+  assert.equal((await gitHooks()).level, "ok", "a default init installs the git hooks");
+
+  // One of them loses its executable bit. git skips it from now on and says nothing; doctor does.
+  const hook = join(alice.dir, ".git", "hooks", "pre-commit");
+  await chmod(hook, 0o644);
+  const { code, report } = await doctorJson(alice);
+  const broken = find(report, "hooks: git hooks");
+  assert.equal(broken.level, "warn");
+  assert.match(broken.detail, /^git ignores the pre-commit hook in \.git\/hooks: not executable\. Run chmod \+x on it\.$/);
+  assert.deepEqual({ code, ok: report.ok, failed: report.failed }, { code: 0, ok: true, failed: 0 }, "a warning: the rest of huddle still works");
+  assert.ok(report.warnings >= 1);
+  const text = await alice.huddle(["doctor"]);
+  assert.match(text.stdout, /warn {2}hooks: git hooks: git ignores the pre-commit hook/);
+
+  // Fixed the way the message says.
+  await chmod(hook, 0o755);
+  assert.equal((await gitHooks()).level, "ok");
+
+  // A hook huddle's lines were taken out of by hand is damage too: the other hooks still run, this one does nothing.
+  const original = await readFile(hook, "utf8");
+  await writeFile(hook, "#!/bin/sh\n");
+  const partly = await gitHooks();
+  assert.equal(partly.level, "warn");
+  assert.match(partly.detail, /^huddle git hooks in \.git\/hooks are missing for pre-commit\. Run huddle init\.$/);
+  await writeFile(hook, original);
+
+  // No huddle hook at all is not damage: nobody set them up in this clone (they are per clone, not committed).
+  for (const name of ["pre-commit", "post-commit", "post-checkout", "post-merge", "post-rewrite"]) await rm(join(alice.dir, ".git", "hooks", name), { force: true });
+  const none = await gitHooks();
+  assert.equal(none.level, "info");
+  assert.match(none.detail, /^no huddle git hooks in \.git\/hooks\. Run huddle init\.$/);
 });
 
 test("the push test leaves no trace when this clone has nothing to announce", async (t) => {
