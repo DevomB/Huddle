@@ -1,7 +1,7 @@
 // T2.3: huddle doctor.
 
 import assert from "node:assert/strict";
-import { chmod, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 import { redactUrl } from "../src/commands/doctor.ts";
@@ -60,6 +60,8 @@ test("a healthy repo passes, and says what it checked", async (t) => {
   assert.match(r.stdout, /ok {4}remote: remote "origin" \(.+\) answered in \d+\.\d s; 0 huddle refs on it/);
   assert.match(r.stdout, /ok {4}push: can create and replace refs under refs\/huddle\/ on this remote/);
   assert.match(r.stdout, /ok {4}AGENTS\.md: /);
+  assert.match(r.stdout, /ok {4}base branch: origin\/HEAD \(origin\/main\)/);
+  assert.doesNotMatch(r.stdout, /clock:|actor id:/, "checks that only appear when something is wrong");
   assert.match(r.stdout, /info {2}identity: this clone is actor [a-z2-7]{8} \(alice on \S+\) with 0 live sessions/);
   assert.match(r.stdout, /info {2}last sync: never synced/);
   assert.match(r.stdout, /prompt capture is on: the first 200 characters of each prompt are shared/);
@@ -188,6 +190,81 @@ test("a repo that never ran init gets warnings, not failures", async (t) => {
   assert.match(r.stdout, /warn {2}bundle: \.huddle\/huddle\.mjs is missing/);
   assert.match(r.stdout, /run "huddle init"/);
   assert.match(r.stdout, /huddle can work here; 1 thing to look at\./);
+});
+
+test("no base branch to compare with is a warning that says what is lost and how to fix it", async (t) => {
+  const { alice } = await setUp(t);
+  await alice.git("remote", "set-head", "origin", "--delete");
+  await alice.git("update-ref", "-d", "refs/remotes/origin/main");
+  const { code, report } = await doctorJson(alice);
+  assert.equal(code, 0, "a warning, not a failure");
+  const base = find(report, "base branch");
+  assert.equal(base.level, "warn");
+  assert.equal(base.detail, "no base branch found: no origin/HEAD, origin/main or origin/master");
+  assert.match(base.notes.join("\n"), /committed files are then shared only until their branch is pushed/);
+  assert.match(base.notes.join("\n"), /set "base" in \.huddle\/config\.json/);
+});
+
+test("a configured base that does not exist is pointed out, with what is used instead", async (t) => {
+  const { alice } = await setUp(t);
+  const file = join(alice.dir, ".huddle", "config.json");
+  await writeFile(file, JSON.stringify({ ...(JSON.parse(await readFile(file, "utf8")) as object), base: "develop" }, null, 2));
+  let base = find((await doctorJson(alice)).report, "base branch");
+  assert.equal(base.level, "warn");
+  assert.equal(base.detail, '"base" is "develop", but there is no such branch here or on origin; using origin/HEAD (origin/main)');
+
+  // Once the branch exists on the remote and is fetched, the check is content.
+  await alice.git("push", "--quiet", "origin", "main:refs/heads/develop");
+  await alice.git("fetch", "--quiet");
+  base = find((await doctorJson(alice)).report, "base branch");
+  assert.deepEqual({ level: base.level, detail: base.detail }, { level: "ok", detail: "origin/develop" });
+});
+
+test("a settings file with a merge conflict is reported, and prompt capture is off until it is fixed", async (t) => {
+  const { alice } = await setUp(t);
+  const file = join(alice.dir, ".huddle", "config.json");
+  const good = await readFile(file, "utf8");
+  await writeFile(file, `<<<<<<< HEAD\n${good}=======\n{ "captureIntent": true }\n>>>>>>> theirs\n`);
+  const { code, report } = await doctorJson(alice);
+  assert.equal(code, 0);
+  const config = find(report, "config");
+  assert.equal(config.level, "warn");
+  assert.deepEqual(config.notes, [
+    ".huddle/config.json is not valid JSON (it has merge conflict markers)",
+    "the team's settings are ignored and prompt capture is off until .huddle/config.json is fixed",
+    "prompt capture is off: agents announce what they are doing with huddle intent",
+  ]);
+});
+
+test("HUDDLE_NOW left set in the environment is a warning", async (t) => {
+  const { alice } = await setUp(t);
+  const r = await alice.huddle(["doctor", "--offline"], { now: "2026-01-01T00:00:00Z" });
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  assert.match(r.stdout, /warn {2}clock: HUDDLE_NOW is set: huddle believes it is 2026-01-01T00:00:00\.000Z/);
+  assert.match(r.stdout, /HUDDLE_NOW is for tests; unset it/);
+});
+
+test("a copy of the repository publishing under the same actor id is reported while it is recent", async (t) => {
+  const { h, alice } = await setUp(t);
+  assert.equal((await alice.huddle(["intent", "the original"])).code, 0);
+  assert.equal((await alice.huddle(["sync"])).code, 0);
+  await cp(alice.dir, join(h.root, "copy"), { recursive: true });
+  assert.equal((await alice.huddle(["intent", "the copy"], { cwd: "../copy" })).code, 0);
+  assert.equal((await alice.huddle(["sync"], { cwd: "../copy" })).code, 0);
+  assert.equal((await alice.huddle(["sync"])).code, 0);
+
+  const paths = await alice.paths();
+  const shared = find((await doctorJson(alice, ["--offline"])).report, "actor id");
+  assert.equal(shared.level, "warn");
+  assert.match(shared.detail, /^another clone is publishing under this clone's actor id [a-z2-7]{8} \(seen \d+s ago\)$/);
+  assert.ok(shared.notes.join("\n").includes(`delete ${paths.actorFile} in the copy`));
+
+  // The same line from two days ago is history, not a problem to fix today.
+  const old = new Date(Date.now() - 2 * 86_400_000).toISOString();
+  await mkdir(paths.stateDir, { recursive: true });
+  await writeFile(paths.logFile, `${old} 123 [sync] another clone is publishing as this one: refs/huddle/actors/abcd2345 holds session x\n`);
+  const { report } = await doctorJson(alice, ["--offline"]);
+  assert.equal(report.checks.some((c) => c.name === "actor id"), false);
 });
 
 test("a vendored bundle that is not committed, or is not a bundle, is reported", async (t) => {
