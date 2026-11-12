@@ -173,7 +173,7 @@ How it was run: huddle built from this repository, Claude Code 2.1.322, model So
 | Claude Code | Hooks in `.claude/settings.json`, exec form (`node` and arguments, no shell) | Briefing at session start, what changed at each prompt, a warning at an edit of a file someone else has in flight. With capture on, its intent is taken from your prompt. | **Live** on Linux: real Claude Code 2.1.322 sessions (see [A recorded run](#a-recorded-run)); the test payloads were recorded from it. **Windows: replay only.** CI runs the committed hook command with recorded payloads rewritten to Windows paths; no live Claude Code session has run on Windows. |
 | Codex | Hooks in `.codex/hooks.json`: a sh command line, and a `commandWindows` line for cmd.exe | The same. | **Fixtures only.** Written from Codex's documentation and source, tested against payloads written by hand to its schemas. Not run against a live Codex session on any platform, and its Windows command line has not run under Codex. |
 | Any agent that reads `AGENTS.md` | A block in `AGENTS.md` | Instructions to run `huddle status`, `huddle intent` and `huddle check` itself. | Works as well as the agent follows instructions. |
-| People, and any tool that commits | Git hooks, only with `init --agent git` | A commit, checkout or merge shows the clone as alive with its files in flight. A commit that touches a teammate's file prints the warning, and goes ahead. | Tested on Linux and, under Git for Windows' sh, on Windows. |
+| People, and any tool that commits | Git hooks, only with `init --agent git` | A commit, checkout or merge shows the clone as alive with its files in flight. A commit that touches a teammate's file prints the warning, and goes ahead. | Linux: the git hook tests. Windows: only the demo's commit, where Git for Windows' sh runs huddle's pre-commit lines after an existing hook, prints the overlap warning and lets the commit through; the git hook tests are skipped there. |
 
 No other agent is supported in this version.
 
@@ -241,6 +241,8 @@ Known and not fixed. Read these before you depend on it.
 - It is not real time. Two active agents see each other's changes within about 15 to 30 seconds; a plain `git commit` can take up to 15 seconds to reach teammates. On GitHub each exchange with the remote takes about a second. Two agents can still start the same thing inside that window; an explicit task claim closes it.
 - Liveness goes by each machine's clock. A clock several minutes off misreports who is live; a clock 15 minutes fast can take over any task.
 - Teammates may treat a session as gone between 12 and 15 minutes after it was last active, not exactly 15.
+- Hooks have deadlines: 150 ms before an edit, 300 ms at a prompt, 4 seconds at session start. On a slow or busy machine (a busy Windows machine, a slow disk, a scanner that reads every file first) a hook can run out of time before it has done its work. It then says nothing and writes a line to the debug log, `.git/huddle/log`, which `git huddle doctor` points at. `HUDDLE_HOOK_PATIENCE`, a number from 1 to 20 in the environment of whatever starts the agent, makes every deadline that many times longer. It gives no extra time for the remote.
+- A commit waits at most 1 second for a sync, so the first commit after a long pause may be checked against the older team state.
 
 **Sessions and claims**
 - A claim and a task both end with the session that holds them. A one-shot session (`claude -p`) releases everything when it exits.
