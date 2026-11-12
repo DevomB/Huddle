@@ -15,7 +15,7 @@ import type { RepoPaths } from "./paths.ts";
 import { toActorDoc } from "./session.ts";
 import { readCache, readLocal, removeSeen, updateLocal, withLock, writeCache } from "./store.ts";
 import { actorRef } from "./types.ts";
-import type { ActorDoc, Config, FailReason, LocalState, PublishResult } from "./types.ts";
+import type { ActorDoc, Config, Doc, FailReason, LocalState, PublishResult } from "./types.ts";
 
 export interface SyncOptions {
   /** Ignore syncIntervalSeconds, and wait for a sync that is already running instead of skipping. */
@@ -54,6 +54,24 @@ function throttledAt(stamp: string | null, config: Config, now: Date): boolean {
 function readStamp(paths: RepoPaths): string | null {
   try {
     return readFileSync(stampFile(paths), "utf8");
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The content hash of the last ActorDoc this clone tried to push. A push can
+ * reach the remote without being recorded in local.json (the process is killed
+ * in between, or the connection drops after the server took the ref); this is
+ * how the next round still recognizes that doc as its own.
+ */
+function attemptFile(paths: RepoPaths): string {
+  return join(paths.stateDir, "publish-attempt");
+}
+
+function readAttempt(paths: RepoPaths): string | null {
+  try {
+    return readFileSync(attemptFile(paths), "utf8").trim() || null;
   } catch {
     return null;
   }
@@ -99,14 +117,30 @@ async function round(ctx: Ctx): Promise<SyncResult> {
   const hash = contentHash(doc);
   const known = new Map(Object.entries(cache.refs).map(([ref, entry]) => [ref, entry.sha]));
 
+  const lastAttempt = readAttempt(paths);
+  const publish = async (): Promise<PublishResult> => {
+    await writeFile(attemptFile(paths), hash);
+    return transport.publish(ownRef, doc, "own");
+  };
+
   const publishDue = shouldPublish(state.published, doc, hash, now, config);
-  const [fetched, firstPublish] = await Promise.all([
-    transport.fetchAll(known),
-    publishDue ? transport.publish(ownRef, doc, "own") : Promise.resolve(null),
-  ]);
+  const [fetched, firstPublish] = await Promise.all([transport.fetchAll(known), publishDue ? publish() : Promise.resolve(null)]);
 
   let cacheChanged = false;
   if (fetched.ok) {
+    const theirs = fetched.changed.get(ownRef);
+    const ours = [state.published?.sha, firstPublish?.ok ? firstPublish.sha : undefined];
+    if (theirs && !ours.includes(theirs.sha)) {
+      const strangers = foreignSessions(theirs.doc, state, [state.published?.hash, lastAttempt, hash], now, config);
+      if (strangers.length > 0) {
+        log(
+          paths,
+          "sync",
+          `another clone is publishing as this one: ${ownRef} holds session ${strangers.slice(0, 3).join(", ")}, which is not a session of this clone. ` +
+            `This happens when a repository is copied together with its .git directory. Delete ${paths.actorFile} in the copy.`,
+        );
+      }
+    }
     for (const [ref, entry] of fetched.changed) cache.refs[ref] = { sha: entry.sha, doc: entry.doc };
     for (const ref of fetched.removed) delete cache.refs[ref];
     cache.fetchedAt = now.toISOString();
@@ -119,7 +153,7 @@ async function round(ctx: Ctx): Promise<SyncResult> {
   // there (deleted, or overwritten by someone else), put it back.
   let published: PublishResult | null = firstPublish;
   if (!published && fetched.ok && state.published && doc.sessions.length > 0 && cache.refs[ownRef]?.sha !== state.published.sha) {
-    published = await transport.publish(ownRef, doc, "own");
+    published = await publish();
   }
 
   if (published?.ok) {
@@ -140,6 +174,30 @@ async function round(ctx: Ctx): Promise<SyncResult> {
   const failure = !fetched.ok ? fetched.reason : published && !published.ok ? published.reason : undefined;
   if (failure) result.error = failure;
   return result;
+}
+
+/**
+ * Evidence that another clone writes this clone's ref: the live sessions in
+ * `remote`, the doc found there, that this clone does not have. Empty when the
+ * doc is one this clone pushed (`ownHashes`: recorded, attempted, or being
+ * pushed right now) or when every live session in it is known here.
+ *
+ * Both conditions are needed. A doc of ours can hold a session we no longer
+ * have (it ended since); and a doc that is not ours with only sessions we know
+ * is no proof of a second writer.
+ */
+export function foreignSessions(
+  remote: Doc | null,
+  state: LocalState,
+  ownHashes: readonly (string | null | undefined)[],
+  now: Date,
+  config: Config,
+): string[] {
+  if (!remote || remote.kind !== "actor") return [];
+  if (ownHashes.includes(contentHash(remote))) return [];
+  const ttlMs = config.ttlMinutes * 60_000;
+  const known = new Set(state.sessions.map((session) => session.id));
+  return remote.sessions.filter((session) => !known.has(session.id) && ageMs(session.seenAt, now) < ttlMs).map((session) => session.id);
 }
 
 /** Step 2: drops sessions past the TTL and recomputes branch and files for the rest. Returns the new local state. */

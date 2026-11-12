@@ -3,14 +3,15 @@
 
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { openContext } from "../src/core/context.ts";
 import type { Io } from "../src/core/io.ts";
-import { contentHash, shouldPublish, spawnBackgroundSync, syncWithin } from "../src/core/sync.ts";
+import { withLock } from "../src/core/store.ts";
+import { contentHash, foreignSessions, shouldPublish, spawnBackgroundSync, syncWithin } from "../src/core/sync.ts";
 import { DEFAULT_CONFIG } from "../src/core/types.ts";
-import type { ActorDoc, LocalState, Session } from "../src/core/types.ts";
+import type { ActorDoc, Cache, LocalState, Session } from "../src/core/types.ts";
 import { BUNDLE, createHarness } from "./harness.ts";
 import type { Clone, Harness } from "./harness.ts";
 
@@ -172,9 +173,13 @@ test("when the remote is unreachable, sync says so and exits 1; status still sho
 
   await bob.git("remote", "set-url", "origin", join(h.root, "gone.git"));
   const before = await bob.snapshot();
+  const cacheFile = (await bob.paths()).cacheFile;
+  assert.equal((JSON.parse(await readFile(cacheFile, "utf8")) as Cache).fetchedAt, at(2));
   const sync = await bob.huddle(["sync"], { now: at(60) });
   assert.equal(sync.code, 1);
+  assert.equal(sync.stdout, "", "a sync that failed does not say it synced");
   assert.match(sync.stderr, /could not reach remote "origin"/);
+  assert.equal((JSON.parse(await readFile(cacheFile, "utf8")) as Cache).fetchedAt, at(2), "a failed fetch does not make the cache look fresh");
 
   const status = await bob.huddle(["status"], { now: at(120) });
   assert.equal(status.code, 0, status.stderr);
@@ -187,6 +192,151 @@ test("when the remote is unreachable, sync says so and exits 1; status still sho
   assert.deepEqual(await bob.snapshot(), before);
   const log = await readFile((await bob.paths()).logFile, "utf8");
   assert.match(log, /offline/, "the failure is in the debug log");
+});
+
+/** Makes the remote refuse every push to refs/huddle/*, the way a server-side hook or a ref rule does. */
+async function refuseHuddleRefs(h: Harness): Promise<void> {
+  const hook = join(h.remote, "hooks", "update");
+  await mkdir(dirname(hook), { recursive: true });
+  await writeFile(hook, '#!/bin/sh\ncase "$1" in refs/huddle/*) echo "huddle refs are not accepted here" >&2; exit 1 ;; esac\nexit 0\n', { mode: 0o755 });
+}
+
+test("when the remote refuses huddle refs, sync says so and exits 1, still reads the team, and tries again next time", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  const bob = await h.clone("bob");
+  await ok(alice, ["intent", "build auth"], at(0));
+  await ok(alice, ["sync"], at(1));
+  await refuseHuddleRefs(h);
+
+  await ok(bob, ["intent", "billing"], at(2));
+  const sync = await bob.huddle(["sync"], { now: at(3) });
+  assert.equal(sync.code, 1, sync.stdout + sync.stderr);
+  assert.equal(sync.stdout, "", "a sync that could not publish does not say it synced");
+  assert.match(sync.stderr, /remote "origin" refused a push to refs\/huddle/);
+  assert.equal((await actorDocs(h)).length, 1, "only alice's doc is on the remote");
+
+  const paths = await bob.paths();
+  const local = JSON.parse(await readFile(paths.localFile, "utf8")) as LocalState;
+  assert.equal(local.published, null, "nothing is recorded as published");
+  // The fetch half of the round worked: the team is readable, and the cache says when it was read.
+  assert.equal((JSON.parse(await readFile(paths.cacheFile, "utf8")) as Cache).fetchedAt, at(3));
+  assert.match((await ok(bob, ["status", "--cached"], at(4))).stdout, /build auth/);
+
+  const background = await bob.huddle(["sync", "--background", "--force"], { now: at(5) });
+  assert.deepEqual({ code: background.code, stdout: background.stdout, stderr: background.stderr }, { code: 0, stdout: "", stderr: "" });
+  assert.match(await readFile(paths.logFile, "utf8"), /publish failed: denied/, "the failure is in the debug log");
+
+  // Once the remote accepts the refs again, the next sync publishes without anything having changed locally.
+  await rm(join(h.remote, "hooks", "update"));
+  assert.match((await ok(bob, ["sync"], at(6))).stdout, /published this clone's sessions/);
+  assert.equal((await actorDocs(h)).length, 2);
+});
+
+test("a sync that is not forced skips at once when another sync holds the lock", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  await ok(alice, ["intent", "waiting"], at(0));
+  const paths = await alice.paths();
+
+  let elapsed = -1;
+  let ran: Awaited<ReturnType<Clone["huddle"]>> | undefined;
+  const held = await withLock(paths, "sync", async () => {
+    const started = Date.now();
+    ran = await alice.huddle(["sync", "--background"], { now: at(1), timeoutMs: 12_000 });
+    elapsed = Date.now() - started;
+  });
+  assert.ok(held.acquired, "the test could not take the sync lock");
+  assert.equal(ran?.code, 0, `the skipped sync was killed or failed: ${ran?.stderr}`);
+  assert.ok(elapsed < 8_000, `a throttled-path sync waited ${elapsed} ms for the lock; only a forced one may wait`);
+  assert.equal(await remoteRefs(h), "", "the skipped sync published nothing");
+
+  // The lock is free again: the same command now runs the round.
+  await ok(alice, ["sync", "--background"], at(2));
+  assert.equal((await actorDocs(h)).length, 1);
+});
+
+test("claims made and released at the same moment in one session are all kept", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  const globs = ["src/a/**", "src/b/**", "src/c/**", "src/d/**", "docs/*.md", "test/**"];
+  const listed = async () => (await ok(alice, ["claim"], at(50))).stdout.trim().split("\n").sort();
+
+  for (let round = 0; round < 3; round++) {
+    // Six processes at once, as an agent does with parallel tool calls.
+    const claimed = await Promise.all(globs.map((glob) => alice.huddle(["claim", glob], { now: at(round * 10) })));
+    for (const r of claimed) assert.equal(r.code, 0, r.stderr);
+    assert.deepEqual(await listed(), [...globs].sort(), `round ${round}: a claim was lost`);
+
+    const kept = globs.slice(0, 2);
+    const released = await Promise.all(globs.slice(2).map((glob) => alice.huddle(["release", glob], { now: at(round * 10 + 1) })));
+    for (const r of released) assert.equal(r.code, 0, r.stderr);
+    assert.deepEqual(await listed(), [...kept].sort(), `round ${round}: a release was lost`);
+
+    await ok(alice, ["release"], at(round * 10 + 2));
+  }
+  const local = JSON.parse(await readFile((await alice.paths()).localFile, "utf8")) as LocalState;
+  assert.equal(local.sessions.length, 1, "all of it happened in one session");
+});
+
+test("a claim over the limit is refused whole and leaves the stored claims alone", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  await ok(alice, ["claim", "keep/**"], at(0));
+  const many = Array.from({ length: 200 }, (_, i) => `gen/${i}/**`);
+  const refused = await alice.huddle(["claim", ...many], { now: at(1) });
+  assert.equal(refused.code, 2, refused.stderr);
+  assert.match(refused.stderr, /at most \d+ claims/);
+  assert.equal((await ok(alice, ["claim"], at(2))).stdout, "keep/**\n");
+});
+
+test("a copied clone publishing under the same actor id is noticed and logged", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  await ok(alice, ["intent", "the original"], at(0));
+  await ok(alice, ["sync"], at(1));
+  const paths = await alice.paths();
+  const logText = () => readFile(paths.logFile, "utf8").catch(() => "");
+  assert.doesNotMatch(await logText(), /another clone/);
+
+  // cp -r of the working directory takes .git/huddle/actor along.
+  await cp(alice.dir, join(h.root, "copy"), { recursive: true });
+  const inCopy = { cwd: "../copy" };
+  const copied = await alice.huddle(["intent", "the copy"], { now: at(2), ...inCopy });
+  assert.equal(copied.code, 0, copied.stderr);
+  const copySync = await alice.huddle(["sync"], { now: at(3), ...inCopy });
+  assert.equal(copySync.code, 0, copySync.stderr);
+  assert.equal((await actorDocs(h)).length, 1, "the test needs both clones on one ref");
+
+  await ok(alice, ["sync"], at(4));
+  const log = await logText();
+  assert.match(log, /another clone is publishing as this one: refs\/huddle\/actors\/[a-z2-7]+ holds session manual-[0-9a-f]{8}/);
+  assert.ok(log.includes(paths.actorFile), "the log line names the file to delete");
+});
+
+test("this clone's own doc is not mistaken for another clone's when a push was never recorded", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  await ok(alice, ["intent", "about to be interrupted"], at(0), { HUDDLE_SESSION: "s1" });
+  await ok(alice, ["sync"], at(1), { HUDDLE_SESSION: "s1" });
+  const paths = await alice.paths();
+  const logText = () => readFile(paths.logFile, "utf8").catch(() => "");
+  // A sync killed between the push and recording it, and then the session ended:
+  // the remote holds a doc with a session this clone no longer has.
+  const interrupted = async () => {
+    await writeFile(paths.localFile, JSON.stringify({ v: 0, sessions: [], published: null }));
+    await rm(paths.cacheFile, { force: true });
+  };
+
+  await interrupted();
+  await ok(alice, ["sync", "--background", "--force"], at(2));
+  assert.doesNotMatch(await logText(), /another clone/);
+
+  // The same state without the record of the attempt is what a second writer looks like.
+  await interrupted();
+  await rm(join(paths.stateDir, "publish-attempt"));
+  await ok(alice, ["sync", "--background", "--force"], at(3));
+  assert.match(await logText(), /another clone is publishing as this one: \S+ holds session s1,/);
 });
 
 test("claims: a claimed glob is an overlap for teammates until it is released", async (t) => {
@@ -493,6 +643,22 @@ test("shouldPublish: changes always, heartbeats only after activity, silence whe
 // ---------------------------------------------------------------------------
 // Concurrency and the background path. These use the real clock.
 // ---------------------------------------------------------------------------
+
+test("foreignSessions: only a doc this clone did not push, holding a live session it does not have, is evidence", () => {
+  const config = { ...DEFAULT_CONFIG };
+  const now = new Date(at(60));
+  const state: LocalState = { v: 0, sessions: [{ ...session({ id: "mine" }), worktree: "/w" }], published: null };
+  const remote = doc([session({ id: "mine", seenAt: at(50) }), session({ id: "theirs", seenAt: at(50) }), session({ id: "other", seenAt: at(55) })]);
+
+  assert.deepEqual(foreignSessions(remote, state, [], now, config), ["theirs", "other"]);
+  assert.deepEqual(foreignSessions(remote, state, [null, undefined, "something else"], now, config), ["theirs", "other"]);
+  assert.deepEqual(foreignSessions(remote, state, ["x", contentHash(remote)], now, config), [], "a doc this clone pushed");
+  assert.deepEqual(foreignSessions(doc([session({ id: "mine" })]), state, [], now, config), [], "every session in it is known here");
+  const longAgo = new Date(T0 + (config.ttlMinutes + 5) * MIN * 1000);
+  assert.deepEqual(foreignSessions(remote, state, [], longAgo, config), [], "sessions past the TTL prove nothing");
+  assert.deepEqual(foreignSessions(null, state, [], now, config), [], "an unreadable doc");
+  assert.deepEqual(foreignSessions({ v: 0, kind: "decisions", actor: "abcd2345", user: "a", host: "h", updatedAt: at(0), decisions: [] } as never, state, [], now, config), []);
+});
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 

@@ -41,7 +41,8 @@ export async function resolveBase(worktree: string, config: Config): Promise<str
 /**
  * Repo-relative paths, at most 200: dirty files (staged, unstaged, deleted,
  * untracked and not ignored) first, then files changed in commits since the
- * merge-base with the base branch. Each group is sorted, so the list is stable
+ * merge-base with the base branch (without a base: in commits not pushed to
+ * the remote, see unpushedFiles). Each group is sorted, so the list is stable
  * between calls. On any git failure the affected group is simply missing.
  */
 export async function filesInFlight(worktree: string, config: Config): Promise<string[]> {
@@ -79,11 +80,37 @@ async function dirtyFiles(worktree: string): Promise<string[]> {
 
 async function committedFiles(worktree: string, config: Config): Promise<string[]> {
   const base = await resolveBase(worktree, config);
-  if (!base) return [];
-  const mergeBase = await git(["merge-base", "HEAD", base], { cwd: worktree });
-  const from = mergeBase.stdout.trim();
-  if (!mergeBase.ok || !from) return [];
-  const result = await git(["diff", "--name-only", "-z", "--no-renames", from, "HEAD"], { cwd: worktree });
+  if (base) {
+    const mergeBase = await git(["merge-base", "HEAD", base], { cwd: worktree });
+    const from = mergeBase.stdout.trim();
+    if (mergeBase.ok && from) {
+      const result = await git(["diff", "--name-only", "-z", "--no-renames", from, "HEAD"], { cwd: worktree });
+      return result.ok ? result.stdout.split("\0").filter(Boolean) : [];
+    }
+  }
+  return unpushedFiles(worktree, config);
+}
+
+/** Commits looked at when there is no base to compare with. */
+const UNPUSHED_COMMITS = 500;
+
+/**
+ * For a worktree with no base to compare with: the trunk is not called main
+ * or master and <remote>/HEAD is not set, `base` names a branch that does not
+ * exist, or a shallow clone has no merge-base. Rather than report nothing, it
+ * reports the files of the commits that are on no branch of the remote yet,
+ * which is the work a teammate has no other way to see. Once the branch is
+ * pushed these files leave the list; `huddle doctor` says so and how to set
+ * `base`.
+ */
+async function unpushedFiles(worktree: string, config: Config): Promise<string[]> {
+  // With nothing fetched from the remote, every commit in the history would count as unpushed.
+  const tracking = await git(["for-each-ref", "--count=1", "--format=%(refname)", `refs/remotes/${config.remote}/`], { cwd: worktree });
+  if (!tracking.ok || tracking.stdout.trim() === "") return [];
+  const result = await git(
+    ["log", "--format=", "--name-only", "-z", "--no-renames", `--max-count=${UNPUSHED_COMMITS}`, "HEAD", "--not", `--remotes=${config.remote}`],
+    { cwd: worktree },
+  );
   if (!result.ok) return [];
   return result.stdout.split("\0").filter(Boolean);
 }
