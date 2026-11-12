@@ -7,7 +7,8 @@
 //   session-start   one sync, waited for; then the full briefing              4 s
 //   prompt          record the intent, brief on what changed, background sync 300 ms
 //   pre-edit        warn when a target path overlaps a teammate's work        150 ms
-//   post-edit       background sync                                           150 ms
+//   post-edit       background sync; the same warning if it was not given yet 150 ms
+//                   with event.brief also what changed, as at a prompt        300 ms
 //   turn-end        background sync, not throttled                            150 ms
 //   session-end     remove the session, background sync, not throttled        1 s
 //
@@ -76,7 +77,7 @@ import { ensureStateDir, loadConfig, locateRepo } from "../core/paths.ts";
 import type { RepoPaths } from "../core/paths.ts";
 import { DEFAULT_BRIEFING_CHARS, formatAge, renderBriefing, renderOverlaps } from "../core/render.ts";
 import { currentView, resolveSession } from "../core/session.ts";
-import { readCache, readSeen, removeSeen, removeSession, updateLocal, writeFileAtomic, writeSeen } from "../core/store.ts";
+import { readCache, readLocal, readSeen, removeSeen, removeSession, updateLocal, writeFileAtomic, writeSeen } from "../core/store.ts";
 import { spawnBackgroundSync, syncWithin } from "../core/sync.ts";
 import { createTransport } from "../core/transport.ts";
 import type { Config, Identity, LocalSession, LocalState, Seen } from "../core/types.ts";
@@ -130,6 +131,12 @@ const MAX_WARNING_PATHS = 5;
 const MAX_WARNING_CHARS = DEFAULT_BRIEFING_CHARS;
 /** How many paths a session's warnings are remembered for. */
 const MAX_WARNED_PATHS = 100;
+/**
+ * A warning and an update that come in one context share MAX_WARNING_CHARS.
+ * With less room than this left for it, the update waits for the next event:
+ * below it a briefing is down to counts, and then to nothing.
+ */
+const MIN_UPDATE_CHARS = 500;
 
 // Keys in Seen.items that are the engine's own. renderBriefing uses "s:", "d:" and "tasks".
 const BRIEFED = "briefed";
@@ -162,6 +169,8 @@ function deadlineFor(event: HookEvent | null | undefined): number {
   const type: unknown = event?.type;
   if (typeof type !== "string" || !Object.hasOwn(DEADLINE_MS, type)) return DEADLINE_MS["pre-edit"];
   if (type === "pre-edit" && event?.ambient === true) return PATIENT_PRE_EDIT_MS;
+  // It does a prompt's work, and for its agent it is the only event that brings news: a prompt's time.
+  if (type === "post-edit" && event?.brief === true) return DEADLINE_MS.prompt;
   return DEADLINE_MS[type as HookEventType];
 }
 
@@ -495,6 +504,23 @@ function sameItems(before_: Seen | null, after: Seen): boolean {
   return keys.length === Object.keys(before_.items).length && keys.every((key) => before_.items[key] === after.items[key]);
 }
 
+/**
+ * The update that is due to a session whose memory is `since`: what changed
+ * since its last briefing ("" when nothing did). Without a briefing to compare
+ * with (hooks installed mid-session, a session-start that failed, an agent
+ * that reports none) it is the full one, which says so when the team state
+ * behind it is old.
+ *
+ * At a prompt that is a briefing of full size, with the note on top. Given
+ * `room`, the whole text keeps to it.
+ */
+function dueUpdate(view: TeamView, since: Seen | null, room?: number): { text: string; seen: Seen } {
+  const baseline = since !== null && Object.hasOwn(since.items, BRIEFED) ? since : null;
+  const note = baseline === null ? staleNote(view) : "";
+  const briefing = renderBriefing(view, room === undefined ? { since: baseline } : { since: baseline, maxChars: room - (note === "" ? 0 : note.length + 1) });
+  return { text: lines(briefing.text, note), seen: briefing.seen };
+}
+
 async function sessionStart(run: Run): Promise<Prepared> {
   const { id, paths, io, deadline } = run;
   // Set whatever happens below: `huddle intent` typed by the agent should land in this session.
@@ -535,12 +561,9 @@ async function prompt(run: Run): Promise<Prepared> {
   if (identity === null) return { outcome: {} };
 
   const view = await currentView(contextFor(run, identity), id, touched?.state, viewerOf(run, touched));
-  // Without a briefing to compare with (hooks installed mid-session, or a session-start that failed) this is the full one.
-  const baseline = since !== null && Object.hasOwn(since.items, BRIEFED) ? since : null;
-  const briefing = renderBriefing(view, { since: baseline });
-  const text = baseline === null ? lines(briefing.text, staleNote(view)) : briefing.text;
-  const next = withMemory(briefing.seen, since);
-  const prepared: Prepared = { outcome: text === "" ? {} : { context: text } };
+  const update = dueUpdate(view, since);
+  const next = withMemory(update.seen, since);
+  const prepared: Prepared = { outcome: update.text === "" ? {} : { context: update.text } };
   if (!sameItems(since, next)) prepared.commit = () => writeSeen(paths, id, next);
   return prepared;
 }
@@ -611,7 +634,8 @@ function capWarned(items: Record<string, string>): Record<string, string> {
 }
 
 /**
- * The warning for the paths about to be edited, from the cache: no network.
+ * The warning for the paths of an edit, one that is about to be made or one
+ * that was just made, from the cache: no network.
  *
  * A path is warned about when a session overlaps it that this session has not
  * been told about for that path yet. So ten edits of one contested file give
@@ -623,12 +647,22 @@ function capWarned(items: Record<string, string>): Record<string, string> {
  * A subagent is always warned and nothing is remembered for it: its context is
  * not the session's, and it does not last. The same goes for an event that
  * names no session: whoever runs `git commit` has no context here at all.
+ *
+ * With `brief`, the update that is due (dueUpdate) follows the warning in the
+ * same text, and one write remembers both. The two share MAX_WARNING_CHARS,
+ * the warning first. An update that would be left less than MIN_UPDATE_CHARS
+ * is not given and not remembered, so it comes with the next event.
+ *
+ * Nothing here waits for touch(): what there is to say is ready even when the
+ * session cannot be recorded.
  */
-async function overlapWarning(run: Run, targets: string[]): Promise<Prepared> {
+async function overlapWarning(run: Run, targets: string[], brief = false): Promise<Prepared> {
   const { id, paths, now } = run;
   const remember = !run.passive;
-  const [identity, since] = await Promise.all([getIdentityFast(run.home), remember ? readSeen(paths, id) : null]);
-  const view = await currentView(contextFor(run, identity), id, undefined, paths.worktree);
+  const [identity, since, local] = await Promise.all([getIdentityFast(run.home), remember ? readSeen(paths, id) : null, readLocal(paths)]);
+  // Whose files are the viewer's own: as in viewerOf(), an agent that is away is still where its session is.
+  const mine = run.away ? local.sessions.find((session) => session.id === id) : undefined;
+  const view = await currentView(contextFor(run, identity), id, local, mine?.worktree ?? paths.worktree);
 
   const items: Record<string, string> = { ...(since?.items ?? {}) };
   /** The paths with something to say, each with what is remembered once it has been said. */
@@ -663,6 +697,17 @@ async function overlapWarning(run: Run, targets: string[]): Promise<Prepared> {
       changed = true;
     }
   }
+
+  const room = MAX_WARNING_CHARS - (text === "" ? 0 : text.length + 1);
+  if (brief && remember && room >= MIN_UPDATE_CHARS) {
+    const update = dueUpdate(view, since, room);
+    const next = withMemory(update.seen, { at: update.seen.at, items: capWarned(items) });
+    const both = lines(text, update.text);
+    const prepared: Prepared = { outcome: both === "" ? {} : { context: both } };
+    if (!sameItems(since, next)) prepared.commit = () => writeSeen(paths, id, next);
+    return prepared;
+  }
+
   const prepared: Prepared = { outcome: text === "" ? {} : { context: text } };
   if (remember && changed) {
     prepared.commit = () => writeSeen(paths, id, { at: since?.at ?? now.toISOString(), items: capWarned(items) });
@@ -716,8 +761,27 @@ async function refreshFirst(run: Run): Promise<boolean> {
   }
 }
 
+/**
+ * What there is to say about `targets`, and with `brief` about the team,
+ * while `recorded` (the session, and the sync that follows from it) runs
+ * alongside: the check does not need it, and the budget is short. A check
+ * that fails costs what it would have said and nothing else.
+ */
+async function checked(run: Run, targets: string[], recorded: Promise<void>, brief = false): Promise<Prepared> {
+  let prepared: Prepared = { outcome: {} };
+  if (targets.length > 0 || brief) {
+    try {
+      prepared = await overlapWarning(run, targets, brief);
+    } catch (error) {
+      log(run.paths, "hook", `${run.event.type}: could not check for overlap${brief ? " or brief the session" : ""}`, error);
+    }
+  }
+  await recorded;
+  return prepared;
+}
+
 async function preEdit(run: Run): Promise<Prepared> {
-  const { event, paths, io } = run;
+  const { event, io } = run;
   const targets = targetPaths(run);
   // A commit may wait for the team state; an agent's edit never does.
   const patient = event.ambient === true && targets.length > 0;
@@ -726,21 +790,34 @@ async function preEdit(run: Run): Promise<Prepared> {
     if (patient && (await refreshFirst(run))) return;
     if (isNews(touched)) effects.spawnBackgroundSync(run.home, io.self, { force: true });
   });
-  // Otherwise the session is recorded alongside the check, not before it: the check does not need it, and the budget is short.
+  // A commit's check comes after its wait. An agent's runs alongside.
   if (patient) await recorded;
-  let prepared: Prepared = { outcome: {} };
-  if (targets.length > 0) {
-    try {
-      prepared = await overlapWarning(run, targets);
-    } catch (error) {
-      log(paths, "hook", "pre-edit: could not check for overlap", error);
-    }
-  }
-  await recorded;
-  return prepared;
+  return checked(run, targets, recorded);
 }
 
-/** post-edit, and every event of a subagent except pre-edit: the session is alive, and a sync may be due. */
+/**
+ * post-edit: the session is alive, a sync may be due, and the paths the event
+ * names are checked the way a pre-edit checks them, with the same memory.
+ * After a pre-edit of the same paths that leaves nothing to say. It is there
+ * for the agents whose hooks cannot speak to the model before an edit (Gemini
+ * CLI, Cursor): for them the warning comes right after the edit, in the event
+ * that also starts the edit's sync. And it makes up for a pre-edit that ran
+ * out of time.
+ *
+ * With event.brief the session is briefed here as well. That is for the
+ * agents whose prompt hook cannot speak to the model either (Cursor): for
+ * them an event after a tool call is where all of the team's news arrives.
+ */
+async function postEdit(run: Run): Promise<Prepared> {
+  return checked(
+    run,
+    targetPaths(run),
+    touch(run).then((touched) => syncAfter(run, touched)),
+    run.event.brief === true,
+  );
+}
+
+/** Every event of a subagent, and every event that names no session, except pre-edit: the session is alive, and a sync may be due. */
 async function heartbeat(run: Run): Promise<Prepared> {
   syncAfter(run, await touch(run));
   return { outcome: {} };
@@ -822,7 +899,7 @@ async function prepare(event: HookEvent, io: Io, deadline: Deadline, trace: Trac
     case "pre-edit":
       return preEdit(run);
     case "post-edit":
-      return heartbeat(run);
+      return postEdit(run);
     case "turn-end":
       return turnEnd(run);
     case "session-end":
