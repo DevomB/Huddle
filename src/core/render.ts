@@ -534,7 +534,12 @@ export function freshnessWarnings(report: FreshnessReport, completeness: Complet
   if (report.freshness === "never") warnings.push(`no team state yet: this clone has never synced with remote ${name}. Run "huddle sync"`);
   else if (report.freshness === "unreadable") warnings.push(`this clone's team state (cache.json) could not be read. Run "huddle sync" to rebuild it`);
   else if (report.freshness === "stale" && (report.refresh === "none" || report.refresh === "ok")) {
-    warnings.push(`the team state is${age}, older than ${report.staleAfterSeconds}s. Run "huddle sync" for a current picture`);
+    // Stale and younger than the limit: the last fetch is stamped ahead of this clock (classifyFreshness), so its age is unknown.
+    if (report.ageSeconds !== null && report.ageSeconds < report.staleAfterSeconds) {
+      warnings.push(`the team state is stamped later than this machine's clock, so how old it is cannot be told. Run "huddle sync" for a current picture`);
+    } else {
+      warnings.push(`the team state is${age}, older than ${report.staleAfterSeconds}s. Run "huddle sync" for a current picture`);
+    }
   }
   if (completeness.unreadableActors > 0) {
     const n = completeness.unreadableActors;

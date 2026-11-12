@@ -11,6 +11,7 @@ import { after, before, describe, test } from "node:test";
 import { openContext } from "../src/core/context.ts";
 import { actorRef } from "../src/core/types.ts";
 import type { ActorDoc } from "../src/core/types.ts";
+import { freshnessWarnings } from "../src/core/render.ts";
 import { classifyFreshness, staleAfterSeconds } from "../src/core/view.ts";
 import { BUNDLE, createHarness } from "./harness.ts";
 import type { Clone, Harness, RunResult } from "./harness.ts";
@@ -254,5 +255,15 @@ describe("classifyFreshness (pure)", () => {
     assert.equal(classifyFreshness({ ...base, fetchedAt: at(0), refresh: "ok" }).freshness, "fresh");
     assert.equal(classifyFreshness({ ...base, fetchedAt: at(3600), refresh: "none" }).freshness, "stale", "a fetch stamped an hour ahead says nothing");
     assert.equal(classifyFreshness({ ...base, fetchedAt: at(-90) }).ageSeconds, 90);
+  });
+
+  test("the warning for a fetch stamped ahead of this clock does not call it recent", () => {
+    const complete = { complete: true, unreadableActors: 0, uncovered: 0 };
+    const ahead = freshnessWarnings(classifyFreshness({ ...base, fetchedAt: at(3600) }), complete, "origin");
+    assert.equal(ahead.length, 1, ahead.join("\n"));
+    assert.doesNotMatch(ahead[0]!, /just now|older than/);
+    assert.match(ahead[0]!, /later than this machine's clock.*huddle sync/);
+    const old = freshnessWarnings(classifyFreshness({ ...base, fetchedAt: at(-90) }), complete, "origin");
+    assert.match(old[0] ?? "", /older than 60s/);
   });
 });
