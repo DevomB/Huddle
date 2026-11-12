@@ -1,0 +1,24 @@
+{
+  "conversation_id": "7c1d5a0e-93b4-4f6a-a2c8-51e0d9b7f3a6",
+  "generation_id": "e4b20f77-1a3c-4d89-9f05-6b8c2d14a7e9",
+  "model": "claude-opus-4-7-thinking-max",
+  "model_id": "claude-opus-4-7",
+  "model_params": [
+    {
+      "id": "thinking",
+      "value": "true"
+    }
+  ],
+  "hook_event_name": "sessionEnd",
+  "cursor_version": "1.7.2",
+  "workspace_roots": [
+    "/home/dev/acme"
+  ],
+  "user_email": null,
+  "transcript_path": null,
+  "session_id": "7c1d5a0e-93b4-4f6a-a2c8-51e0d9b7f3a6",
+  "reason": "user_close",
+  "duration_ms": 45000,
+  "is_background_agent": false,
+  "final_status": "completed"
+}
