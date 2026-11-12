@@ -259,7 +259,8 @@ test("a git that does not stop on SIGTERM is killed STOP_GRACE_MS after it", pos
     ],
   );
   const waited = (sent[1]?.at ?? 0) - (sent[0]?.at ?? 0);
-  assert.ok(waited >= STOP_GRACE_MS - 1, `SIGKILL came ${Math.round(waited)} ms after SIGTERM`);
+  // A timer may fire a millisecond or two early by performance.now() (CI saw 1999 ms for 2000).
+  assert.ok(waited >= STOP_GRACE_MS - 10, `SIGKILL came ${Math.round(waited)} ms after SIGTERM`);
 });
 
 test("a git that stops on SIGTERM gets the time to, and no SIGKILL: not before it is done, and not after it is gone", posixOnly("signals to a process group (process.kill(-pid)), which Windows does not have"), async (t) => {
