@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { checkGeminiCli, detectGeminiCli, geminiCli, systemSettingsFiles, withoutComments } from "../src/adapters/gemini-cli.ts";
 import type { Surroundings } from "../src/adapters/gemini-cli.ts";
 import { getAdapter } from "../src/adapters/index.ts";
+import type { Installed } from "../src/adapters/json-hooks.ts";
 import { SILENT } from "../src/adapters/types.ts";
 import type { HookEvent, HookEventType, HookInput } from "../src/adapters/types.ts";
 import { CliError } from "../src/core/io.ts";
@@ -700,8 +701,11 @@ function countOurs(settings: Json): Record<string, number> {
 
 test("install: an empty repo gets .gemini/settings.json with one handler per event", async (t) => {
   const { root, file } = await scratchRepo(t);
-  const result = await geminiCli.install({ repoRoot: root, bundle: BUNDLE });
+  // `files` joins the adapter contract with T2.3; until then it is json-hooks' own type that has it.
+  const result: Installed = await geminiCli.install({ repoRoot: root, bundle: BUNDLE });
   assert.deepEqual(result.changed, [".gemini/settings.json"]);
+  // The file the team commits: named on every run, so that init can keep saying it is not committed yet.
+  assert.deepEqual(result.files, [".gemini/settings.json"]);
   assert.equal(result.notes.length, 2);
   assert.match(result.notes[0] ?? "", /starts gemini at the top of the repository/);
   assert.match(result.notes[0] ?? "", /trusts the folder when asked/);
@@ -772,7 +776,11 @@ test("install: installing twice adds nothing", async (t) => {
   await geminiCli.install({ repoRoot: root, bundle: BUNDLE });
   const first = await readFile(file);
   const before = await stat(file);
-  for (let run = 0; run < 3; run++) assert.deepEqual((await geminiCli.install({ repoRoot: root, bundle: BUNDLE })).changed, []);
+  for (let run = 0; run < 3; run++) {
+    const again: Installed = await geminiCli.install({ repoRoot: root, bundle: BUNDLE });
+    assert.deepEqual(again.changed, []);
+    assert.deepEqual(again.files, [".gemini/settings.json"], "still named, changed or not");
+  }
   assert.ok((await readFile(file)).equals(first), "byte for byte the same");
   const after = await stat(file);
   // Gemini CLI trusts a project's hook by its name and command: a rewrite that
@@ -1142,10 +1150,13 @@ test("install and check: a settings file with a byte order mark in front keeps i
   assert.equal(off[0], MARK_NOTE);
   assert.match(off[1] ?? "", /turned off/);
 
-  // Without the mark nothing is said about one.
-  await writeFile(file, written.slice(1));
-  assert.equal((await checkGeminiCli(root, around)).notes.includes(MARK_NOTE), false);
-  assert.equal((await geminiCli.install({ repoRoot: root, bundle: BUNDLE })).notes.includes(MARK_NOTE), false);
+  // Without the mark nothing is said about one. One further in, inside a string, is none.
+  for (const unmarked of [written.slice(1), JSON.stringify({ ...installed(), ui: { title: `${MARK}acme` } })]) {
+    await writeFile(file, unmarked);
+    assert.equal((await checkGeminiCli(root, around)).installed, true);
+    assert.equal((await checkGeminiCli(root, around)).notes.includes(MARK_NOTE), false);
+    assert.equal((await geminiCli.install({ repoRoot: root, bundle: BUNDLE })).notes.includes(MARK_NOTE), false);
+  }
   // Nor when the file is not there, or cannot be read at all.
   await rm(file);
   assert.deepEqual((await checkGeminiCli(root, around)).notes, []);
@@ -1360,6 +1371,8 @@ test("check: reports what install left, and what is still missing", async (t) =>
   assert.match(ok.notes[1] ?? "", /the user is shown an overlap with a teammate before the edit/);
   assert.match(ok.notes[1] ?? "", /the agent hears of it right after the edit, not before it/);
   assert.deepEqual(ok.notes, (await geminiCli.install({ repoRoot: root, bundle: BUNDLE })).notes, "init and doctor say the same");
+  // What doctor checks for being committed. Not named while the hooks are not installed.
+  assert.deepEqual(ok.files, [".gemini/settings.json"]);
   assert.equal((await getAdapter("gemini-cli")?.check(root))?.installed, true);
 
   const settings = await readJson(file);
