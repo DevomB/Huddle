@@ -327,15 +327,14 @@ interface Touched {
  * logged, and the caller carries on without it.
  */
 async function touch(run: Run, intent = ""): Promise<Touched | null> {
-  const { event, id, paths, now } = run;
+  const { event, id, paths, now, passive } = run;
   const at = now.toISOString();
   const agent = cleanText(event.agent, LIMITS.name) || "unknown";
-  const { passive } = run;
   let created = false;
   let moved = false;
   let intentChanged = false;
   try {
-    const state = await updateLocal(
+    const updating = updateLocal(
       paths,
       (local) => {
         let session = local.sessions.find((candidate) => candidate.id === id);
@@ -354,8 +353,7 @@ async function touch(run: Run, intent = ""): Promise<Touched | null> {
             moved = true;
           }
         }
-        // A one-word prompt ("yes", "continue") says nothing about the work: it does not replace an intent that does.
-        if (intent !== "" && intent !== session.intent && !(session.intent !== "" && isBareWord(intent))) {
+        if (intent !== "" && intent !== session.intent && replacesIntent(session, intent)) {
           session.intent = intent;
           session.intentSource = "prompt";
           intentChanged = true;
@@ -363,12 +361,38 @@ async function touch(run: Run, intent = ""): Promise<Touched | null> {
       },
       { waitMs: storeWait(run.deadline) },
     );
-    const session = state.sessions.find((candidate) => candidate.id === id);
-    return session === undefined ? null : { state, session, created, moved, intentChanged };
+    // The lock gives up by itself, but only between two tries, so it can run
+    // over by one step of its backoff. This timer cannot, and whatever was
+    // found out alongside (a warning that is ready) still has to be printed.
+    const updated = await before({ left: () => run.deadline.left() - STORE_MARGIN_MS }, updating);
+    if (!updated.done) {
+      log(paths, "hook", `${event.type}: could not record the session: the store was still busy close to the deadline`);
+      return null;
+    }
+    const session = updated.value.sessions.find((candidate) => candidate.id === id);
+    return session === undefined ? null : { state: updated.value, session, created, moved, intentChanged };
   } catch (error) {
     log(paths, "hook", `${event.type}: could not record the session`, error);
     return null;
   }
+}
+
+/**
+ * Does the intent taken from a prompt replace the one the session has? Not in
+ * two cases.
+ *
+ * An intent stated with `huddle intent` stays until it is stated again or
+ * cleared (`huddle intent --clear`). Someone put it into words on purpose; the
+ * start of the next prompt is a guess, and often a worse one ("looks good, now
+ * the tests"). The price: it goes stale when the session moves on to other
+ * work and nobody says so.
+ *
+ * And a one-word prompt ("yes", "continue") says nothing about the work, so it
+ * does not replace an intent that does.
+ */
+function replacesIntent(session: LocalSession, intent: string): boolean {
+  if (session.intent === "") return true;
+  return session.intentSource !== "manual" && !isBareWord(intent);
 }
 
 /**
@@ -505,12 +529,32 @@ function clip(text: string, max: number): string {
   return `${text.slice(0, end)}\n${CUT_NOTE}`;
 }
 
-function warningText(blocks: string[]): string {
-  if (blocks.length === 0) return "";
-  const shown = blocks.slice(0, MAX_WARNING_PATHS);
-  const more = blocks.length - shown.length;
-  if (more > 0) shown.push(`[huddle] ${more} more of the paths in this edit overlap teammates' work as well: run \`huddle check\`.`);
-  return clip(shown.join("\n"), MAX_WARNING_CHARS);
+function moreNote(count: number): string {
+  return `[huddle] ${count} more of the paths in this edit overlap teammates' work as well: run \`huddle check\`.`;
+}
+
+/**
+ * One text from the warnings of an edit, one block per path, that is never
+ * longer than MAX_WARNING_CHARS. `shown` is how many of the blocks are in it,
+ * from the first: at most MAX_WARNING_PATHS, and fewer when they do not fit.
+ * The rest are counted in a last line. The first block is always in, cut
+ * short if it has to be.
+ */
+function composeWarning(blocks: string[]): { text: string; shown: number } {
+  const first = blocks[0];
+  if (first === undefined) return { text: "", shown: 0 };
+  /** Room for the line that counts the blocks left out, when `rest` of them are. */
+  const roomFor = (rest: number): number => MAX_WARNING_CHARS - (rest > 0 ? moreNote(rest).length + 1 : 0);
+  let text = clip(first, roomFor(blocks.length - 1));
+  let shown = 1;
+  while (shown < Math.min(blocks.length, MAX_WARNING_PATHS)) {
+    const longer = `${text}\n${blocks[shown] ?? ""}`;
+    if (longer.length > roomFor(blocks.length - shown - 1)) break;
+    text = longer;
+    shown++;
+  }
+  const rest = blocks.length - shown;
+  return { text: rest > 0 ? `${text}\n${moreNote(rest)}` : text, shown };
 }
 
 /** Drops the oldest remembered warnings once there are more than MAX_WARNED_PATHS. Edits `items`. */
@@ -526,10 +570,13 @@ function capWarned(items: Record<string, string>): Record<string, string> {
  * A path is warned about when a session overlaps it that this session has not
  * been told about for that path yet. So ten edits of one contested file give
  * one warning, a second teammate arriving on the file gives another, and a
- * session-start (a new or compacted context) starts over. A subagent is
- * always warned and nothing is remembered for it: its context is not the
- * session's, and it does not last. The same goes for an event that names no
- * session: whoever runs `git commit` has no context here at all.
+ * session-start (a new or compacted context) starts over. Told means spelled
+ * out: a path that was only counted, because the edit named more overlapping
+ * paths than one warning holds, is warned about again at the next edit.
+ *
+ * A subagent is always warned and nothing is remembered for it: its context is
+ * not the session's, and it does not last. The same goes for an event that
+ * names no session: whoever runs `git commit` has no context here at all.
  */
 async function overlapWarning(run: Run, targets: string[]): Promise<Prepared> {
   const { id, paths, now } = run;
@@ -538,7 +585,8 @@ async function overlapWarning(run: Run, targets: string[]): Promise<Prepared> {
   const view = await currentView(contextFor(run, config, identity), id, undefined, paths.worktree);
 
   const items: Record<string, string> = { ...(since?.items ?? {}) };
-  const blocks: string[] = [];
+  /** The paths with something to say, each with what is remembered once it has been said. */
+  const news: Array<{ key: string; value: string; block: string }> = [];
   let changed = false;
   for (const path of targets) {
     const key = WARNED + path;
@@ -551,16 +599,24 @@ async function overlapWarning(run: Run, targets: string[]): Promise<Prepared> {
       continue;
     }
     const who = found.map((overlap) => shortHash(`${overlap.session.actor}/${overlap.session.id}`)).sort();
-    const told = new Set((Object.hasOwn(items, key) ? (items[key] ?? "") : "").split(","));
-    if (!remember || who.some((one) => !told.has(one))) blocks.push(renderOverlaps(path, found, now));
     const value = who.join(",");
-    if (remember && items[key] !== value) {
+    const told = new Set((Object.hasOwn(items, key) ? (items[key] ?? "") : "").split(","));
+    if (!remember || who.some((one) => !told.has(one))) {
+      news.push({ key, value, block: renderOverlaps(path, found, now) });
+    } else if (items[key] !== value) {
+      // Nobody new, but somebody left: forgotten, so that their return is news again.
       items[key] = value;
       changed = true;
     }
   }
 
-  const text = warningText(blocks);
+  const { text, shown } = composeWarning(news.map((one) => one.block));
+  if (remember) {
+    for (const { key, value } of news.slice(0, shown)) {
+      items[key] = value;
+      changed = true;
+    }
+  }
   const prepared: Prepared = { outcome: text === "" ? {} : { context: text } };
   if (remember && changed) {
     prepared.commit = () => writeSeen(paths, id, { at: since?.at ?? now.toISOString(), items: capWarned(items) });
