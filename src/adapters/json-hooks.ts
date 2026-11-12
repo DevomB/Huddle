@@ -307,7 +307,7 @@ export async function checkHooks(file: HookFile, repoRoot: string): Promise<{ re
   for (const bundle of new Set(standings.map((item) => item.bundle ?? ""))) {
     if (!(await exists(join(repoRoot, bundle)))) return no(`hooks in ${file.path} run ${bundle}, which is not in this checkout. Run huddle init.`, settings);
   }
-  return { result: { installed: true, detail: `${file.registrations.length} hooks in ${file.path}`, notes: [] }, settings };
+  return { result: { installed: true, detail: `${file.registrations.length} hooks in ${file.path}`, notes: [], files: [file.path] }, settings };
 }
 
 /** Is a program with one of these file names in a directory on PATH? Looks, does not run anything. */

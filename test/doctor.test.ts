@@ -1,7 +1,7 @@
 // T2.3: huddle doctor.
 
 import assert from "node:assert/strict";
-import { chmod, cp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 import { redactUrl } from "../src/commands/doctor.ts";
@@ -114,6 +114,79 @@ test("hooks that are installed and cannot work are a warning that says what to d
   const none = await gitHooks();
   assert.equal(none.level, "info");
   assert.match(none.detail, /^no huddle git hooks in \.git\/hooks\. Run huddle init\.$/);
+});
+
+test("hooks that work here and are not committed are a warning: teammates would not get them", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  // .claude is ignored, as it often is for the sake of settings.local.json.
+  await alice.write(".gitignore", ".claude/\n");
+  await commitAll(h, alice, "ignore rules");
+  assert.equal((await alice.huddle(["init", "--agent", "claude-code", "--agent", "codex"])).code, 0);
+  const hooksOf = async (title: string) => find((await doctorJson(alice, ["--offline"])).report, `hooks: ${title}`);
+
+  // Nothing committed yet: both sets of hooks work in this clone and in no other.
+  const fresh = await hooksOf("Codex");
+  assert.equal(fresh.level, "warn");
+  assert.equal(fresh.notes[0], ".codex/hooks.json is not committed as it is now, so teammates do not get it with a pull: git add .codex/hooks.json && git commit");
+
+  // The user commits everything git shows them. The ignored file is not among it, and git never says so.
+  await commitAll(h, alice, "Set up huddle");
+  assert.equal(await alice.git("status", "--porcelain"), "");
+  assert.equal((await hooksOf("Codex")).level, "ok");
+  const hidden = await hooksOf("Claude Code");
+  assert.equal(hidden.level, "warn");
+  assert.match(hidden.detail, /hooks in \.claude\/settings\.json$/, "the hooks themselves are in order");
+  assert.equal(
+    hidden.notes[0],
+    ".claude/settings.json is hidden from git by an ignore rule (.gitignore:1: .claude/) and is not committed, so teammates do not get it with a pull: change the rule, or git add -f .claude/settings.json && git commit",
+  );
+  const text = await alice.huddle(["doctor", "--offline"]);
+  assert.match(text.stdout, /warn {2}hooks: Claude Code: .*\n {10}\.claude\/settings\.json is hidden from git by an ignore rule/);
+  assert.equal(text.code, 0, "a warning: huddle works in this clone");
+
+  // Shared the way the note says.
+  await alice.git("add", "-f", ".claude/settings.json");
+  await alice.git("-c", `core.hooksPath=${join(h.root, "no-hooks")}`, "commit", "--quiet", "-m", "Share the hooks");
+  assert.equal((await hooksOf("Claude Code")).level, "ok");
+
+  // A later change to a committed hook file is the same gap again.
+  await alice.write(".codex/hooks.json", (await alice.read(".codex/hooks.json")) + "\n");
+  assert.equal((await hooksOf("Codex")).level, "warn");
+});
+
+test("hooks the team commits next to its own git hooks are checked the same way; hooks under .git are nobody's to commit", { skip: process.platform === "win32" ? "file modes" : false }, async (t) => {
+  const { h, alice } = await setUp(t);
+  const gitHooks = async () => find((await doctorJson(alice, ["--offline"])).report, "hooks: git hooks");
+  assert.deepEqual({ level: (await gitHooks()).level }, { level: "ok" }, "under .git/hooks: never committed, and no warning for that");
+
+  // The team keeps its hooks in the repository.
+  await alice.git("config", "core.hooksPath", ".githooks");
+  assert.equal((await alice.huddle(["init", "--agent", "git"])).code, 0);
+  const uncommitted = await gitHooks();
+  assert.equal(uncommitted.level, "warn");
+  assert.ok(uncommitted.notes.includes(".githooks/pre-commit is not committed as it is now, so teammates do not get it with a pull: git add .githooks/pre-commit && git commit"), uncommitted.notes.join("\n"));
+  await commitAll(h, alice, "git hooks for the team");
+  assert.equal((await gitHooks()).level, "ok");
+});
+
+test("AGENTS.md that is a link: the file it points at is the one that has to be committed", { skip: process.platform === "win32" ? "symbolic links" : false }, async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  await alice.write("CLAUDE.md", "# Project rules\n");
+  await symlink("CLAUDE.md", join(alice.dir, "AGENTS.md"));
+  await commitAll(h, alice, "rules for agents");
+  assert.equal((await alice.huddle(["init"])).code, 0);
+  // Everything but the file the block went into.
+  await alice.git("add", ".huddle", ".claude", ".codex");
+  await alice.git("-c", `core.hooksPath=${join(h.root, "no-hooks")}`, "commit", "--quiet", "-m", "Set up huddle");
+  const agentsMd = async () => find((await doctorJson(alice, ["--offline"])).report, "AGENTS.md");
+  const open = await agentsMd();
+  assert.equal(open.level, "warn");
+  assert.equal(open.detail, "AGENTS.md has the huddle block");
+  assert.deepEqual(open.notes, ["CLAUDE.md is not committed as it is now, so teammates do not get it with a pull: git add CLAUDE.md && git commit"]);
+  await commitAll(h, alice, "the block");
+  assert.deepEqual({ level: (await agentsMd()).level, notes: (await agentsMd()).notes }, { level: "ok", notes: [] });
 });
 
 test("the push test leaves no trace when this clone has nothing to announce", async (t) => {

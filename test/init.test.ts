@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 import { AGENTS_MD_BEGIN, AGENTS_MD_END, AgentsMdError, agentsMdBlock, checkAgentsMd, installAgentsMd } from "../src/adapters/agents-md.ts";
@@ -527,6 +527,11 @@ test("the files to commit are named one by one, and only huddle's", async (t) =>
   const staged = (await clone.git("add", "--dry-run", ...named)).split("\n").map((line) => /^add '(.+)'$/.exec(line)?.[1]).sort();
   assert.deepEqual(staged, [...named].sort());
 
+  // A second run before the commit changes nothing and still names all of them, the hook file included.
+  const second = await clone.huddle(["init", "--agent", "claude-code"]);
+  assert.match(second.stdout, /already set up here; nothing changed/);
+  assert.deepEqual(/^ {2}git add (.+)$/m.exec(second.stdout)?.[1]?.split(" "), named);
+
   // Once they are committed there is nothing to say, whatever else lies around untracked.
   await clone.git("add", ...named);
   await clone.git("commit", "--quiet", "-m", "Set up huddle");
@@ -564,9 +569,132 @@ test("a team config that cannot be used is pointed out by init", async (t) => {
   await clone.write(".huddle/config.json", '<<<<<<< HEAD\n{ "ttlMinutes": 20 }\n=======\n{ "ttlMinutes": 30 }\n>>>>>>> theirs\n');
   const r = await clone.huddle(["init"]);
   assert.equal(r.code, 0, r.stderr);
-  assert.match(r.stdout, /Note: .*\.huddle\/config\.json.*Until it is fixed huddle runs on defaults, with prompt capture off\./);
+  assert.match(r.stdout, /^Note: \.huddle\/config\.json is not valid JSON \(it has merge conflict markers\)$/m);
+  assert.equal(r.stdout.split("prompt capture is off until .huddle/config.json is fixed").length - 1, 1, "what follows from it is said once");
   assert.doesNotMatch(r.stdout, /first 200 characters of each prompt are shared/, "capture is off while the config is unusable");
   assert.match(await clone.read(".huddle/config.json"), /^<<<<<<< HEAD/, "the file is the user's to fix");
+  // A file init has just called unusable is not one it hands to the team.
+  const add = /^ {2}git add (.+)$/m.exec(r.stdout)?.[1];
+  assert.ok(add, r.stdout);
+  assert.deepEqual(add.split(" ").filter((file) => file.startsWith(".huddle/")), [".huddle/huddle.mjs", ".huddle/.gitattributes"]);
+});
+
+test("a hook file that an ignore rule hides is not dropped from the commit line without a word", async (t) => {
+  const h = await createHarness(t);
+  const clone = await h.clone("alice");
+  // Common: people keep settings.local.json in .claude and ignore the whole directory.
+  await clone.write(".gitignore", "node_modules/\n.claude/\n");
+  await commitAll(h, clone, "ignore rules");
+  const r = await clone.huddle(["init", "--agent", "claude-code"]);
+  assert.equal(r.code, 0, r.stderr);
+  const add = /^ {2}git add (.+)$/m.exec(r.stdout)?.[1];
+  assert.deepEqual(add?.split(" "), [".huddle/huddle.mjs", ".huddle/config.json", ".huddle/.gitattributes", "AGENTS.md"], "git add would refuse an ignored path");
+  assert.ok(
+    r.stdout.includes(
+      "\nHidden from git by an ignore rule, so git add leaves it out and your teammates do not get it with a pull:\n" +
+        "  .claude/settings.json   (.gitignore:2: .claude/)\n" +
+        "To share it, change the rule, or add it by force: git add -f .claude/settings.json, before the commit below\n",
+    ),
+    r.stdout,
+  );
+  assert.ok(r.stdout.indexOf("add it by force") < r.stdout.indexOf("Next: commit"), "said before the commands it has to precede");
+
+  // The user commits only what the commit line names. It is said again, now with the whole way out.
+  await clone.git("add", ...(add ?? "").split(" "));
+  await clone.git("-c", `core.hooksPath=${join(h.root, "no-hooks")}`, "commit", "--quiet", "-m", "Set up huddle");
+  const again = await clone.huddle(["init", "--agent", "claude-code"]);
+  assert.match(again.stdout, /already set up here; nothing changed/);
+  assert.doesNotMatch(again.stdout, /Next: commit/);
+  const force = /add it by force: (git add -f \.claude\/settings\.json) && git commit -m "Set up huddle" && git push\n/.exec(again.stdout)?.[1];
+  assert.ok(force, again.stdout);
+
+  // Following it: the file is staged, the commit line takes over, and after the commit there is nothing left to say.
+  await clone.git(...force.split(" ").slice(1));
+  const staged = await clone.huddle(["init", "--agent", "claude-code"]);
+  assert.doesNotMatch(staged.stdout, /Hidden from git/);
+  assert.equal(/^ {2}git add (.+)$/m.exec(staged.stdout)?.[1], ".claude/settings.json");
+  await clone.git("-c", `core.hooksPath=${join(h.root, "no-hooks")}`, "commit", "--quiet", "-m", "Share the hooks");
+  const done = await clone.huddle(["init", "--agent", "claude-code"]);
+  assert.doesNotMatch(done.stdout, /Hidden from git|Next: commit/);
+  await clone.push();
+  const bob = await h.clone("bob");
+  assert.match(await bob.read(".claude/settings.json"), /huddle\.mjs/, "the teammate has the hooks after a clone");
+});
+
+test("the ignore rule can be anywhere git reads one from, and a rule that takes the file back out is not one", async (t) => {
+  const h = await createHarness(t);
+  const clone = await h.clone("alice");
+  // The user's own excludes file, which no teammate has and which is in no listing of the repository.
+  const excludes = join(h.root, "alice-excludes");
+  await writeFile(excludes, "# mine\n.codex/\n");
+  await clone.git("config", "core.excludesFile", excludes);
+  // Everything in .claude is ignored except the one file the team shares.
+  await clone.write(".gitignore", ".claude/*\n!.claude/settings.json\n");
+  const r = await clone.huddle(["init", "--agent", "claude-code", "--agent", "codex"]);
+  assert.equal(r.code, 0, r.stderr);
+  assert.ok(r.stdout.includes(`  .codex/hooks.json   (${excludes}:2: .codex/)\n`), r.stdout);
+  assert.doesNotMatch(r.stdout, /\.claude\/settings\.json {3}\(/, "not hidden: the second rule takes it back out");
+  const add = (/^ {2}git add (.+)$/m.exec(r.stdout)?.[1] ?? "").split(" ");
+  assert.ok(add.includes(".claude/settings.json"));
+  assert.ok(!add.includes(".codex/hooks.json"));
+
+  // Two hidden files are named together, and one command shares both.
+  await clone.write(".gitignore", ".claude/\n");
+  const both = await clone.huddle(["init", "--agent", "claude-code", "--agent", "codex"]);
+  assert.match(both.stdout, /git add leaves them out and your teammates do not get them with a pull:\n {2}\.claude\/settings\.json {3}\(\.gitignore:1: \.claude\/\)\n {2}\.codex\/hooks\.json {3}\(/);
+  assert.match(both.stdout, /add them by force: git add -f \.claude\/settings\.json \.codex\/hooks\.json, before the commit below\n/);
+});
+
+test("a hook file reached through a linked directory is named where it really is, and does not stop another hidden file from being reported", { skip: process.platform === "win32" ? "symbolic links" : false }, async (t) => {
+  const h = await createHarness(t);
+  const clone = await h.clone("alice");
+  // .claude is a link to a directory the team keeps elsewhere in the repository; .codex is ignored.
+  await clone.write("tools/claude/README.md", "shared agent settings\n");
+  await symlink(join("tools", "claude"), join(clone.dir, ".claude"));
+  await clone.write(".gitignore", ".codex/\n");
+  await commitAll(h, clone, "agent settings");
+  const r = await clone.huddle(["init", "--agent", "claude-code", "--agent", "codex"]);
+  assert.equal(r.code, 0, r.stderr);
+  const add = (/^ {2}git add (.+)$/m.exec(r.stdout)?.[1] ?? "").split(" ");
+  assert.deepEqual(add, [".huddle/huddle.mjs", ".huddle/config.json", ".huddle/.gitattributes", "AGENTS.md", "tools/claude/settings.json"]);
+  // git cannot judge a path beyond a link at all; the file next to it is still looked at.
+  assert.ok(r.stdout.includes("  .codex/hooks.json   (.gitignore:1: .codex/)\n"), r.stdout);
+  await clone.git("add", ...add);
+  await clone.git("-c", `core.hooksPath=${join(h.root, "no-hooks")}`, "commit", "--quiet", "-m", "Set up huddle");
+  assert.equal(await clone.git("status", "--porcelain"), "", "what was printed could be run, and left nothing of huddle's behind");
+});
+
+test("AGENTS.md that is a link to another file in the repository: the file that changed is the one named for the commit",{ skip: process.platform === "win32" ? "symbolic links" : false }, async (t) => {
+  const h = await createHarness(t);
+  const clone = await h.clone("alice");
+  // How many repositories give two agents one file.
+  await clone.write("CLAUDE.md", "# Project rules\n\nUse tabs.\n");
+  await symlink("CLAUDE.md", join(clone.dir, "AGENTS.md"));
+  await commitAll(h, clone, "rules for agents");
+  await clone.push();
+  const r = await clone.huddle(["init", "--agent", "claude-code"]);
+  assert.equal(r.code, 0, r.stderr);
+  assert.ok((await lstat(join(clone.dir, "AGENTS.md"))).isSymbolicLink(), "the link is kept");
+  assert.match(await clone.read("CLAUDE.md"), /^# Project rules\n\nUse tabs\.\n\n<!-- huddle:begin -->/, "the block is in the file both names show");
+  const add = (/^ {2}git add (.+)$/m.exec(r.stdout)?.[1] ?? "").split(" ");
+  assert.deepEqual(add, [".huddle/huddle.mjs", ".huddle/config.json", ".huddle/.gitattributes", "CLAUDE.md", ".claude/settings.json"], "the link itself did not change");
+
+  // Running what was printed leaves nothing of huddle's uncommitted.
+  await clone.git("add", ...add);
+  await clone.git("-c", `core.hooksPath=${join(h.root, "no-hooks")}`, "commit", "--quiet", "-m", "Set up huddle");
+  assert.equal(await clone.git("status", "--porcelain"), "");
+  assert.doesNotMatch((await clone.huddle(["init", "--agent", "claude-code"])).stdout, /Next: commit/);
+
+  // A link that leads out of the repository names nothing that cannot be committed from here.
+  const outside = await h.clone("bob");
+  await writeFile(join(h.root, "shared-rules.md"), "# Shared\n");
+  await rm(join(outside.dir, "AGENTS.md"));
+  await symlink(join(h.root, "shared-rules.md"), join(outside.dir, "AGENTS.md"));
+  const out = await outside.huddle(["init", "--agent", "claude-code"]);
+  assert.equal(out.code, 0, out.stderr);
+  const named = (/^ {2}git add (.+)$/m.exec(out.stdout)?.[1] ?? "").split(" ");
+  assert.ok(named.includes("AGENTS.md"), "the link changed, and it is this repository's");
+  assert.ok(!named.some((file) => file.includes("shared-rules")), "its target is not");
 });
 
 test("an older .gitattributes is brought up to date, and other lines in it are kept", async (t) => {
@@ -580,6 +708,12 @@ test("an older .gitattributes is brought up to date, and other lines in it are k
   await clone.huddle(["init"]);
   assert.equal(await clone.read(".huddle/.gitattributes"), "notes.txt text\nhuddle.mjs -text linguist-vendored\n");
   assert.match((await clone.huddle(["init"])).stdout, /already set up here; nothing changed/);
+
+  // With huddle's line there, a line of the user's own for the same file is left alone, wherever it stands, and nothing is doubled.
+  const withTheirs = "huddle.mjs merge=ours\nhuddle.mjs -text linguist-vendored\nnotes.txt text\n";
+  await clone.write(".huddle/.gitattributes", withTheirs);
+  await clone.huddle(["init"]);
+  assert.equal(await clone.read(".huddle/.gitattributes"), withTheirs);
 });
 
 test("init never overwrites an existing config; flags change only the keys they name", async (t) => {

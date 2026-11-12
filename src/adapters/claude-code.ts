@@ -321,7 +321,7 @@ const NOTES: readonly string[] = [ROOT_NOTE, NODE_NOTE, TRUST_NOTE];
 
 async function install(opts: InstallOptions): Promise<InstallResult> {
   const changed = await installHooks(SETTINGS_FILE, opts.repoRoot, opts.bundle);
-  return { changed: changed ? [SETTINGS] : [], notes: [...NOTES] };
+  return { changed: changed ? [SETTINGS] : [], notes: [...NOTES], files: [SETTINGS] };
 }
 
 // ---------------------------------------------------------------------------

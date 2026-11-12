@@ -246,7 +246,7 @@ const TRUST_NOTE =
 
 async function install(opts: InstallOptions): Promise<InstallResult> {
   const changed = await installHooks(HOOKS_FILE, opts.repoRoot, opts.bundle);
-  return { changed: changed ? [HOOKS] : [], notes: [TRUST_NOTE] };
+  return { changed: changed ? [HOOKS] : [], notes: [TRUST_NOTE], files: [HOOKS] };
 }
 
 // ---------------------------------------------------------------------------

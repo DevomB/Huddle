@@ -580,10 +580,12 @@ export async function checkGitHooks(repoRoot: string, platform: NodeJS.Platform 
   }
   const notes = [place.inWorktree ? committedNote(place) : PER_CLONE_NOTE, ...[...bundles].map(RUNS_CHECKOUT_NOTE), NODE_NOTE];
   const count = `${found} git ${found === 1 ? "hook" : "hooks"} in ${place.shown}`;
-  if (foreign.length === 0) return { installed: true, detail: count, notes };
+  // The hooks that hold huddle's lines, where they are the team's to commit (.husky and the like). Hooks under .git are nobody's.
+  const files = place.inWorktree ? GIT_HOOKS.filter((hook) => !foreign.includes(hook)).map((hook) => shownPath(place.root, join(place.dir, hook))) : [];
+  if (foreign.length === 0) return { installed: true, detail: count, notes, files };
   const one = foreign.length === 1;
   notes.push(`The ${foreign.join(", ")} ${one ? "hook" : "hooks"} in ${place.shown} ${one ? "is not a shell script" : "are not shell scripts"} huddle can add itself to, so ${one ? "it was" : "they were"} left alone.`);
-  return { installed: true, detail: `${count}; ${foreign.join(", ")} left alone`, notes };
+  return { installed: true, detail: `${count}; ${foreign.join(", ")} left alone`, notes, files };
 }
 
 /** Every repository with a working tree has git, whatever agent is or is not in use. */

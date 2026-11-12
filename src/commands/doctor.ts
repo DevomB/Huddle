@@ -16,7 +16,7 @@ import { loadConfigReport } from "../core/paths.ts";
 import { readCache, readLocal } from "../core/store.ts";
 import { actorRef, REF_PATTERN } from "../core/types.ts";
 import type { ActorDoc } from "../core/types.ts";
-import { BUNDLE, bundleVersion } from "./init.ts";
+import { BUNDLE, bundleVersion, unsharedNotes } from "./init.ts";
 
 export const summary = "Check that huddle can work here: remote, push access, hooks, last sync";
 
@@ -269,8 +269,11 @@ async function hooks(ctx: Ctx): Promise<Check[]> {
   for (const adapter of ADAPTERS) {
     try {
       const result = await adapter.check(ctx.paths.worktree);
+      // Hooks that work here and are not committed work for nobody else: "everyone else only pulls" is the promise.
+      const gaps = result.installed && result.files ? await unsharedNotes(ctx.paths.worktree, result.files) : [];
       // Hooks that are there and cannot work are a problem; an agent nobody set up here is not.
-      checks.push(check(`hooks: ${adapter.title}`, result.installed ? "ok" : result.broken ? "warn" : "info", result.detail, result.notes));
+      const level: Level = result.installed ? (gaps.length > 0 ? "warn" : "ok") : result.broken ? "warn" : "info";
+      checks.push(check(`hooks: ${adapter.title}`, level, result.detail, [...gaps, ...result.notes]));
     } catch (error) {
       if (error instanceof NotImplementedError) {
         checks.push(check(`hooks: ${adapter.title}`, "info", "not available in this version of huddle"));
@@ -280,7 +283,9 @@ async function hooks(ctx: Ctx): Promise<Check[]> {
     }
   }
   const agentsMd = await checkAgentsMd(ctx.paths.worktree, { bundle: BUNDLE });
-  checks.push(check("AGENTS.md", agentsMd.installed ? "ok" : "info", agentsMd.detail, agentsMd.notes));
+  // When AGENTS.md is a link, the block is in the file it points at, and that is the file to commit.
+  const gaps = agentsMd.installed ? await unsharedNotes(ctx.paths.worktree, ["AGENTS.md"]) : [];
+  checks.push(check("AGENTS.md", agentsMd.installed ? (gaps.length > 0 ? "warn" : "ok") : "info", agentsMd.detail, [...gaps, ...agentsMd.notes]));
   return checks;
 }
 

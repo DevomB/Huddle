@@ -4,7 +4,8 @@
 // AGENTS.md is the user's file. huddle owns one block in it, between two
 // marker lines, and nothing else:
 // - A marker counts only as a line of its own. The same text inside a sentence
-//   or a code sample is the user's.
+//   is the user's. huddle does not read Markdown: a sample in a code fence that
+//   puts each marker on a line of its own is taken for the block.
 // - The block is an end marker line and the nearest begin marker line before
 //   it. A begin marker with no end after it, or an end marker with no begin
 //   before it, is a leftover of some edit: it is left where it is and never

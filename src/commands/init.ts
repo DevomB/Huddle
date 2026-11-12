@@ -1,7 +1,7 @@
 // T2.3. huddle init: one teammate runs this once; everyone else only pulls.
 
-import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { isAbsolute, relative, resolve } from "node:path";
+import { chmod, mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import { installAgentsMd } from "../adapters/agents-md.ts";
 import { ADAPTERS, getAdapter } from "../adapters/index.ts";
 import type { Adapter } from "../adapters/types.ts";
@@ -119,7 +119,14 @@ async function planBundle(paths: RepoPaths, io: Io, allowDowngrade: boolean): Pr
   return { text: running, line: `${BUNDLE} (huddle ${previous ?? "unknown"} -> ${version})` };
 }
 
-/** .huddle/.gitattributes with the bundle's line in it. Lines for other files are kept. Returns whether the file changed. */
+/**
+ * .huddle/.gitattributes with the bundle's line in it. Returns whether the
+ * file changed. Lines for other files are kept. When huddle's line is there,
+ * nothing is touched, a further line for huddle.mjs included. When it is not,
+ * the first line for huddle.mjs is taken for an older one of huddle's and
+ * replaced: an attribute it sets (linguist-generated hides the bundle's diff
+ * in review) would otherwise outlive the line that was meant to replace it.
+ */
 async function ensureAttributes(file: string): Promise<boolean> {
   const existing = await readText(file, ATTRIBUTES);
   if (existing === null) {
@@ -128,8 +135,8 @@ async function ensureAttributes(file: string): Promise<boolean> {
   }
   const eol = existing.includes("\r\n") ? "\r\n" : "\n";
   const lines = existing.split(/\r?\n/);
+  if (lines.some((line) => line.trim() === ATTRIBUTES_LINE)) return false;
   const at = lines.findIndex((line) => /^huddle\.mjs\s/.test(line));
-  if (at !== -1 && lines[at]!.trim() === ATTRIBUTES_LINE) return false;
   if (at !== -1) lines[at] = ATTRIBUTES_LINE;
   else {
     if (lines[lines.length - 1] === "") lines.pop();
@@ -147,6 +154,15 @@ function chooseAdapters(names: string[], all: boolean): Adapter[] | null {
     if (!adapter) throw new UsageError(`unknown agent "${name}". Known: ${ADAPTERS.map((a) => a.name).join(", ")}`);
     return adapter;
   });
+}
+
+function isJsonObject(text: string): boolean {
+  try {
+    const value: unknown = JSON.parse(text);
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+  } catch {
+    return false;
+  }
 }
 
 /** A word for a shell command line: as it is when every character is inert, in single quotes otherwise. */
@@ -176,6 +192,73 @@ async function uncommitted(repoRoot: string, files: string[]): Promise<string[]>
     if (entry[0] === "R" || entry[0] === "C") i++;
   }
   return files.filter((file) => dirty.has(file));
+}
+
+/**
+ * `files`, and after each one that is reached through a symbolic link, the
+ * file inside the worktree it really is. Writing through a link changes what
+ * it points at, and that is the file git then shows as changed: AGENTS.md as
+ * a link to CLAUDE.md is how many repositories give two agents one file, and
+ * a linked directory does the same for everything in it.
+ */
+async function withLinkTargets(repoRoot: string, files: string[]): Promise<string[]> {
+  const root = await realpath(repoRoot).catch(() => repoRoot);
+  const all = new Set<string>();
+  for (const file of files) {
+    all.add(file);
+    try {
+      const real = relative(root, await realpath(resolve(repoRoot, file))).split(sep).join("/");
+      if (real !== file && committable(real)) all.add(real);
+    } catch {
+      // Not there, or a link to nothing: there is no second file to name.
+    }
+  }
+  return [...all];
+}
+
+/**
+ * Of `files`, the ones git does not track and an ignore rule hides. `git
+ * status` does not list such a file and `git add` passes over it, so nothing
+ * else ever says that it is not shared. `rule` is where the rule stands and
+ * what it is: ".gitignore:3: .claude/".
+ */
+async function ignoredByGit(repoRoot: string, files: string[]): Promise<Array<{ file: string; rule: string }>> {
+  const hidden: Array<{ file: string; rule: string }> = [];
+  for (const file of files) {
+    // One file a call: a path git cannot judge (one beyond a symbolic link) fails the whole call.
+    const asked = await git(["check-ignore", "-v", "-z", "--stdin"], { cwd: repoRoot, input: `${file}\0` });
+    const [source, line, pattern, path] = asked.stdout.split("\0");
+    // With -v, the rule that takes a file back out of an ignored directory ("!file") is reported as well.
+    if (!asked.ok || path === undefined || pattern === undefined || pattern.startsWith("!")) continue;
+    hidden.push({ file, rule: `${source}:${line}: ${pattern}` });
+  }
+  return hidden;
+}
+
+/** The team files that a teammate would not get, or not as they are now, by pulling. */
+export interface Unshared {
+  /** New or changed, and not committed. */
+  uncommitted: string[];
+  /** Not tracked, and hidden from git by an ignore rule. */
+  hidden: Array<{ file: string; rule: string }>;
+}
+
+/** What of `files` (repo-relative; a link's target inside the worktree is looked at too) is not committed as it is now. */
+export async function unshared(repoRoot: string, files: string[]): Promise<Unshared> {
+  const candidates = await withLinkTargets(repoRoot, files.filter(committable));
+  return { uncommitted: await uncommitted(repoRoot, candidates), hidden: await ignoredByGit(repoRoot, candidates) };
+}
+
+/** For doctor: one sentence for each of `files` that teammates do not get as it is now. Empty when all of them are committed. */
+export async function unsharedNotes(repoRoot: string, files: string[]): Promise<string[]> {
+  const { uncommitted: changed, hidden } = await unshared(repoRoot, files);
+  return [
+    ...changed.map((file) => `${file} is not committed as it is now, so teammates do not get it with a pull: git add ${shellWord(file)} && git commit`),
+    ...hidden.map(
+      ({ file, rule }) =>
+        `${file} is hidden from git by an ignore rule (${rule}) and is not committed, so teammates do not get it with a pull: change the rule, or git add -f ${shellWord(file)} && git commit`,
+    ),
+  ];
 }
 
 export async function run(args: string[], io: Io): Promise<number> {
@@ -247,7 +330,9 @@ export async function run(args: string[], io: Io): Promise<number> {
   }
   // A settings file that cannot be used is skipped by every command; here is where the user hears about it.
   const { config, problems } = await loadConfigReport(paths);
-  for (const problem of problems) notes.push(`${problem}. Until it is fixed huddle runs on defaults, with prompt capture off.`);
+  notes.push(...problems);
+  // A team file that cannot be used is not one to hand to the team.
+  if (existingConfig !== null && !isJsonObject(existingConfig)) teamFiles.delete(CONFIG);
 
   // 3. AGENTS.md, for agents with no hook adapter.
   try {
@@ -266,6 +351,8 @@ export async function run(args: string[], io: Io): Promise<number> {
       const result = await adapter.install({ repoRoot, bundle: BUNDLE });
       installed.push(adapter.title);
       changed.push(...result.changed);
+      // `files` is every file of the adapter that the team commits, not only what this run changed: a file an
+      // earlier run wrote and nobody committed is still to be named. An adapter that leaves it out is named by `changed` alone.
       for (const file of result.files ?? result.changed) teamFiles.add(file);
       notes.push(...result.notes.map((note) => `${adapter.title}: ${note}`));
     } catch (error) {
@@ -297,10 +384,19 @@ export async function run(args: string[], io: Io): Promise<number> {
   io.out(installed.length > 0 ? `Hooks: ${installed.join(", ")}.` : "Hooks: none installed. Agents can still use huddle through AGENTS.md.");
   for (const note of notes) io.out(`Note: ${note}`);
 
-  const toCommit = await uncommitted(repoRoot, [...teamFiles].filter(committable));
+  const { uncommitted: toCommit, hidden } = await unshared(repoRoot, [...teamFiles]);
+  const here = relative(io.cwd, repoRoot);
+  const gitHere = here === "" ? "git" : `git -C ${shellWord(here)}`;
+  if (hidden.length > 0) {
+    // Said on every run while it is so: git itself never mentions a file it ignores.
+    const it = hidden.length === 1 ? "it" : "them";
+    const andCommit = toCommit.length > 0 ? ", before the commit below" : ` && ${gitHere} commit -m "Set up huddle" && ${gitHere} push`;
+    io.out("");
+    io.out(`Hidden from git by an ignore rule, so git add leaves ${it} out and your teammates do not get ${it} with a pull:`);
+    for (const { file, rule } of hidden) io.out(`  ${file}   (${rule})`);
+    io.out(`To share ${it}, change the rule, or add ${it} by force: ${gitHere} add -f ${hidden.map(({ file }) => shellWord(file)).join(" ")}${andCommit}`);
+  }
   if (toCommit.length > 0) {
-    const here = relative(io.cwd, repoRoot);
-    const gitHere = here === "" ? "git" : `git -C ${shellWord(here)}`;
     io.out("");
     io.out("Next: commit and push these files so your teammates get huddle with their next pull:");
     io.out(`  ${gitHere} add ${toCommit.map(shellWord).join(" ")}`);

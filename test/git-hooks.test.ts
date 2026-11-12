@@ -360,7 +360,7 @@ test("git install: a clone with no hooks gets four files that hold nothing but t
 
   assert.deepEqual(await install(alice), { changed: [], notes: result.notes, files: [] }, "a second run changes nothing");
   assert.deepEqual(await install(alice, "./.huddle/huddle.mjs"), { changed: [], notes: result.notes, files: [] }, "the bundle path is one spelling");
-  assert.deepEqual(await checkGitHooks(alice.dir), { installed: true, detail: "4 git hooks in .git/hooks", notes: result.notes });
+  assert.deepEqual(await checkGitHooks(alice.dir), { installed: true, detail: "4 git hooks in .git/hooks", notes: result.notes, files: [] });
   assert.equal(await alice.git("status", "--porcelain", "--", ".git"), "", "nothing git tracks was touched");
 });
 
@@ -768,7 +768,8 @@ test("git install: core.hooksPath inside the repository is where the hooks go, a
   // These are files the team commits: init names them, changed by this run or not.
   assert.deepEqual(result.files, GIT_HOOKS.map((hook) => `.githooks/${hook}`));
   assert.deepEqual((await readdir(join(alice.dir, ".git/hooks"))).sort(), before, "the directory git no longer reads is left alone");
-  assert.deepEqual(await checkGitHooks(alice.dir), { installed: true, detail: "4 git hooks in .githooks", notes: result.notes });
+  // check names the same files to commit as install did.
+  assert.deepEqual(await checkGitHooks(alice.dir), { installed: true, detail: "4 git hooks in .githooks", notes: result.notes, files: result.files });
 
   ok(await commitFile(b, alice, "a.txt"));
   assert.equal(b.records("pre-commit").length, 1);
@@ -777,6 +778,12 @@ test("git install: core.hooksPath inside the repository is where the hooks go, a
   // The same directory named by its absolute path is still inside the repository.
   await alice.git("config", "core.hooksPath", join(alice.dir, ".githooks"));
   assert.deepEqual(await install(alice), { changed: [], notes: result.notes, files: GIT_HOOKS.map((hook) => `.githooks/${hook}`) });
+
+  // A hook in another language holds none of huddle's lines: it is the team's file, and not one of huddle's to have committed.
+  await script(join(alice.dir, ".githooks", "pre-commit"), "#!/usr/bin/env python3\n");
+  const mixed = await checkGitHooks(alice.dir);
+  assert.equal(mixed.detail, "3 git hooks in .githooks; pre-commit left alone");
+  assert.deepEqual(mixed.files, [".githooks/post-commit", ".githooks/post-checkout", ".githooks/post-merge"]);
 });
 
 test("git install: a hooks directory outside the repository is not huddle's to change", { skip: !POSIX }, async (t) => {
@@ -832,7 +839,8 @@ test("git install: with husky 9 the hooks go next to the team's own, not into th
   assert.equal(await readFile(join(alice.dir, ".husky/_/pre-commit"), "utf8"), generated);
   assert.equal(await alice.read(".husky/pre-commit"), `${hookBlock("pre-commit", BUNDLE, false)}echo "husky ran" >> "$USER_MARKER"\n`);
   assert.equal(await modeOf(join(alice.dir, ".husky/pre-commit")), 0o644);
-  assert.deepEqual(await checkGitHooks(alice.dir), { installed: true, detail: "4 git hooks in .husky", notes: result.notes });
+  assert.deepEqual(result.files, [".husky/pre-commit", ".husky/post-commit", ".husky/post-checkout", ".husky/post-merge"]);
+  assert.deepEqual(await checkGitHooks(alice.dir), { installed: true, detail: "4 git hooks in .husky", notes: result.notes, files: result.files });
 
   ok(await commitFile(b, alice, "a.txt", { USER_MARKER: marker }));
   assert.equal(await readFile(marker, "utf8"), "husky ran\n");
@@ -890,7 +898,7 @@ test("git install: a linked worktree shares the clone's hooks, and each worktree
   const result = await install(tree);
   assert.deepEqual(result.changed, GIT_HOOKS.map((hook) => join(alice.dir, ".git/hooks", hook)), "outside this worktree, so named in full");
   assert.deepEqual(result.files, [], "and not files anyone commits");
-  assert.deepEqual(await checkGitHooks(tree.dir), { installed: true, detail: `4 git hooks in ${join(alice.dir, ".git/hooks")}`, notes: result.notes });
+  assert.deepEqual(await checkGitHooks(tree.dir), { installed: true, detail: `4 git hooks in ${join(alice.dir, ".git/hooks")}`, notes: result.notes, files: [] });
   assert.deepEqual((await install(alice)).changed, [], "the main checkout finds them in place");
 
   ok(await commitFile(b, tree, "in tree.txt"));
