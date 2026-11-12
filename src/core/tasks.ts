@@ -170,7 +170,7 @@ async function remember(ctx: Ctx, task: TaskDoc, sha: Sha): Promise<void> {
  * was not made.
  */
 function notSent(result: PublishResult): boolean {
-  return !result.ok && (result as { sent?: boolean }).sent === false;
+  return !result.ok && result.sent === false;
 }
 
 /**
