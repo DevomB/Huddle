@@ -543,8 +543,8 @@ async function readJson(file: string): Promise<Json> {
 }
 
 function isOurs(candidate: unknown): boolean {
-  const args = (candidate as Json | null)?.args;
-  return Array.isArray(args) && args[1] === "hook" && args[2] === "claude-code";
+  const { command, args } = (candidate ?? {}) as Json;
+  return command === "node" && Array.isArray(args) && args.length === 3 && args[1] === "hook" && args[2] === "claude-code";
 }
 
 /** The settings with every huddle handler taken out again, and the groups and events that leaves empty. */
@@ -589,10 +589,29 @@ function assertStandingNotes(notes: readonly string[]): void {
   assert.match(trust, /workspace trust dialog/);
 }
 
+/**
+ * What doctor adds to the three in a repository without huddle's Cursor hooks:
+ * Cursor runs these hooks, they stand down for it, and so a Cursor session
+ * here is seen by nobody. Not one of init's notes: a default init installs
+ * Cursor's hooks a moment later.
+ */
+function assertCheckNotes(notes: readonly string[]): void {
+  assert.equal(notes.length, 4, notes.join("\n"));
+  assertStandingNotes(notes.slice(0, 3));
+  assert.equal(
+    notes[3],
+    "Cursor runs these hooks too, unless that is switched off in Cursor, and huddle's Claude Code hooks stand down when it does: a Cursor session belongs to Cursor's own hooks, which are not installed in this repository. Someone working in Cursor here stays invisible to the team until huddle init --agent cursor has been run and committed.",
+  );
+}
+
 test("install: an empty repo gets .claude/settings.json with one exec-form handler per event", async (t) => {
   const { root, file } = await scratchRepo(t);
   const result = await claudeCode.install({ repoRoot: root, bundle: BUNDLE });
   assert.deepEqual(result.changed, [".claude/settings.json"]);
+  // What the team commits, named whether or not this run changed it.
+  assert.deepEqual((result as { files?: string[] }).files, [".claude/settings.json"]);
+  const again = await claudeCode.install({ repoRoot: root, bundle: BUNDLE });
+  assert.deepEqual([again.changed, (again as { files?: string[] }).files], [[], [".claude/settings.json"]]);
   assertStandingNotes(result.notes);
 
   const text = await readFile(file, "utf8");
@@ -783,6 +802,116 @@ test("install: an install from before PostToolUse had a matcher gains it in plac
   assert.deepEqual(((await readJson(second.file)).hooks as Record<string, Json[]>).PostToolUse, [{ hooks: [userGuard] }, { matcher: NOT_READ_ONLY, hooks: [handler(5, { async: true })] }]);
 });
 
+test("install: a command of the user's that runs huddle's hook among other things, or only names it, is the user's and stays", async (t) => {
+  // The three from the review of the Cursor adapter, as they would stand in a Claude Code settings file.
+  const chained = { type: "command", command: 'node "$CLAUDE_PROJECT_DIR/.huddle/huddle.mjs" hook claude-code; ./notify.sh', timeout: 30, statusMessage: "notifying" };
+  const after = { type: "command", command: './format.sh && node "$CLAUDE_PROJECT_DIR/.huddle/huddle.mjs" hook claude-code' };
+  const mention = { type: "command", command: "echo 'TODO: node .huddle/huddle.mjs hook claude-code is noisy' >> notes.txt" };
+  // And the exec form: a wrapper that is handed huddle's words, and huddle's own line with a word added.
+  const wrapper = { type: "command", command: "./with-env.sh", args: ["node", SCRIPT, "hook", "claude-code"] };
+  const timed = { type: "command", command: "timeout", args: ["2", "node", SCRIPT, "hook", "claude-code"], async: true };
+  const verbose = { type: "command", command: "node", args: [SCRIPT, "hook", "claude-code", "--verbose"] };
+  const flagged = { type: "command", command: "node", args: ["--inspect", SCRIPT, "hook", "claude-code"] };
+  const theirs = {
+    hooks: {
+      Stop: [{ hooks: [chained] }],
+      PostToolUse: [{ matcher: "Edit|Write", hooks: [after, wrapper] }],
+      SessionEnd: [{ hooks: [mention] }],
+      PreToolUse: [{ matcher: "Bash", hooks: [timed] }, { hooks: [verbose, flagged] }],
+    },
+  };
+  const { root, file } = await scratchRepo(t, theirs);
+  const result = await claudeCode.install({ repoRoot: root, bundle: BUNDLE });
+  assert.deepEqual(result.changed, [".claude/settings.json"]);
+  const merged = await readJson(file);
+  const hooks = merged.hooks as Record<string, unknown[]>;
+  // Each is where it was, as it was, and huddle's own handler stands in a group of its own next to it.
+  assert.deepEqual(hooks.Stop, [{ hooks: [chained] }, { hooks: [handler(5)] }]);
+  assert.deepEqual(hooks.PostToolUse, [{ matcher: "Edit|Write", hooks: [after, wrapper] }, { matcher: NOT_READ_ONLY, hooks: [handler(5, { async: true })] }]);
+  assert.deepEqual(hooks.SessionEnd, [{ hooks: [mention] }, { hooks: [handler(5)] }]);
+  assert.deepEqual(hooks.PreToolUse, [{ matcher: "Bash", hooks: [timed] }, { hooks: [verbose, flagged] }, { matcher: "Edit|Write|MultiEdit|NotebookEdit", hooks: [handler(5)] }]);
+  assert.deepEqual(withoutHuddle(merged), theirs, "taking huddle's handlers out again gives back the original");
+  assert.deepEqual(countOurs(merged), ONE_EACH);
+
+  // The user is told that the hook may now run twice, by init and by doctor.
+  const twice =
+    "In .claude/settings.json, a hook command of your own under Stop, PostToolUse, SessionEnd, PreToolUse also names huddle's hook. huddle left it as it is and has its own handler next to it. If yours runs huddle's hook, the hook now runs twice on that event: take it out of yours.";
+  assertStandingNotes(result.notes.slice(0, 3));
+  assert.deepEqual(result.notes.slice(3), [twice]);
+  const text = await readFile(file, "utf8");
+  const again = await claudeCode.install({ repoRoot: root, bundle: BUNDLE });
+  assert.deepEqual([again.changed, again.notes.slice(3)], [[], [twice]]);
+  assert.equal(await readFile(file, "utf8"), text);
+  await withBundle(root);
+  const checked = await checkClaudeCode(root, { env: {}, home: await emptyHome(t) });
+  assert.equal(checked.installed, true);
+  assert.ok(checked.notes.includes(twice), checked.notes.join("\n"));
+});
+
+test("install: the exec form is huddle's only when node itself is started, on a file named huddle.mjs, with huddle's three words", async (t) => {
+  const stopOf = async (candidate: Json): Promise<unknown[]> => {
+    const { root, file } = await scratchRepo(t, { hooks: { Stop: [{ hooks: [candidate] }] } });
+    await claudeCode.install({ repoRoot: root, bundle: BUNDLE });
+    return ((await readJson(file)).hooks as Record<string, unknown[]>).Stop ?? [];
+  };
+  const words = [SCRIPT, "hook", "claude-code"];
+  // Left by an older install or a hand edit: brought up to date in place.
+  for (const ours of [
+    { type: "command", command: "node", args: words, timeout: 60 },
+    { type: "command", command: "/usr/local/bin/node", args: words },
+    { type: "command", command: "C:\\Program Files\\nodejs\\node.exe", args: ["C:\\work\\acme\\.huddle\\huddle.mjs", "hook", "claude-code"] },
+    { type: "command", command: "node", args: ["huddle.mjs", "hook", "claude-code"] },
+    { type: "command", command: "node .huddle/huddle.mjs hook claude-code", timeout: 5 },
+  ]) {
+    assert.deepEqual(await stopOf(ours), [{ hooks: [handler(5)] }], JSON.stringify(ours));
+  }
+  // Everything else is the user's: it stays, and huddle's handler is added next to it.
+  for (const theirs of [
+    { type: "command", command: "nodemon", args: words },
+    { type: "command", command: "bun", args: words },
+    { type: "command", command: "node", args: [...words, "--verbose"] },
+    { type: "command", command: "node", args: ["--inspect", ...words] },
+    { type: "command", command: "node", args: ["${CLAUDE_PROJECT_DIR}/.huddle/huddle.mjs.bak", "hook", "claude-code"] },
+    { type: "command", command: "node", args: [SCRIPT, "hook"] },
+    { type: "command", command: "node", args: [SCRIPT, "hook", "codex"] },
+    { type: "command", command: "sh", args: ["-c", "node .huddle/huddle.mjs hook claude-code"] },
+    { type: "prompt", command: "node", args: words },
+    { type: "command", command: "node .huddle/huddle.mjs hook claude-code | tee hooks.log" },
+  ]) {
+    assert.deepEqual(await stopOf(theirs), [{ hooks: [theirs] }, { hooks: [handler(5)] }], JSON.stringify(theirs));
+  }
+});
+
+test("install: huddle's handlers under an event this version does not use are taken out, and nothing else is", async (t) => {
+  const userGuard = { type: "command", command: "./guard.sh" };
+  const stale = {
+    hooks: {
+      ...(installed().hooks as Json),
+      // A group of huddle's alone goes; from a group shared with the user's handler only huddle's goes.
+      Notification: [{ hooks: [handler(5)] }, { matcher: "idle_prompt", hooks: [userGuard, handler(5)] }],
+      SubagentStop: [{ hooks: [{ type: "command", command: 'node "$CLAUDE_PROJECT_DIR/.huddle/huddle.mjs" hook claude-code' }] }],
+      PreCompact: [{ hooks: [userGuard] }],
+    },
+    model: "sonnet",
+  };
+  const { root, file } = await scratchRepo(t, stale);
+  await withBundle(root);
+  const around = { env: {}, home: await emptyHome(t) };
+  assert.deepEqual(await checkClaudeCode(root, around), {
+    installed: false,
+    broken: true,
+    detail: "huddle hooks in .claude/settings.json are still there under Notification, SubagentStop, which this version does not use. Run huddle init.",
+    notes: [],
+  });
+  assert.deepEqual((await claudeCode.install({ repoRoot: root, bundle: BUNDLE })).changed, [".claude/settings.json"]);
+  assert.deepEqual(await readJson(file), {
+    hooks: { ...(installed().hooks as Json), Notification: [{ matcher: "idle_prompt", hooks: [userGuard] }], PreCompact: [{ hooks: [userGuard] }] },
+    model: "sonnet",
+  });
+  assert.equal((await checkClaudeCode(root, around)).installed, true);
+  assert.deepEqual((await claudeCode.install({ repoRoot: root, bundle: BUNDLE })).changed, []);
+});
+
 test("install: a new bundle location re-points the handlers instead of adding a second set", async (t) => {
   const { root, file } = await scratchRepo(t);
   await claudeCode.install({ repoRoot: root, bundle: "tools/huddle/huddle.mjs" });
@@ -811,9 +940,11 @@ test("install: other tools' hooks that merely look similar are not huddle's", as
     { type: "http", url: "http://localhost/huddle.mjs hook claude-code" },
   ];
   const { root, file } = await scratchRepo(t, { hooks: { Stop: [{ hooks: lookalikes }] } });
-  await claudeCode.install({ repoRoot: root, bundle: BUNDLE });
+  const result = await claudeCode.install({ repoRoot: root, bundle: BUNDLE });
   const stop = ((await readJson(file)).hooks as Record<string, Json[]>).Stop;
   assert.deepEqual(stop, [{ hooks: lookalikes }, { hooks: [handler(5)] }]);
+  // None of them runs huddle's hook for Claude Code: nothing can run twice, and nothing is said about it.
+  assertStandingNotes(result.notes);
 });
 
 test("install: a settings file huddle cannot read safely is refused and left exactly as it was", async (t) => {
@@ -927,8 +1058,10 @@ test("check: reports what install left, and what is still missing", async (t) =>
   assert.deepEqual(await checkClaudeCode(root, around), { installed: false, detail: ".claude/settings.json not found. Run huddle init.", notes: [] });
 
   await claudeCode.install({ repoRoot: root, bundle: BUNDLE });
+  // Never installed is one thing; there and not able to work is `broken`, which doctor warns about.
   assert.deepEqual(await checkClaudeCode(root, around), {
     installed: false,
+    broken: true,
     detail: "hooks in .claude/settings.json run .huddle/huddle.mjs, which is not in this checkout. Run huddle init.",
     notes: [],
   });
@@ -945,7 +1078,9 @@ test("check: reports what install left, and what is still missing", async (t) =>
   const ok = await checkClaudeCode(root, around);
   assert.equal(ok.installed, true);
   assert.equal(ok.detail, "6 hooks in .claude/settings.json");
-  assertStandingNotes(ok.notes);
+  // The file the team commits, for doctor to say when it is not committed yet.
+  assert.deepEqual((ok as { files?: string[] }).files, [".claude/settings.json"]);
+  assertCheckNotes(ok.notes);
 
   // The same answer through the adapter, when the repo itself settles it.
   assert.equal((await claudeCode.check(root)).installed, true);
@@ -958,6 +1093,7 @@ test("check: reports what install left, and what is still missing", async (t) =>
   await writeFile(file, JSON.stringify(settings));
   assert.deepEqual(await checkClaudeCode(root, around), {
     installed: false,
+    broken: true,
     detail: "huddle hooks in .claude/settings.json are missing for Stop, SessionEnd. Run huddle init.",
     notes: [],
   });
@@ -982,14 +1118,49 @@ test("check: settings with no huddle hooks, or that cannot be read, are not inst
     await withBundle(root);
     assert.deepEqual(await checkClaudeCode(root, around), { installed: false, detail: "no huddle hooks in .claude/settings.json. Run huddle init.", notes: [] }, content);
   }
-  for (const content of ["{ nope", "[]", "// comment\n{}"]) {
+  // A file huddle cannot parse, with nothing of huddle's in it: not installed, and not huddle's to call broken.
+  for (const content of ["{ nope", "[]", "// comment\n{}", '{ "permissions": { "allow": ["Bash(node .huddle/huddle.mjs hook codex)"] }, ']) {
     const { root } = await scratchRepo(t, content);
     assert.deepEqual(
       await checkClaudeCode(root, around),
-      { installed: false, detail: ".claude/settings.json cannot be read as a JSON object. Fix the file, then run huddle init.", notes: [] },
+      { installed: false, detail: ".claude/settings.json cannot be read as a JSON object, so huddle cannot add its hooks to it. There are none in it now.", notes: [] },
       content,
     );
   }
+  // With huddle's hooks in it, it is broken: they are there, in the exec form or the shell form, and nobody can say whether they still work.
+  const whole = `${JSON.stringify(installed(), null, 2)}\n`;
+  const shellForm = '{ "hooks": { "Stop": [{ "hooks": [{ "type": "command", "command": "node \\"$CLAUDE_PROJECT_DIR/.huddle/huddle.mjs\\" hook claude-code" }] }] }, }';
+  for (const content of [whole.replace(/\}\n$/, ",}\n"), `// team settings\n${whole}`, `<<<<<<< HEAD\n${whole}=======\n${whole}>>>>>>> theirs\n`, whole.slice(0, whole.indexOf('"Stop"')), `${JSON.stringify(installed())},`, shellForm]) {
+    const { root } = await scratchRepo(t, content);
+    await withBundle(root);
+    assert.deepEqual(
+      await checkClaudeCode(root, around),
+      { installed: false, broken: true, detail: ".claude/settings.json cannot be read as a JSON object, and huddle's hooks are in it. Fix the file, then run huddle init.", notes: [] },
+      content.slice(0, 40),
+    );
+  }
+});
+
+test("check: the note about Cursor is there until huddle's Cursor hooks are, and init does not give it", async (t) => {
+  const around = { env: {}, home: await emptyHome(t) };
+  const { root } = await scratchRepo(t);
+  const result = await claudeCode.install({ repoRoot: root, bundle: BUNDLE });
+  await withBundle(root);
+  assertStandingNotes(result.notes);
+  assertCheckNotes((await checkClaudeCode(root, around)).notes);
+
+  // A Cursor hooks file of the user's own changes nothing: huddle's hooks are not in it.
+  await mkdir(join(root, ".cursor"));
+  await writeFile(join(root, ".cursor", "hooks.json"), JSON.stringify({ version: 1, hooks: { stop: [{ command: "./notify.sh" }, { command: "node .huddle/huddle.mjs hook codex" }] } }));
+  assertCheckNotes((await checkClaudeCode(root, around)).notes);
+  await writeFile(join(root, ".cursor", "hooks.json"), "{ not json");
+  assertCheckNotes((await checkClaudeCode(root, around)).notes);
+
+  // With them installed there is nothing left to say.
+  await rm(join(root, ".cursor", "hooks.json"));
+  await getAdapter("cursor")?.install({ repoRoot: root, bundle: BUNDLE });
+  assertStandingNotes((await checkClaudeCode(root, around)).notes);
+  assertStandingNotes((await claudeCode.install({ repoRoot: root, bundle: BUNDLE })).notes);
 });
 
 test("check: a doubled or shell-form handler is reported as not what this version installs", async (t) => {
@@ -1006,6 +1177,7 @@ test("check: a doubled or shell-form handler is reported as not what this versio
   await withBundle(second.root);
   const result = await checkClaudeCode(second.root, around);
   assert.equal(result.installed, false);
+  assert.equal(result.broken, true);
   assert.match(result.detail, /not what this version installs for Stop/);
 });
 
@@ -1026,9 +1198,9 @@ test("check: says so when Claude Code has hooks turned off, following its settin
   assert.equal(await off(), `Hooks are turned off for Claude Code here: "disableAllHooks" is true in ${userFile}. huddle's hooks will not run until that is removed.`);
   const result = await checkClaudeCode(root, around);
   assert.equal(result.installed, true, "the config is in place; the note says why it does nothing");
-  assert.equal(result.notes.length, 4);
+  assert.equal(result.notes.length, 5);
   assert.match(result.notes[0] ?? "", /disableAllHooks/, "what stops the hooks outright comes first");
-  assertStandingNotes(result.notes.slice(1));
+  assertCheckNotes(result.notes.slice(1));
 
   // The project's settings outrank the user's, and the local file outranks both.
   const projectFile = join(root, ".claude", "settings.json");
@@ -1100,25 +1272,25 @@ test("check: says so when the Claude Code on this machine is too old for exec-fo
   const notesWith = async (printed: string | null): Promise<string[]> => (await checkClaudeCode(root, { env: {}, home, claudeVersion: async () => printed })).notes;
 
   for (const fine of ["2.1.139 (Claude Code)", "2.1.140 (Claude Code)", "2.1.322 (Claude Code)", "2.2.0 (Claude Code)", "3.0.1 (Claude Code)", "10.0.0"]) {
-    assertStandingNotes(await notesWith(fine));
+    assertCheckNotes(await notesWith(fine));
   }
   // Unknown is not old: no claude on the PATH, or output that is not a version.
-  for (const unknown of [null, "", "claude: command not found", "v-next"]) assertStandingNotes(await notesWith(unknown));
+  for (const unknown of [null, "", "claude: command not found", "v-next"]) assertCheckNotes(await notesWith(unknown));
 
   for (const old of ["2.1.138 (Claude Code)", "2.1.9 (Claude Code)", "2.0.76 (Claude Code)", "1.0.128 (Claude Code)"]) {
     const notes = await notesWith(old);
-    assert.equal(notes.length, 4, old);
+    assert.equal(notes.length, 5, old);
     assert.equal(notes[0], `Claude Code ${old.split(" ")[0]} on this machine is older than 2.1.139, the first release that can run the hooks huddle installs. Update Claude Code.`);
-    assertStandingNotes(notes.slice(1));
+    assertCheckNotes(notes.slice(1));
   }
 
   // Not asked at all when the surroundings give no way to ask.
-  assertStandingNotes((await checkClaudeCode(root, { env: {}, home })).notes);
+  assertCheckNotes((await checkClaudeCode(root, { env: {}, home })).notes);
   // With hooks turned off as well, that comes first: it stops everything.
   await mkdir(join(root, ".claude"), { recursive: true });
   await writeFile(join(root, ".claude", "settings.local.json"), '{ "disableAllHooks": true }');
   const both = await notesWith("2.0.0 (Claude Code)");
-  assert.equal(both.length, 5);
+  assert.equal(both.length, 6);
   assert.match(both[0] ?? "", /disableAllHooks/);
   assert.match(both[1] ?? "", /older than 2\.1\.139/);
 });
