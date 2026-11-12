@@ -16,10 +16,10 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { ADAPTERS, getAdapter } from "../src/adapters/index.ts";
 import type { Adapter, HookEvent, HookEventType } from "../src/adapters/types.ts";
-import { run as hookCommand } from "../src/commands/hook.ts";
+import { run as hookCommand, limitLifetime } from "../src/commands/hook.ts";
 import { seenFile } from "../src/core/paths.ts";
 import { OVERLAP_HINT } from "../src/core/render.ts";
-import { DEADLINE_MS, appendLines, runHook } from "../src/hooks/engine.ts";
+import { DEADLINE_MS, appendLines, lifetimeMs, runHook } from "../src/hooks/engine.ts";
 import { toIntent } from "../src/hooks/intent.ts";
 import {
   ALONE,
@@ -28,6 +28,8 @@ import {
   FULL_FOOT,
   FULL_HEAD,
   NOTHING_ASKED,
+  ON_THE_CLOCK,
+  PATIENCE,
   SAY_SO,
   ago,
   aliceBuildsAuth,
@@ -57,11 +59,6 @@ import {
 import type { Team } from "./engine.kit.ts";
 import { BUNDLE, BUNDLE_NODE } from "./harness.ts";
 import type { CleanupHost, Clone, RunResult } from "./harness.ts";
-
-// Whoever runs these tests may be an agent with hooks of its own. Its
-// SessionStart gets the path of a file that its shell runs; a session-start
-// here must never find that path and write into it.
-delete process.env.CLAUDE_ENV_FILE;
 
 type Json = Record<string, unknown>;
 type Agent = "claude-code" | "codex";
@@ -375,13 +372,20 @@ test("a hook command that names no agent, or one that does not exist, says so on
 
 test("the payload is waited for 300 ms and no longer", async (t) => {
   const { bob } = await team(t);
-  const io = ioFor(bob, { stdin: () => new Promise<string>(() => {}) });
+  const io = ioFor(bob, { stdin: () => new Promise<string>(() => {}), env: ON_THE_CLOCK });
   const { ms, value } = await timed(() => runHook(["claude-code"], io));
   assert.equal(value, 0);
   assert.deepEqual([io.stdout, io.stderr], [[], []]);
   // It asks for one JSON value and gives the read 300 ms; a timer of its own holds if the read does not keep to that.
   assert.deepEqual(io.stdinCalls, [{ timeoutMs: 300, json: true }]);
   assert.ok(ms >= 340 && ms < 700, `came back after ${Math.round(ms)} ms`);
+
+  // A machine that was given patience waits that many times longer for it, as for everything else.
+  const patient = ioFor(bob, { stdin: () => new Promise<string>(() => {}), env: { HUDDLE_HOOK_PATIENCE: "2" } });
+  const slow = await timed(() => runHook(["claude-code"], patient));
+  assert.deepEqual([slow.value, patient.stdout, patient.stderr], [0, [], []]);
+  assert.deepEqual(patient.stdinCalls, [{ timeoutMs: 600, json: true }]);
+  assert.ok(slow.ms >= 640 && slow.ms < 1000, `came back after ${Math.round(slow.ms)} ms`);
 });
 
 test("a payload that arrives late has used up its event's time: the hook does not run over because its input was slow", async (t) => {
@@ -394,7 +398,7 @@ test("a payload that arrives late has used up its event's time: the hook does no
   assert.deepEqual(await hook(bob, "claude-code", edit("s-on-time"), 20), says("PreToolUse", authWarning(20)));
 
   // A quarter of a second late, the 150 ms of a pre-edit are gone before the engine has begun.
-  const io = ioFor(bob, { now: at(21), stdin: () => sleep(250).then(() => edit("s-late")) });
+  const io = ioFor(bob, { now: at(21), stdin: () => sleep(250).then(() => edit("s-late")), env: ON_THE_CLOCK });
   const { ms, value } = await timed(() => runHook(["claude-code"], io));
   assert.equal(value, 0);
   assert.deepEqual([io.stdout, io.stderr], [[], []], "with 150 ms of its own it would have had the warning to print");
@@ -407,7 +411,7 @@ test("through the bundle: a pipe that stays open holds nothing up, with a payloa
   const { bob } = await aliceBuildsAuth(t);
   await publish(bob, 15);
   const edit = recorded("claude-code", "pre-tool-use.write", bob, { session_id: "s-bob", agent_id: "a1", tool_input: { file_path: join(bob.dir, "src/auth.ts"), content: "one" } });
-  const run = (stdin: { text?: string; end: boolean }): Promise<Exited> => start(BUNDLE_NODE, [BUNDLE, "hook", "claude-code"], bob.dir, stdin, { HUDDLE_NOW: at(20) });
+  const run = (stdin: { text?: string; end: boolean }): Promise<Exited> => start(BUNDLE_NODE, [BUNDLE, "hook", "claude-code"], bob.dir, stdin, { HUDDLE_NOW: at(20), ...ON_THE_CLOCK });
 
   // Nothing ever arrives and nobody closes the pipe: the hook gives up by itself, quietly.
   const empty = await run({ end: false });
@@ -518,6 +522,39 @@ test("what was shown goes on record only after it is printed: output that did no
 
   // Once it is on record, the same edit is quiet.
   assert.deepEqual(await hook(bob, "claude-code", edit, 27), SILENT);
+});
+
+test("a hook whose time runs out once its answer is out does not stay to put it on record, and the log says so", async (t) => {
+  const { bob } = await aliceBuildsAuth(t);
+  await publish(bob, 15);
+  const patience = 4;
+  const asleep = new Int32Array(new SharedArrayBuffer(4));
+  const warning = contextJson("PreToolUse", authWarning(20));
+
+  // The machine stalls the moment the warning is out, for longer than the edit has. On a machine that is busy enough
+  // the edit runs out of time before it has a warning at all, hence the second and third try.
+  let session = "";
+  let stdout: string[] = [];
+  for (let attempt = 0; attempt < 3 && stdout.length === 0; attempt++) {
+    session = `s-stalled-${attempt}`;
+    const edit = recorded("claude-code", "pre-tool-use.write", bob, { session_id: session, tool_input: { file_path: join(bob.dir, "src/auth.ts"), content: "one" } });
+    const io = ioFor(bob, { now: at(20), stdin: edit, env: { HUDDLE_HOOK_PATIENCE: String(patience) } });
+    const print = io.out;
+    io.out = (line) => {
+      print(line);
+      // Runs as soon as the hook waits for anything, which is the write of its record: nothing in this process
+      // moves again before the deadline is behind it.
+      queueMicrotask(() => void Atomics.wait(asleep, 0, 0, patience * DEADLINE_MS["pre-edit"] + 20));
+    };
+    assert.equal(await runHook(["claude-code"], io), 0);
+    assert.deepEqual(io.stderr, []);
+    stdout = io.stdout;
+  }
+  assert.deepEqual(stdout, [warning]);
+  assert.match(await logOf(bob), /\[hook\] pre-edit: its deadline passed before what was shown was on record/);
+  // A hook process is over at this point, and the next edit of the file is warned about once more. Here the process
+  // lives on and the write lands after all: it was only not waited for.
+  await until("the abandoned write to land", async () => (await seenKeys(bob, session)).includes("w:src/auth.ts"));
 });
 
 test("an adapter with no way to show a context says so, and the news is kept for an event that can carry it", async (t) => {
@@ -656,13 +693,46 @@ test("the hook command is runHook, and watches for crashes only in a hook proces
   const before = listeners();
 
   const io = ioFor(bob, { now: at(0), stdin: recorded("claude-code", "post-tool-use.write", bob) });
-  assert.equal(await hookCommand(["claude-code"], io), 0);
+  // Every timer that is asked for while the command runs, by how long it is to run.
+  const timers: unknown[] = [];
+  const setTimeout_ = globalThis.setTimeout;
+  globalThis.setTimeout = Object.assign((...args: Parameters<typeof setTimeout>) => {
+    timers.push(args[1]);
+    return setTimeout_(...args);
+  }, setTimeout_);
+  try {
+    assert.equal(await hookCommand(["claude-code"], io), 0);
+  } finally {
+    globalThis.setTimeout = setTimeout_;
+  }
   assert.deepEqual([io.stdout, io.stderr], [[], []]);
   assert.equal((await sessionOf(bob, CLAUDE_SESSION))?.seenAt, at(0));
   assert.deepEqual(listeners(), before, "a test, or another command, gets no listeners on its process");
+  assert.ok(timers.length > 0, "the event's own deadline is a timer");
+  assert.ok(!timers.includes(lifetimeMs(io)), "and no limit on its lifetime: that one ends the process");
 });
 
 const WORKER = fileURLToPath(new URL("./hook.worker.ts", import.meta.url));
+
+test("no hook process outlives its limit, and the limit holds up no process that is done", async (t) => {
+  const { bob } = await team(t);
+  // The limit is the longest deadline there is and a little more, with the patience the machine was given.
+  assert.equal(lifetimeMs(ioFor(bob, { env: ON_THE_CLOCK })), 4500);
+  assert.equal(lifetimeMs(ioFor(bob)), PATIENCE * 4000 + 500);
+  assert.equal(lifetimeMs(null), 4500);
+
+  // The timer ends the process with exit code 0, and nothing waits for it.
+  const codes: number[] = [];
+  const timer = limitLifetime(30, (code) => void codes.push(code));
+  assert.equal(timer.hasRef(), false);
+  await sleep(120);
+  assert.deepEqual(codes, [0]);
+
+  // A real hook process in which something lives on after its event is done: nothing else would end it for 30 s.
+  const lingering = await start(process.execPath, [WORKER, "hook", bob.dir, "linger"], bob.dir, { end: true }, ON_THE_CLOCK);
+  assert.deepEqual([lingering.code, lingering.stdout, lingering.stderr], [0, "", ""]);
+  assert.ok(lingering.ms >= 4400 && lingering.ms < 9000, `it was ended after ${Math.round(lingering.ms)} ms`);
+});
 
 test("a crash that nothing catches leaves a line in the clone's debug log, and the hook still exits 0 in silence", async (t) => {
   const { bob } = await team(t);
@@ -774,7 +844,7 @@ test("through the bundle: where huddle cannot work, every event still exits 0 wi
 test("through the bundle: each event gets its work done in less than its budget on top of what node needs to start", async (t) => {
   const { bob } = await aliceBuildsAuth(t);
   const claude = (name: string, seconds: number, over: Json = {}): Promise<RunResult> =>
-    bob.huddle(["hook", "claude-code"], { stdin: recorded("claude-code", name, bob, { session_id: "s-bob", ...over }), now: at(seconds) });
+    bob.huddle(["hook", "claude-code"], { stdin: recorded("claude-code", name, bob, { session_id: "s-bob", ...over }), now: at(seconds), env: ON_THE_CLOCK });
   const auth = { tool_input: { file_path: join(bob.dir, "src/auth.ts"), content: "one" } };
   assert.deepEqual(await claude("session-start.startup", 20), prints("SessionStart", text(FULL_HEAD, aliceLine(20), FULL_FOOT)));
   /** How often a hook in this clone has run out of time so far. */
@@ -822,23 +892,84 @@ test("through the bundle: each event gets its work done in less than its budget 
   }
 });
 
+/**
+ * Stands in for a git that waits: on a dead network file system, on a lock, on a credential helper. Like git, it has
+ * a child in its process group (git's would be ssh), and like git it does something when it is asked to stop with
+ * SIGTERM (git removes its lock files). It notes each of those steps.
+ */
+const HANGING_GIT = [
+  "#!/bin/sh",
+  'echo "start $$" >> "$HUDDLE_TEST_PIDS"',
+  `trap 'echo "stopped $$" >> "$HUDDLE_TEST_PIDS"; exit 143' TERM`,
+  "sleep 20 &",
+  'echo "child $! $$" >> "$HUDDLE_TEST_PIDS"',
+  "wait",
+  "",
+].join("\n");
+
+/** Has the process ended? A zombie has: what is left of it is an exit status that nobody has read yet. */
+async function ended(pid: string): Promise<boolean> {
+  try {
+    process.kill(Number(pid), 0);
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ESRCH";
+  }
+  const stat = await readFile(`/proc/${pid}/stat`, "utf8").catch(() => "");
+  return stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z");
+}
+
+/** HANGING_GIT in `root`: what a hook's environment needs to run it as git, and what the stand-ins noted. */
+async function hangingGit(root: string) {
+  const bin = join(root, "bin");
+  const notes = join(root, "git.pids");
+  await mkdir(bin);
+  await writeFile(join(bin, "git"), HANGING_GIT);
+  await chmod(join(bin, "git"), 0o755);
+  const lines = async (): Promise<string[]> => (await readFile(notes, "utf8").catch(() => "")).split("\n").filter(Boolean);
+  return {
+    env: { PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`, HUDDLE_TEST_PIDS: notes, ...ON_THE_CLOCK },
+    lines,
+    /** How many times git was started. */
+    starts: async (): Promise<number> => (await lines()).filter((line) => line.startsWith("start ")).length,
+    /** Each stand-in that got as far as starting its child, which it does once it would note a SIGTERM: [stand-in, child]. */
+    pairs: async (): Promise<Array<[string, string]>> =>
+      (await lines()).filter((line) => line.startsWith("child ")).map((line): [string, string] => [line.split(" ")[2] ?? "", line.split(" ")[1] ?? ""]),
+    /** For a test that fails before the hooks have ended them. */
+    killAll: async (): Promise<void> => {
+      for (const pid of (await lines()).flatMap((line) => line.split(" ").slice(1))) {
+        try {
+          process.kill(Number(pid), "SIGKILL");
+        } catch {
+          // Gone already.
+        }
+      }
+    },
+  };
+}
+
+/**
+ * Every stand-in that got as far as starting its child was asked to stop with SIGTERM, and it and its child have
+ * ended: the hook signalled the process group. Returns how many there were.
+ */
+async function noGitLeft(git: Awaited<ReturnType<typeof hangingGit>>): Promise<number> {
+  const pairs = await git.pairs();
+  for (const [standIn, child] of pairs) {
+    await until(`stand-in ${standIn} and its child ${child} to end`, async () => (await ended(standIn)) && (await ended(child)), 10_000);
+    assert.ok((await git.lines()).includes(`stopped ${standIn}`), `stand-in ${standIn} ended without a SIGTERM`);
+  }
+  return pairs.length;
+}
+
 test(
-  "through the bundle: when git itself hangs, every event gives up at its deadline, exits 0 and says nothing",
+  "through the bundle: when git itself hangs, every event gives up at its deadline, exits 0, says nothing and leaves no git behind",
   { skip: process.platform === "win32" ? "needs a shell script to stand in for git" : false },
   async (t) => {
     const { h, bob } = await team(t);
-    const bin = join(h.root, "bin");
-    const pids = join(h.root, "git.pids");
-    await mkdir(bin);
-    // Stands in for a git that waits: on a dead network file system, on a lock, on a credential helper.
-    await writeFile(join(bin, "git"), '#!/bin/sh\necho "$$" >> "$HUDDLE_TEST_PIDS"\nexec sleep 20\n');
-    await chmod(join(bin, "git"), 0o755);
-    const env = { PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`, HUDDLE_TEST_PIDS: pids };
-    const started = async (): Promise<string[]> => (await readFile(pids, "utf8").catch(() => "")).split("\n").filter(Boolean);
+    const git = await hangingGit(h.root);
 
     try {
       const runs = await Promise.all(
-        SIX_OF_CLAUDE.map(([, name]) => timed(() => bob.huddle(["hook", "claude-code"], { stdin: recorded("claude-code", name, bob), env, now: at(0) }))),
+        SIX_OF_CLAUDE.map(([, name]) => timed(() => bob.huddle(["hook", "claude-code"], { stdin: recorded("claude-code", name, bob), env: git.env, now: at(0) }))),
       );
       for (const [index, [type]] of SIX_OF_CLAUDE.entries()) {
         const run = runs[index]!;
@@ -848,17 +979,46 @@ test(
         assert.ok(run.ms >= deadline && run.ms < deadline + 2500, `${type} came back after ${Math.round(run.ms)} ms; its deadline is ${deadline} ms`);
       }
       // It was the stand-in that ran, for each event, and nothing got as far as writing anything.
-      assert.ok((await started()).length >= SIX_OF_CLAUDE.length, `the stand-in for git ran ${(await started()).length} times`);
+      assert.ok((await git.starts()) >= SIX_OF_CLAUDE.length, `the stand-in for git ran ${await git.starts()} times`);
       assert.equal(existsSync(join(bob.dir, ".git", "huddle")), false);
+      // Its time limit was a timer in the hook, and the hook is gone: on its way out it ended every git it had started.
+      assert.ok((await noGitLeft(git)) >= 1, "no stand-in got as far as starting its child");
     } finally {
-      // Nobody is left to end them: the hook that started each one exited at its deadline.
-      for (const pid of await started()) {
-        try {
-          process.kill(Number(pid), "SIGKILL");
-        } catch {
-          // Gone already.
-        }
+      await git.killAll();
+    }
+  },
+);
+
+test(
+  "through the bundle: a hook that a signal stops ends the gits it started, and exits 0",
+  { skip: process.platform === "win32" ? "needs a shell script to stand in for git, and signals" : false },
+  async (t) => {
+    const { bob, h } = await team(t);
+    const git = await hangingGit(h.root);
+
+    try {
+      // What an agent sends a hook that runs over its own time limit, and what a terminal sends on Ctrl-C or when it closes.
+      for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
+        const before = (await git.pairs()).length;
+        const hook = spawn(BUNDLE_NODE, [BUNDLE, "hook", "claude-code"], {
+          cwd: bob.dir,
+          env: { ...process.env, ...git.env, HUDDLE_NOW: at(0) },
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+        const output: string[] = [];
+        hook.stdout.on("data", (chunk: Buffer) => output.push(chunk.toString()));
+        hook.stderr.on("data", (chunk: Buffer) => output.push(chunk.toString()));
+        const exited = new Promise<[number | null, NodeJS.Signals | null]>((resolve) => hook.once("close", (code, by) => resolve([code, by])));
+        hook.stdin.end(recorded("claude-code", "session-start.startup", bob));
+
+        // The start has 4 s for its work, and the git it waits for never answers: it is waiting when the signal comes.
+        await until(`the git of the hook that gets ${signal} to start`, async () => (await git.pairs()).length > before);
+        hook.kill(signal);
+        assert.deepEqual([await exited, output.join("")], [[0, null], ""], signal);
       }
+      assert.ok((await noGitLeft(git)) >= 3);
+    } finally {
+      await git.killAll();
     }
   },
 );

@@ -2,10 +2,11 @@
 
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmod, readFile, utimes, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { chmod, mkdir, readFile, utimes, writeFile } from "node:fs/promises";
+import { delimiter, join } from "node:path";
 import { test } from "node:test";
-import { git, GitError, gitEnv, gitOut, hardenSshCommand } from "../src/core/git.ts";
+import type { TestContext } from "node:test";
+import { STOP_GRACE_MS, endRunningGits, git, GitError, gitEnv, gitOut, hardenSshCommand } from "../src/core/git.ts";
 import { createHarness } from "./harness.ts";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -138,6 +139,166 @@ test("a call that outlives its timeout is killed along with its children", async
   assert.ok(pid > 0);
   for (let i = 0; i < 20 && alive(pid); i++) await sleep(50);
   assert.equal(alive(pid), false, "the grandchild survived the timeout");
+});
+
+// ---------------------------------------------------------------------------
+// How a git call is ended: SIGTERM, and SIGKILL if git still runs STOP_GRACE_MS later
+// ---------------------------------------------------------------------------
+
+interface Sent {
+  group: number;
+  signal: string;
+  at: number;
+}
+
+/** The signals sent to process groups from now until the test ends. git.ts signals a group, never a single process. */
+function groupSignals(t: TestContext): Sent[] {
+  const sent: Sent[] = [];
+  const original = process.kill;
+  process.kill = ((pid: number, signal?: string | number) => {
+    if (pid < 0) sent.push({ group: -pid, signal: String(signal), at: performance.now() });
+    return original.call(process, pid, signal);
+  }) as typeof process.kill;
+  t.after(() => {
+    process.kill = original;
+  });
+  return sent;
+}
+
+/**
+ * A shell script that runs in place of git: found first on the PATH of the environment this returns. It sets its
+ * trap, then writes its process id (the number of its process group) where `pid` reads it, then does what it does.
+ * So once `pid` has an answer, a SIGTERM meets the trap.
+ */
+async function standIn(dir: string, trap: string, ...body: string[]) {
+  const bin = join(dir, "bin");
+  const pidFile = join(dir, "git.pid");
+  const notes = join(dir, "notes");
+  await mkdir(bin, { recursive: true });
+  await writeFile(join(bin, "git"), ["#!/bin/sh", trap, 'echo "$$" > "$STAND_IN_PID"', ...body, ""].join("\n"));
+  await chmod(join(bin, "git"), 0o755);
+  return {
+    env: { PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`, STAND_IN_PID: pidFile, STAND_IN_NOTES: notes },
+    pid: async (): Promise<number> => {
+      for (let i = 0; i < 200; i++) {
+        const text = await readFile(pidFile, "utf8").catch(() => "");
+        if (text.endsWith("\n")) return Number(text.trim());
+        await sleep(10);
+      }
+      throw new Error("the stand-in for git never started");
+    },
+    notes: async (): Promise<string> => readFile(notes, "utf8").catch(() => ""),
+  };
+}
+
+const POSIX = process.platform !== "win32";
+
+test("a git that does not stop on SIGTERM is killed STOP_GRACE_MS after it", { skip: !POSIX }, async (t) => {
+  const h = await createHarness(t);
+  const sent = groupSignals(t);
+  // A git that is stuck where a signal cannot reach it is the same thing as one that ignores SIGTERM. So is its child.
+  const stuck = await standIn(h.root, "trap '' TERM", "exec sleep 30");
+
+  // A second is long enough for the stand-in to set its trap, however busy the machine.
+  const result = await git(["fetch"], { cwd: h.root, timeoutMs: 1000, env: stuck.env });
+  assert.deepEqual([result.ok, result.timedOut, result.code], [false, true, -1]);
+  const pid = await stuck.pid();
+  t.after(() => {
+    if (alive(pid)) process.kill(pid, "SIGKILL");
+  });
+  assert.deepEqual(
+    sent.map(({ group, signal }) => [group, signal]),
+    [[pid, "SIGTERM"]],
+    "at the timeout git is asked to stop, and not killed yet",
+  );
+  await sleep(STOP_GRACE_MS / 2);
+  assert.equal(alive(pid), true, "it ignores SIGTERM");
+
+  for (let i = 0; i < 100 && alive(pid); i++) await sleep(50);
+  assert.equal(alive(pid), false, "it was never killed");
+  assert.deepEqual(
+    sent.map(({ group, signal }) => [group, signal]),
+    [
+      [pid, "SIGTERM"],
+      [pid, "SIGKILL"],
+    ],
+  );
+  const waited = (sent[1]?.at ?? 0) - (sent[0]?.at ?? 0);
+  assert.ok(waited >= STOP_GRACE_MS - 1, `SIGKILL came ${Math.round(waited)} ms after SIGTERM`);
+});
+
+test("a git that stops on SIGTERM gets the time to, and no SIGKILL: not before it is done, and not after it is gone", { skip: !POSIX }, async (t) => {
+  const h = await createHarness(t);
+  const sent = groupSignals(t);
+  // Like git removing its lock files: it takes a moment, and then it exits by itself. Its child goes with the group.
+  const tidy = await standIn(
+    h.root,
+    `trap 'echo stopping >> "$STAND_IN_NOTES"; sleep 1; echo stopped >> "$STAND_IN_NOTES"; exit 143' TERM`,
+    "sleep 30 &",
+    "wait",
+  );
+
+  const result = await git(["fetch"], { cwd: h.root, timeoutMs: 1000, env: tidy.env });
+  assert.equal(result.timedOut, true);
+  const pid = await tidy.pid();
+  t.after(() => {
+    if (alive(pid)) process.kill(pid, "SIGKILL");
+  });
+  for (let i = 0; i < 100 && alive(pid); i++) await sleep(50);
+  assert.equal(alive(pid), false);
+  assert.equal(await tidy.notes(), "stopping\nstopped\n", "it was killed before it was done");
+
+  // By now the group's number may belong to another process: it must not get the SIGKILL that would have been due.
+  await sleep(STOP_GRACE_MS + 500);
+  assert.deepEqual(
+    sent.map(({ group, signal }) => [group, signal]),
+    [[pid, "SIGTERM"]],
+  );
+});
+
+test("endRunningGits ends the calls that are still running the way a timeout does, and leaves the ones that are done alone", { skip: !POSIX }, async (t) => {
+  const h = await createHarness(t);
+  const sent = groupSignals(t);
+
+  // A call that is done is not running any more: nothing is sent to it.
+  assert.equal((await git(["--version"], { cwd: h.root })).ok, true);
+  endRunningGits();
+  assert.equal(sent.length, 0);
+
+  // Two calls that are running, with no timeout near: one git stops on SIGTERM, the other does not.
+  const tidy = await standIn(join(h.root, "tidy"), `trap 'echo stopped >> "$STAND_IN_NOTES"; exit 143' TERM`, "sleep 30 &", "wait");
+  const stuck = await standIn(join(h.root, "stuck"), "trap '' TERM", "exec sleep 30");
+  const calls = [git(["fetch"], { cwd: h.root, env: tidy.env }), git(["fetch"], { cwd: h.root, env: stuck.env })];
+  const pids = [await tidy.pid(), await stuck.pid()];
+  t.after(() => {
+    for (const pid of pids) if (alive(pid)) process.kill(pid, "SIGKILL");
+  });
+  const ended = performance.now();
+  endRunningGits();
+
+  const results = await Promise.all(calls);
+  assert.deepEqual(
+    results.map((result) => [result.ok, result.timedOut]),
+    [
+      [false, false],
+      [false, false],
+    ],
+  );
+  assert.equal(await tidy.notes(), "stopped\n");
+  assert.equal(alive(pids[1] ?? 0), false);
+  await sleep(Math.max(0, ended + STOP_GRACE_MS + 500 - performance.now()));
+  const signals = sent.map(({ group, signal }) => [group, signal]);
+  assert.deepEqual(signals.filter(([group]) => group === pids[0]), [[pids[0], "SIGTERM"]], "the git that stopped got no SIGKILL");
+  assert.deepEqual(
+    signals.filter(([group]) => group === pids[1]),
+    [
+      [pids[1], "SIGTERM"],
+      [pids[1], "SIGKILL"],
+    ],
+    "the git that did not stop was killed",
+  );
+  const kill = sent.find(({ group, signal }) => group === pids[1] && signal === "SIGKILL");
+  assert.ok((kill?.at ?? 0) - ended >= STOP_GRACE_MS - 1, "not before STOP_GRACE_MS");
 });
 
 test("network calls get the no-prompt environment", () => {

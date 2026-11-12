@@ -11,24 +11,26 @@ import { join, relative } from "node:path";
 import { test } from "node:test";
 import type { HookEvent, HookEventType } from "../src/adapters/types.ts";
 import type { Io } from "../src/core/io.ts";
-import { OVERLAP_HINT } from "../src/core/render.ts";
+import { OVERLAP_HINT, shownText } from "../src/core/render.ts";
 import type { ActorDoc } from "../src/core/types.ts";
 import { DEADLINE_MS, handleEvent, sessionIdOf } from "../src/hooks/engine.ts";
 import { REDACTED } from "../src/hooks/intent.ts";
 import {
   ALONE,
   AUTH_PROMPT,
-  CUT_NOTE,
   DELTA_HEAD,
   FULL_FOOT,
   FULL_HEAD,
   MIN,
   NEVER_FETCHED,
   NOTHING_ASKED,
+  ON_THE_CLOCK,
+  PATIENCE,
   SAY_SO,
   ago,
   aliceBuildsAuth,
   aliceLine,
+  ambient,
   at,
   authWarning,
   cacheTeam,
@@ -55,8 +57,10 @@ import {
   text,
   throttled,
   timed,
+  unnamedNote,
 } from "./engine.kit.ts";
 import { createHarness } from "./harness.ts";
+import type { Clone } from "./harness.ts";
 
 /** Values shaped like a credential are put together at run time: see test/source.test.ts. */
 const tok = (...parts: string[]) => parts.join("");
@@ -73,7 +77,7 @@ test("the deadlines are the time budgets of the plan, except session-end", () =>
 test("session-start records the session, waits for one sync and gives the full briefing", async (t) => {
   const { h, alice } = await team(t);
   const asked = record(t);
-  const outcome = await fire(alice, "session-start", 0, { source: "startup" });
+  const outcome = await fire(alice, "session-start", 0, { source: "startup" }, ON_THE_CLOCK);
 
   // HUDDLE_SESSION is for the agent's shell: `huddle intent` typed there lands in this session.
   assert.deepEqual(outcome, { env: { HUDDLE_SESSION: "s-alice" }, context: ALONE });
@@ -136,7 +140,7 @@ test("session-start says so when the team state could not be refreshed, or was n
 test("session-start does not wait for a sync that never comes back: the briefing is built from what there is", async (t) => {
   const { alice } = await team(t);
   const asked = record(t, never);
-  const { ms, value } = await timed(() => fire(alice, "session-start", 0));
+  const { ms, value } = await timed(() => fire(alice, "session-start", 0, {}, ON_THE_CLOCK));
 
   assert.deepEqual(value, { env: { HUDDLE_SESSION: "s-alice" }, context: text(ALONE, NEVER_FETCHED) });
   assert.ok(ms >= 3500 && ms < DEADLINE_MS["session-start"], `took ${Math.round(ms)} ms`);
@@ -519,7 +523,28 @@ test("an edit of many files spells out five overlapping paths and counts the res
   assert.deepEqual(await fire(bob, "pre-edit", 22, edit), {});
 });
 
-test("a warning never grows past 4000 characters: what does not fit is counted, and one path that is too long alone is cut", async (t) => {
+test("a warning names first whoever is new to the session, whatever the order of the team view", async (t) => {
+  const { bob } = await team(t);
+  await fire(bob, "session-start", 0);
+  const on = (actor: string, user: string, seen: number): ActorDoc => teammate(actor, user, [remoteSession(`s-${user}`, seen, { files: ["a.ts"] })]);
+  const line = (user: string, seen: number, now: number): string => `- ${user} / codex on main (${ago(seen, now)}) has it in flight: no stated intent.`;
+
+  await cacheTeam(bob, 30, [on("aliceaaa", "alice", 30)]);
+  assert.equal((await fire(bob, "pre-edit", 31, { paths: ["a.ts"] })).context, text(overlapHead("a.ts"), line("alice", 30, 31), SAY_SO));
+
+  // Dave and erin turn up on the file. Both were last seen before alice, so the team view has them after her.
+  await cacheTeam(bob, 32, [on("aliceaaa", "alice", 30), on("daveaaaa", "dave", 20), on("erinaaaa", "erin", 25)]);
+  assert.equal((await fire(bob, "pre-edit", 33, { paths: ["a.ts"] })).context, text(overlapHead("a.ts"), line("erin", 25, 33), line("dave", 20, 33), line("alice", 30, 33), SAY_SO));
+  assert.deepEqual(await fire(bob, "pre-edit", 34, { paths: ["a.ts"] }), {});
+
+  // A subagent has been told about nobody: for it, the order is the team view's.
+  assert.equal(
+    (await fire(bob, "pre-edit", 35, { paths: ["a.ts"], subagent: true })).context,
+    text(overlapHead("a.ts"), line("alice", 30, 35), line("erin", 25, 35), line("dave", 20, 35), SAY_SO),
+  );
+});
+
+test("a warning never grows past 4000 characters: what does not fit is counted, and of one path that is too long alone the sessions are", async (t) => {
   const { bob } = await team(t);
   await fire(bob, "session-start", 0);
 
@@ -536,15 +561,113 @@ test("a warning never grows past 4000 characters: what does not fit is counted, 
   assert.ok(second.startsWith(overlapHead("huge.ts")) && second.endsWith(SAY_SO), second.slice(-200));
   assert.ok(second.length <= 4000);
 
-  // Twenty on one file: its warning alone is too long. It is cut at the end of a line, says so, and counts as told.
+  // Twenty on one file: its warning cannot name them all. It names as many as fit and counts the others.
   await cacheTeam(bob, 10, crowd(20, ["vast.ts"]));
+  /** A warning about vast.ts as the letters of the teammates it names, and its other lines. */
+  const about = (warning: string): { named: string; frame: string[]; lineLength: number } => {
+    const all = warning.split("\n");
+    const named = all.slice(1, -2).map((line) => /^- teammate-([a-t]) \/ codex on main \(\d\ds ago\) has it in flight: "(?:\1 ){99}\1"\.$/.exec(line)?.[1] ?? "?");
+    return { named: named.join(""), frame: [all[0] ?? "", ...all.slice(-2)], lineLength: all[1]?.length ?? 0 };
+  };
   const cut = (await fire(bob, "pre-edit", 22, { paths: ["vast.ts"] })).context ?? "";
-  assert.ok(cut.length > 3000 && cut.length <= 4000, `${cut.length} characters`);
-  const cutLines = cut.split("\n");
-  assert.equal(cutLines[0], overlapHead("vast.ts"));
-  assert.equal(cutLines.at(-1), CUT_NOTE);
-  for (const line of cutLines.slice(1, -1)) assert.match(line, /^- teammate-[a-t] \/ codex on main \(12s ago\) has it in flight: "(?:[a-t] ){99}[a-t]"\.$/);
-  assert.deepEqual(await fire(bob, "pre-edit", 23, { paths: ["vast.ts"] }), {});
+  assert.deepEqual(about(cut), { named: "abcdefghijklmn", frame: [overlapHead("vast.ts"), SAY_SO, unnamedNote(6, "vast.ts")], lineLength: 259 });
+  assert.ok(cut.length <= 4000 && cut.length + 260 > 4000, `${cut.length} characters: no room was left for one more of them`);
+
+  // Only the ones it named count as told. The next edit of the file is warned about with the others, and the
+  // fourteen from before are the ones that are counted now.
+  const rest = (await fire(bob, "pre-edit", 23, { paths: ["vast.ts"] })).context ?? "";
+  assert.deepEqual(about(rest), { named: "opqrst", frame: [overlapHead("vast.ts"), SAY_SO, unnamedNote(14, "vast.ts")], lineLength: 259 });
+  assert.deepEqual(await fire(bob, "pre-edit", 24, { paths: ["vast.ts"] }), {}, "now the session has been told about all twenty");
+
+  // One more arrives. The warning is about that one, and does not go through the twenty again.
+  await cacheTeam(bob, 10, [...crowd(20, ["vast.ts"]), teammate("teamlate", "zoe", [remoteSession("s-zoe", 5, { files: ["vast.ts"] })])]);
+  assert.equal(
+    (await fire(bob, "pre-edit", 25, { paths: ["vast.ts"] })).context,
+    text(overlapHead("vast.ts"), "- zoe / codex on main (20s ago) has it in flight: no stated intent.", SAY_SO, unnamedNote(20, "vast.ts")),
+  );
+  assert.deepEqual(await fire(bob, "pre-edit", 26, { paths: ["vast.ts"] }), {});
+
+  // A subagent has no memory: it gets the first fourteen each time.
+  for (const now of [27, 28]) assert.equal(about((await fire(bob, "pre-edit", now, { paths: ["vast.ts"], subagent: true })).context ?? "").named, "abcdefghijklmn");
+
+  // Twenty other people on two files, both in one edit. The line that counts the second file needs its room too,
+  // so the first file's block names one fewer; and the second file waits until the first has been told in full.
+  await cacheTeam(bob, 10, crowd(20, ["east.ts", "west.ts"], "y"));
+  const both = { paths: ["east.ts", "west.ts"] };
+  const turns: string[] = [];
+  for (let now = 30; now < 36; now++) {
+    const warning = (await fire(bob, "pre-edit", now, both)).context ?? "";
+    assert.ok(warning.length <= 4000, `${warning.length} characters`);
+    const all = warning.split("\n");
+    const counted = all.at(-1) === moreNote(1) ? 1 : 0;
+    const named = all.filter((line) => line.startsWith("- teammate-")).map((line) => line.charAt(11));
+    turns.push(`${/^\[huddle\] (\S+) overlaps/.exec(all[0] ?? "")?.[1] ?? "nothing"}: ${named.join("")}${counted === 1 ? ", and one more path" : ""}`);
+    if (warning !== "") assert.equal(all.at(-1 - counted), unnamedNote(20 - named.length, turns.at(-1)?.split(":")[0] ?? ""));
+  }
+  assert.deepEqual(turns, ["east.ts: abcdefghijklm, and one more path", "east.ts: nopqrst, and one more path", "west.ts: abcdefghijklmn", "west.ts: opqrst", "nothing: ", "nothing: "]);
+
+  // Fifteen on one file is one too many, and the line that says so counts in the singular.
+  await cacheTeam(bob, 10, crowd(15, ["tall.ts"], "x"));
+  assert.deepEqual(about((await fire(bob, "pre-edit", 40, { paths: ["tall.ts"] })).context ?? ""), {
+    named: "abcdefghijklmn",
+    frame: [overlapHead("tall.ts"), SAY_SO, unnamedNote(1, "tall.ts")],
+    lineLength: 259,
+  });
+  const fifteenth = `- teammate-o / codex on main (${ago(10, 41)}) has it in flight: "${"o ".repeat(100).trim()}".`;
+  assert.equal((await fire(bob, "pre-edit", 41, { paths: ["tall.ts"] })).context, text(overlapHead("tall.ts"), fifteenth, SAY_SO, unnamedNote(14, "tall.ts")));
+
+  // Eight on one file and six on another: each block fits, and the two together are a few characters too long. A
+  // block that does not fit whole is left for the next edit, however little is missing.
+  await cacheTeam(bob, 10, [...crowd(8, ["north.ts"], "n"), ...crowd(6, ["south.ts"], "s")]);
+  const poles = { paths: ["north.ts", "south.ts"] };
+  const north = (await fire(bob, "pre-edit", 50, poles)).context ?? "";
+  assert.equal(north.split("\n").length, 11);
+  assert.ok(north.startsWith(`${overlapHead("north.ts")}\n`) && north.endsWith(`\n${SAY_SO}\n${moreNote(1)}`), north.slice(-300));
+  const south = (await fire(bob, "pre-edit", 51, poles)).context ?? "";
+  assert.equal(south.split("\n").length, 8);
+  assert.ok(south.startsWith(`${overlapHead("south.ts")}\n`) && south.endsWith(`\n${SAY_SO}`), south.slice(-300));
+  const together = north.length - moreNote(1).length + south.length;
+  assert.ok(together > 4000 && together < 4100, `the two blocks and the line break between them are ${together} characters`);
+
+  // The line that counts the rest shows the path the way the first line of the warning does, "<" and ">" included.
+  await cacheTeam(bob, 10, crowd(15, ["<tag>.ts"], "y"));
+  const shown = shownText("<tag>.ts", 200);
+  assert.notEqual(shown, "<tag>.ts");
+  const tagged = ((await fire(bob, "pre-edit", 60, { paths: ["<tag>.ts"] })).context ?? "").split("\n");
+  assert.deepEqual([tagged.length, tagged[0], tagged.at(-1)], [17, overlapHead(shown), unnamedNote(1, shown)]);
+});
+
+test("one session always fits in a warning: the longest names there can be, in characters that count double", async (t) => {
+  const { bob } = await team(t);
+  await fire(bob, "session-start", 0);
+  // Outside the basic plane a character is two in a JavaScript string, and every limit on a name counts characters.
+  const wide = (count: number): string => String.fromCodePoint(0x1f600).repeat(count);
+  const dir = Array.from({ length: 4 }, () => wide(49)).join("/");
+  const worst = (letter: string): ActorDoc =>
+    teammate(`worst${letter.repeat(3)}`, `${letter}${wide(79)}`, [
+      remoteSession(`s-${letter}`, 10, { agent: wide(80), branch: wide(200), intent: wide(200), intentSource: "prompt", files: [`${dir}/${wide(49)}`] }),
+    ]);
+  await cacheTeam(bob, 10, ["a", "b", "c", "d"].map(worst));
+  const edit = { paths: [join(bob.dir, dir)] };
+
+  // Four of them do not fit, and neither do three with the line that counts the fourth. Two do.
+  const first = ((await fire(bob, "pre-edit", 20, edit)).context ?? "").split("\n");
+  assert.deepEqual([first.length, first[0], ...first.slice(-2)], [5, overlapHead(dir), SAY_SO, unnamedNote(2, dir)]);
+  assert.deepEqual(
+    first.slice(1, 3).map((line) => line.slice(0, 3)),
+    ["- a", "- b"],
+  );
+  // Each line is as long as a line gets: every name in it was cut to its limit.
+  for (const line of first.slice(1, 3)) assert.ok(line.length > 1100 && line.length < 1200, `${line.length} characters`);
+  assert.ok(first.join("\n").length > 3000 && first.join("\n").length <= 4000, `${first.join("\n").length} characters`);
+
+  const second = ((await fire(bob, "pre-edit", 21, edit)).context ?? "").split("\n");
+  assert.deepEqual([second.length, second[0], ...second.slice(-2)], [5, overlapHead(dir), SAY_SO, unnamedNote(2, dir)]);
+  assert.deepEqual(
+    second.slice(1, 3).map((line) => line.slice(0, 3)),
+    ["- c", "- d"],
+  );
+  assert.deepEqual(await fire(bob, "pre-edit", 22, edit), {});
 });
 
 test("a pre-edit that is the first sign of a session records it and has it published at once", async (t) => {
@@ -714,17 +837,21 @@ test("a warning and an update in one text never pass 4000 characters: the update
     await fire(carol, "session-end", 140 + round, fresh);
   }
 
-  // Twenty on one file: the warning alone has to be cut, and leaves no room worth using. The update is not given, so
-  // it is not used up either: it comes with the next event that may brief.
+  // Twenty on one file: the warning names as many of them as fit, and that leaves no room worth using. The update
+  // is not given, so it is not used up either: it comes with the next event that may brief.
   await cacheTeam(bob, 10, crowd(20, ["vast.ts"], "z"));
   const vast = { brief: true, paths: ["vast.ts"] };
   const alone = (await fire(bob, "post-edit", 40, vast)).context ?? "";
   assert.ok(alone.length > 3500 && alone.length <= 4000, `${alone.length} characters`);
   assert.equal(alone.split("\n")[0], overlapHead("vast.ts"));
-  assert.equal(alone.split("\n").at(-1), CUT_NOTE);
+  assert.deepEqual(alone.split("\n").slice(-2), [SAY_SO, unnamedNote(6, "vast.ts")]);
   assert.ok(!alone.includes(DELTA_HEAD), "there was no room for an update");
+  // That event has the six who were only counted, which is a short warning, and the update after it.
   const late = (await fire(bob, "post-edit", 41, vast)).context ?? "";
-  assert.ok(late.startsWith(`${DELTA_HEAD}\n`) && late.length <= 4000, late.slice(0, 200));
+  assert.ok(late.length <= 4000, `${late.length} characters`);
+  const [others, update] = parts(late, DELTA_HEAD);
+  assert.deepEqual([others.split("\n").length, others.split("\n")[0], ...others.split("\n").slice(-2)], [9, overlapHead("vast.ts"), SAY_SO, unnamedNote(14, "vast.ts")]);
+  assert.ok(update.length >= 500, `an update of ${update.length} characters`);
   assert.deepEqual(await fire(bob, "post-edit", 42, vast), {});
 });
 
@@ -1155,7 +1282,7 @@ test("when the store is busy a hook gives up on recording the session, not on wa
     let now = 25;
     for (let attempt = 0; attempt < 3 && outcome.context === undefined; attempt++) {
       now = 25 + attempt;
-      ({ ms, value: outcome } = await timed(() => fire(bob, "pre-edit", now, { ...edit, sessionId: `s-late-${attempt}` })));
+      ({ ms, value: outcome } = await timed(() => fire(bob, "pre-edit", now, { ...edit, sessionId: `s-late-${attempt}` }, ON_THE_CLOCK)));
     }
     assert.equal(outcome.context, authWarning(now));
     assert.ok(ms < DEADLINE_MS["pre-edit"] + 25, `pre-edit took ${Math.round(ms)} ms`);
@@ -1167,7 +1294,7 @@ test("when the store is busy a hook gives up on recording the session, not on wa
 
     // The other events have nothing but the session to record. They come back in time, empty-handed.
     for (const type of ["prompt", "post-edit", "turn-end", "session-end"] as const) {
-      const run = await timed(() => fire(bob, type, 30, { prompt: "Add the login page" }));
+      const run = await timed(() => fire(bob, type, 30, { prompt: "Add the login page" }, ON_THE_CLOCK));
       assert.deepEqual(run.value, {}, type);
       assert.ok(run.ms < DEADLINE_MS[type] + 25, `${type} took ${Math.round(run.ms)} ms`);
     }
@@ -1203,7 +1330,7 @@ test("an event that cannot finish gives up at its deadline with nothing to say, 
   record(t, never);
   const releases = await Promise.all(stuck.map(({ clone }) => hold(clone, "identity")));
   try {
-    const runs = await Promise.all(stuck.map(({ clone, type, over }) => timed(() => fire(clone, type, 0, over))));
+    const runs = await Promise.all(stuck.map(({ clone, type, over }) => timed(() => fire(clone, type, 0, over, ON_THE_CLOCK))));
     for (const [index, { clone, type, deadline }] of stuck.entries()) {
       const run = runs[index]!;
       assert.deepEqual(run.value, {}, type);
@@ -1215,6 +1342,94 @@ test("an event that cannot finish gives up at its deadline with nothing to say, 
     // What was abandoned runs on once the lock is free. Let it finish before the clones are removed under it.
     await sleep(400);
   }
+});
+
+test("HUDDLE_HOOK_PATIENCE makes every deadline that many times longer, and counts as 1 when it is not a number from 1 to 100", async (t) => {
+  const { alice } = await team(t);
+  record(t, never);
+  // No actor id yet, and the lock that minting one needs is held: every edit here is stuck until its deadline.
+  const cases: Array<[patience: string, deadline: number]> = [
+    ["1", 150],
+    ["2", 300],
+    ["1.5", 225],
+    ["", 150],
+    ["0", 150],
+    ["0.5", 150],
+    ["-2", 150],
+    ["101", 150],
+    ["ten", 150],
+    ["2x", 150],
+  ];
+  const release = await hold(alice, "identity");
+  try {
+    const runs = await Promise.all(
+      cases.map(([patience], index) => timed(() => fire(alice, "pre-edit", 0, { sessionId: `s-${index}`, paths: ["a.ts"] }, { HUDDLE_HOOK_PATIENCE: patience }))),
+    );
+    for (const [index, [patience, deadline]] of cases.entries()) {
+      const run = runs[index]!;
+      assert.deepEqual(run.value, {}, patience);
+      // Never before its deadline. How long after is up to the machine, with ten of them at once.
+      assert.ok(run.ms >= deadline - 5, `with ${JSON.stringify(patience)} it came back after ${Math.round(run.ms)} ms; its deadline is then ${deadline} ms`);
+    }
+    // What the log says is the deadline each event really had: none of them had more than it should.
+    const log = await logOf(alice);
+    for (const [deadline, times] of [[150, 8], [225, 1], [300, 1]] as const) {
+      assert.equal(log.split(`[hook] pre-edit: gave up at its deadline of ${deadline} ms`).length - 1, times, `${deadline} ms`);
+    }
+  } finally {
+    await release();
+    await sleep(400);
+  }
+});
+
+test("patience is for this machine and not for the remote: a sync is waited for no longer than without it", async (t) => {
+  const { alice, bob } = await aliceBuildsAuth(t);
+  const asked = record(t);
+  assert.ok(PATIENCE > 1, "these tests run with patience, as every test here does that is not about time");
+
+  // A session start has twenty times its 4 s here. The sync it waits for still gets the 3.7 s it always gets at
+  // the most, and what patience adds is kept for the work that comes after.
+  await fire(alice, "session-start", 20);
+  assert.deepEqual(asked.waited, [3700]);
+  // The same for the second that a commit may wait. (Alice was last seen at 10 as far as the remote knows: a session
+  // that was only seen again is not published again so soon.)
+  assert.deepEqual(await ambient(bob, "pre-edit", 25, { paths: ["src/auth.ts"] }), { context: authWarning(25) });
+  assert.deepEqual(asked.waited, [3700, 1000]);
+});
+
+test("what is kept back for the work after a sync grows with patience: after a slow start, the sync gets the rest of the deadline less that", async (t) => {
+  const { alice, bob } = await team(t);
+  /** By checkout: the budget its sync was given, and when. */
+  const waits = new Map<string, { budget: number; at: number }>();
+  record(t, (ctx, budgetMs) => {
+    waits.set(ctx.paths.worktree, { budget: budgetMs, at: performance.now() });
+    return Promise.resolve(false);
+  });
+  // Neither clone has an actor id yet. Minting one needs the identity lock, so both events are stuck while it is held.
+  const releases = await Promise.all([hold(alice, "identity"), hold(bob, "identity")]);
+  // With one and a half times its 4 s, a session start has 6 s and keeps 450 ms of them for the briefing.
+  const startBegan = performance.now();
+  const start = fire(alice, "session-start", 0, {}, { HUDDLE_HOOK_PATIENCE: "1.5" });
+  // With twice its 1.5 s, a commit has 3 s and keeps 300 ms of them for the check.
+  const commitBegan = performance.now();
+  const commit = ambient(bob, "pre-edit", 0, { paths: ["a.ts"] }, { HUDDLE_HOOK_PATIENCE: "2" });
+  // Two seconds in, each of them has less left than the longest wait and what it keeps back.
+  await sleep(2000);
+  await Promise.all(releases.map((release) => release()));
+  assert.deepEqual(await start, { env: { HUDDLE_SESSION: "s-alice" }, context: text(ALONE, NEVER_FETCHED) });
+  assert.deepEqual(await commit, {});
+
+  /** When the wait the event was given runs out, counted from when the event began. */
+  const waitEnds = (clone: Clone, began: number): number => {
+    const wait = waits.get(clone.dir);
+    assert.ok(wait, `the event in ${clone.name}'s clone waited for no sync`);
+    return wait.at - began + wait.budget;
+  };
+  // 6000 - 450 and 3000 - 300. With the 300 ms and 150 ms of a machine without patience, both would end 150 ms later.
+  const startEnds = waitEnds(alice, startBegan);
+  assert.ok(Math.abs(startEnds - 5550) < 50, `the session start's wait would have ended ${Math.round(startEnds)} ms in`);
+  const commitEnds = waitEnds(bob, commitBegan);
+  assert.ok(Math.abs(commitEnds - 2700) < 50, `the commit's wait would have ended ${Math.round(commitEnds)} ms in`);
 });
 
 test("on a quiet machine each event takes less than half of its budget", async (t) => {
