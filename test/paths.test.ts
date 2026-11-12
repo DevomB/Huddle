@@ -201,11 +201,12 @@ test("a team config that cannot be used turns prompt capture off and is reported
   assert.equal((await loadConfig(paths)).captureIntent, false);
   assert.match(await readFile(paths.logFile, "utf8"), /\[config\] \.huddle\/config\.json is not valid JSON/);
 
-  // The local override is this machine's own choice and still applies.
+  // The local override still applies, except that it cannot turn capture back on while the team file is broken:
+  // the broken file may be the one that turned it off.
   await mkdir(paths.stateDir, { recursive: true });
   await writeFile(paths.localConfigFile, JSON.stringify({ captureIntent: true, ttlMinutes: 20 }));
   const overridden = await loadConfigReport(paths);
-  assert.equal(overridden.config.captureIntent, true);
+  assert.equal(overridden.config.captureIntent, false);
   assert.equal(overridden.config.ttlMinutes, 20);
 
   // A broken local override is reported, and a good team file is still used.
@@ -214,8 +215,9 @@ test("a team config that cannot be used turns prompt capture off and is reported
   const localBroken = await loadConfigReport(paths);
   assert.equal(localBroken.config.remote, "upstream");
   assert.equal(localBroken.config.captureIntent, false);
-  assert.equal(localBroken.problems.length, 1);
+  assert.equal(localBroken.problems.length, 2);
   assert.match(localBroken.problems[0] ?? "", /^the local override .* is not valid JSON$/);
+  assert.equal(localBroken.problems[1], `the local override's settings are ignored and prompt capture is off until ${paths.localConfigFile} is fixed`);
 });
 
 test("listCheckouts names the checkouts of a clone, the main one first, and only those that are still there", async (t) => {

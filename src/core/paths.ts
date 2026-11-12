@@ -232,22 +232,40 @@ export interface ConfigReport {
   problems: string[];
 }
 
+export interface ConfigReadOptions {
+  /**
+   * Reads one config file as text. The default is readFile. Tests pass one that
+   * fails the way a real disk can (access denied), which a file mode cannot
+   * produce on every platform.
+   */
+  readText?: (file: string) => Promise<string>;
+}
+
 /**
  * Defaults, then .huddle/config.json, then the local override. A missing file
- * is skipped.
+ * is skipped: it has no setting to lose.
  *
- * A file that exists but does not hold a JSON object is skipped too, with a
- * line in `problems`. For the team file that also turns prompt capture off:
- * the usual cause is a merge conflict in .huddle/config.json, and a team that
- * had switched capture off must not start publishing prompts because of one.
- * The local override can still turn it back on.
+ * A file that exists but cannot be read or does not hold a JSON object is
+ * skipped too, with a line in `problems`, and it turns prompt capture off,
+ * because it may be the very file that turned capture off:
+ *
+ * - The team file: the usual cause is a merge conflict in .huddle/config.json,
+ *   and a team that had switched capture off must not start publishing
+ *   prompts because of one.
+ * - The local override: it is where one person opts out on one machine.
+ *
+ * Either way capture stays off whatever the other layer says, until the file
+ * is fixed. The same goes for a layer whose captureIntent is present but is
+ * not a boolean. The other settings of a broken file are ignored; those of a
+ * readable one still apply.
  */
-export async function loadConfigReport(paths: RepoPaths): Promise<ConfigReport> {
+export async function loadConfigReport(paths: RepoPaths, options: ConfigReadOptions = {}): Promise<ConfigReport> {
+  const readText = options.readText ?? ((file: string) => readFile(file, "utf8"));
   const problems: string[] = [];
   const read = async (file: string, label: string): Promise<unknown> => {
     let text: string;
     try {
-      text = await readFile(file, "utf8");
+      text = await readText(file);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
       problems.push(`${label} cannot be read (${(error as NodeJS.ErrnoException).code ?? "error"})`);
@@ -262,10 +280,20 @@ export async function loadConfigReport(paths: RepoPaths): Promise<ConfigReport> 
     }
     return null;
   };
+  // A captureIntent that is there but is neither true nor false: the layer meant something, and it may have meant off.
+  const unclear = (value: unknown): boolean =>
+    typeof value === "object" && value !== null && Object.hasOwn(value, "captureIntent") && typeof (value as Record<string, unknown>).captureIntent !== "boolean";
+
   const team = await read(paths.teamConfigFile, ".huddle/config.json");
   if (team === null) problems.push("the team's settings are ignored and prompt capture is off until .huddle/config.json is fixed");
+  if (unclear(team)) problems.push(".huddle/config.json has a captureIntent that is not true or false, so prompt capture is off until it is fixed");
   const local = await read(paths.localConfigFile, "the local override (huddle/config.json in the git directory)");
-  const config = mergeConfig(team === null ? { captureIntent: false } : team, local);
+  if (local === null) problems.push(`the local override's settings are ignored and prompt capture is off until ${paths.localConfigFile} is fixed`);
+  if (unclear(local)) problems.push(`the local override has a captureIntent that is not true or false, so prompt capture is off until ${paths.localConfigFile} is fixed`);
+
+  const config = mergeConfig(team === null ? {} : team, local);
+  // Whatever any other layer says: a layer that exists and cannot be trusted may be the one that turned capture off.
+  if (team === null || local === null || unclear(team) || unclear(local)) config.captureIntent = false;
   return { config, problems };
 }
 

@@ -29,7 +29,7 @@ export async function run(args: string[], io: Io): Promise<number> {
   // looks like a credential is not published (hooks/intent.ts; best effort). An intent is
   // published with that part taken out, because the next prompt replaces it. A decision is the
   // rule itself: with a part taken out it is a rule nobody can follow, for good. So it is refused.
-  const scrubbed = scrubSecrets(typed);
+  const scrubbed = scrubSecrets(typed, { durable: true });
   if (scrubbed !== typed) {
     throw new UsageError(
       "part of this looks like a credential, so the decision was NOT recorded: a decision is read by everyone who can read the repository and is never removed. " +

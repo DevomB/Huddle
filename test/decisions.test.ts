@@ -708,6 +708,11 @@ test("a decision that holds something shaped like a credential is not recorded, 
   // A decision with nothing of the kind is published as typed.
   const plain = await ok(alice, ["decide", "API errors use problem+json, version 2"], at(5));
   assert.match(plain.stdout, /^decision [a-z2-7]{8} recorded: API errors use problem\+json, version 2$/m);
+  // Ordinary rules shaped like "name: value" are rules, not credentials (durable mode of scrubSecrets).
+  for (const rule of ["Primary key: uuid7 for all new tables", "Auth: oauth2 with PKCE only", "Password: 12 characters minimum"]) {
+    const recorded = await ok(alice, ["decide", rule], at(5));
+    assert.ok(recorded.stdout.endsWith(`recorded: ${rule}\n`), recorded.stdout);
+  }
 
   // The length limit is judged on what was typed, and is what the author hears about first:
   // 470 characters, a space and a token are over it as typed and would be within it with the token taken out.
