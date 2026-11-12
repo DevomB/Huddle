@@ -19,10 +19,12 @@ permissions:
 
 jobs:
   smoke:
-    # The fast job: what a user does with a clean checkout. Pack from clean
-    # source (prepack builds the bundle), install the tarball, run the bins
-    # (on Windows the .cmd shims from PowerShell and from CMD), and the
-    # two-clone demo against the built bundle.
+    # The fast job, and the acceptance check for the shipped artifact: build the
+    # release archive from a clean copy of the tracked files, unpack it into a
+    # path with a space, and run THAT, never dist/ of this checkout: the
+    # launchers (on Windows git-huddle.cmd from PowerShell and CMD),
+    # `git huddle` through PATH, init for Claude Code and Codex, and the
+    # two-clone demo driven by the unpacked artifact.
     name: Smoke (Node 22, ${{ matrix.os }})
     if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 't/mvp-')
     strategy:
@@ -43,13 +45,9 @@ jobs:
       - run: node scripts/ci-evidence.mjs platform smoke-evidence ($PSVersionTable.PSVersion.ToString())
       - run: npm ci
       - run: npm run typecheck
-      - run: npm run build
-      - name: Pack from clean source and install the tarball
-        run: npm run smoke:pack -- --keep smoke-evidence
-      - name: Two-clone demo
-        if: hashFiles('scripts/demo-mvp.mjs') != ''
-        run: npm run demo -- --evidence smoke-evidence
-      - name: Keep the smoke evidence
+      - name: Release archive from clean source, unpacked and run, with the two-clone demo
+        run: node scripts/mvp-delivery-release.mjs --keep smoke-evidence
+      - name: Keep the smoke evidence and the archive
         if: always()
         uses: actions/upload-artifact@v4
         with:

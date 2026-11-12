@@ -29,7 +29,8 @@
     "typecheck": "tsc --noEmit",
     "pretest": "npm run build",
     "test": "node --test \"test/**/*.test.ts\"",
-    "smoke:pack": "node scripts/mvp-delivery-pack.mjs",
+    "release": "npm run build && node scripts/build-release.mjs",
+    "smoke:release": "node scripts/mvp-delivery-release.mjs",
     "demo": "node scripts/demo-mvp.mjs"
   },
   "devDependencies": {
