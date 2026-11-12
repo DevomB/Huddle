@@ -17,6 +17,7 @@ import type { RepoPaths } from "../src/core/paths.ts";
 import {
   StoreBusyError,
   readCache,
+  readCacheStatus,
   readLocal,
   readSeen,
   removeSeen,
@@ -732,6 +733,35 @@ describe("cache.json", () => {
     await mkdir(paths.stateDir, { recursive: true });
     await writeFile(paths.cacheFile, "{ nope");
     assert.deepEqual(await readCache(paths), { fetchedAt: null, refs: {} });
+  });
+
+  test("readCacheStatus tells a missing cache from an unreadable one, and readCache stays as it was", async () => {
+    const paths = await makePaths();
+    const empty: Cache = { fetchedAt: null, refs: {} };
+    assert.deepEqual(await readCacheStatus(paths), { cache: empty, state: "missing" });
+
+    await mkdir(paths.stateDir, { recursive: true });
+    // Not JSON, JSON that is not an object, an object that is not a cache.
+    for (const text of ["{ nope", "", "[]", "null", "42", '"text"', "{}", '{"fetchedAt":null,"refs":[]}']) {
+      await writeFile(paths.cacheFile, text);
+      assert.deepEqual(await readCacheStatus(paths), { cache: empty, state: "unreadable" }, text);
+      assert.deepEqual(await readCache(paths), empty, text);
+    }
+
+    // Exists but cannot be read at all: a directory in its place fails the read on every platform.
+    await rm(paths.cacheFile, { force: true });
+    await mkdir(paths.cacheFile);
+    assert.deepEqual(await readCacheStatus(paths), { cache: empty, state: "unreadable" });
+    assert.deepEqual(await readCache(paths), empty);
+    await rm(paths.cacheFile, { recursive: true });
+
+    // Written by writeCache, including one that has never fetched anything.
+    await writeCache(paths, empty);
+    assert.deepEqual(await readCacheStatus(paths), { cache: empty, state: "ok" });
+    const cache: Cache = { fetchedAt: T0, refs: { [ref]: { sha, doc: actorDoc("abcdefgh") } } };
+    await writeCache(paths, cache);
+    assert.deepEqual(await readCacheStatus(paths), { cache, state: "ok" });
+    assert.deepEqual(await readCache(paths), cache);
   });
 
   test("round-trips, creating the state directory if needed", async () => {
