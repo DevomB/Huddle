@@ -301,7 +301,8 @@ describe("A08 and A10: shared task text", () => {
     assert.match(refused.stderr, /NOT added/);
     assert.doesNotMatch(refused.stderr, /AUDIT_FAKE_1234567890/, "the refusal does not echo the credential");
     assert.equal((await remoteTasks(h)).size, before);
-    for (const title of ["Rotate the key named in config/secrets.md", "Fix the token refresh bug"]) {
+    // Ordinary sentences that only look like "name: value" are titles, not credentials (lead's durable mode).
+    for (const title of ["Rotate the key named in config/secrets.md", "Fix the token refresh bug", "Primary key: uuid7 for all new tables"]) {
       assert.equal((await alice.huddle(["task", "add", title], { now: at(20), session: "alice-1" })).code, 0, title);
     }
   });

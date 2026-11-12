@@ -155,7 +155,7 @@ export function uncertain(ctx: Pick<Ctx, "config">, verb: Verb | "add", task: Ta
  * can change without touching the policy above.
  */
 function durableScrub(text: string): string {
-  return scrubSecrets(text);
+  return scrubSecrets(text, { durable: true });
 }
 
 async function list(args: string[], io: Io): Promise<number> {
