@@ -558,6 +558,40 @@ test("an adapter with no way to show a context says so, and the news is kept for
   const news = text(DELTA_HEAD, `- alice / claude-code on main (${ago(30, 36)}): "Switch the JWT middleware to sessions". Files: src/auth.ts`, OVERLAP_HINT);
   assert.deepEqual(await run("user-prompt-submit", 36), says("UserPromptSubmit", news));
   assert.deepEqual(await run("user-prompt-submit", 37), SILENT);
+
+  // An agent that can be spoken to only after a tool call (Gemini CLI): nothing can be said before the edit. The
+  // warning is kept, and the event after the edit carries it, once.
+  codex.format = mute;
+  assert.deepEqual(await run("session-start.startup", 40), SILENT);
+  assert.deepEqual(await run("pre-tool-use.apply-patch.add", 41, edit), SILENT);
+  codex.format = format;
+  const late = text(overlapHead("src/auth.ts"), `- alice / claude-code on main (${ago(30, 42)}) has it in flight: "Switch the JWT middleware to sessions".`, SAY_SO);
+  assert.deepEqual(await run("post-tool-use.apply-patch", 42, edit), says("PostToolUse", late));
+  assert.deepEqual(await run("post-tool-use.apply-patch", 43, edit), SILENT);
+  assert.deepEqual(await run("pre-tool-use.apply-patch.add", 44, edit), SILENT);
+
+  // An agent that cannot be spoken to at a prompt either (Cursor): its adapter says of the event after a tool call
+  // that the session may be briefed there, and what the prompt could not say arrives with it.
+  const parse = codex.parse;
+  codex.parse = (input) => {
+    const event = parse(input);
+    return event !== null && event.type === "post-edit" ? { ...event, brief: true } : event;
+  };
+  // The briefing that the session start at 40 could not show is still owed. The warning was given at 42.
+  const owed = text(FULL_HEAD, `- alice / claude-code on main (${ago(30, 45)}): "Switch the JWT middleware to sessions". Files: src/auth.ts`, FULL_FOOT);
+  assert.deepEqual(await run("post-tool-use.apply-patch", 45, edit), says("PostToolUse", owed));
+  assert.deepEqual(await run("post-tool-use.apply-patch", 46, edit), SILENT);
+  // And so is news that comes while the agent works.
+  await fire(alice, "session-end", 50);
+  await publish(alice, 51);
+  await publish(bob, 52);
+  codex.format = mute;
+  assert.deepEqual(await run("user-prompt-submit", 55), SILENT);
+  // Saying that it may brief is not the same as being able to: an answer that was not shown uses up nothing here either.
+  assert.deepEqual(await run("post-tool-use.apply-patch", 56, edit), SILENT);
+  codex.format = format;
+  assert.deepEqual(await run("post-tool-use.apply-patch", 57, edit), says("PostToolUse", text(DELTA_HEAD, "Left: alice / claude-code (main).")));
+  assert.deepEqual(await run("post-tool-use.apply-patch", 58, edit), SILENT);
 });
 
 test("appendLines adds a line to a file once, makes the directory, and refuses a line that is more than one", async (t) => {
@@ -757,7 +791,8 @@ test("through the bundle: each event gets its work done in less than its budget 
     prompt: { work: () => claude("user-prompt-submit.typed", 31), stdout: "" },
     // A subagent's edit is warned about every time, so it is the one that does all of the work every time.
     "pre-edit": { work: () => claude("pre-tool-use.subagent-write", 32, auth), stdout: prints("PreToolUse", authWarning(32)).stdout },
-    "post-edit": { work: () => claude("post-tool-use.write", 33, auth), stdout: "" },
+    // The session has been warned about the file by then: the check is made, and has nothing to add.
+    "post-edit": { work: () => claude("post-tool-use.write", 33, auth), stdout: "", before: () => fire(bob, "pre-edit", 32, { paths: [auth.tool_input.file_path] }) },
     "turn-end": { work: () => claude("stop", 34), stdout: "" },
     // Each run has a session to remove.
     "session-end": { work: () => claude("session-end", 36), stdout: "", before: () => fire(bob, "post-edit", 35) },

@@ -357,6 +357,20 @@ test("a subagent's prompt keeps the session alive and nothing else: no intent, a
 
 const warnedPaths = async (...args: Parameters<typeof seenKeys>): Promise<string[]> => (await seenKeys(...args)).filter((key) => key.startsWith("w:"));
 
+/**
+ * Teammates a, b, c and so on, each with an intent of the full length and all
+ * on `files`. `tag` makes them other people than a crowd with another tag.
+ * `shorter` takes that many characters off the intents, from the last
+ * teammate's first, 190 at the most from each.
+ */
+const crowd = (count: number, files: string[], tag = "", shorter = 0): ActorDoc[] =>
+  Array.from({ length: count }, (_, index) => {
+    const letter = String.fromCharCode(97 + index);
+    const cut = Math.max(0, Math.min(190, shorter - (count - 1 - index) * 190));
+    const intent = `${letter} `.repeat(100).trim().slice(0, 199 - cut).trimEnd();
+    return teammate(`team${letter}${tag}`, `teammate-${letter}`, [remoteSession(`s-${letter}`, 10, { intent, intentSource: "prompt", files })]);
+  });
+
 test("pre-edit warns once when the file is in a teammate's flight, from the cache and without touching the network", async (t) => {
   const { bob } = await aliceBuildsAuth(t);
   await fire(bob, "session-start", 20);
@@ -508,15 +522,8 @@ test("an edit of many files spells out five overlapping paths and counts the res
 test("a warning never grows past 4000 characters: what does not fit is counted, and one path that is too long alone is cut", async (t) => {
   const { bob } = await team(t);
   await fire(bob, "session-start", 0);
-  // Teammates with intents of the full length, all on the same files.
-  const crowd = (count: number, files: string[]) =>
-    Array.from({ length: count }, (_, index) => {
-      const letter = String.fromCharCode(97 + index);
-      const intent = `${letter} `.repeat(100).trim();
-      return teammate(`team${letter}`, `teammate-${letter}`, [remoteSession(`s-${letter}`, 10, { intent, intentSource: "prompt", files })]);
-    });
 
-  // Twelve of them: either file alone fits, the two together do not.
+  // Twelve teammates with intents of the full length, all on the same files: either file alone fits, the two together do not.
   await cacheTeam(bob, 10, crowd(12, ["big.ts", "huge.ts"]));
   const first = (await fire(bob, "pre-edit", 20, { paths: ["big.ts", "huge.ts"] })).context ?? "";
   assert.ok(first.length > 3000 && first.length <= 4000, `${first.length} characters`);
@@ -565,13 +572,13 @@ test("post-edit keeps the session alive and leaves the sync to the throttle, unl
   const { bob } = await aliceBuildsAuth(t);
   await publish(bob, 15);
   const asked = record(t);
-  const edit = { paths: [join(bob.dir, "src/auth.ts")] };
+  const mine = { paths: [join(bob.dir, "src/login.ts")] };
 
-  // The session is new: published at once. And no warning after the fact, even for a contested file.
-  assert.deepEqual(await fire(bob, "post-edit", 20, edit), {});
+  // The session is new: published at once.
+  assert.deepEqual(await fire(bob, "post-edit", 20, mine), {});
   assert.deepEqual(asked.background, [forced(bob)]);
 
-  assert.deepEqual(await fire(bob, "post-edit", 21, edit), {});
+  assert.deepEqual(await fire(bob, "post-edit", 21, mine), {});
   assert.deepEqual(await fire(bob, "post-edit", 22, {}), {}, "a shell command names no files");
   assert.deepEqual(asked.background, [forced(bob), throttled(bob), throttled(bob)]);
   // The throttle is asked with the event's clock and the team's config, so that no process is started for nothing.
@@ -580,6 +587,145 @@ test("post-edit keeps the session alive and leaves the sync to the throttle, unl
   assert.deepEqual(asked.waited, []);
   assert.equal((await sessionOf(bob))?.seenAt, at(22));
   assert.deepEqual(await seenKeys(bob), [], "nothing was shown, so nothing is remembered");
+});
+
+test("post-edit gives the warning that no pre-edit gave: once, with the edit's sync, and never to a subagent", async (t) => {
+  const { bob } = await aliceBuildsAuth(t);
+  await fire(bob, "session-start", 20);
+  const asked = record(t);
+  const edit = { paths: [join(bob.dir, "src/auth.ts")] };
+
+  // An agent that cannot be spoken to before a tool call (Gemini CLI, Cursor), or a pre-edit that ran out of time:
+  // nothing warned the session before this edit. So it is warned now, in the event that also starts the edit's sync.
+  assert.deepEqual(await fire(bob, "post-edit", 25, edit), { context: authWarning(25) });
+  assert.deepEqual(asked.background, [throttled(bob)]);
+  assert.deepEqual(await warnedPaths(bob), ["w:src/auth.ts"]);
+  // Told is told, whichever event did it.
+  assert.deepEqual(await fire(bob, "post-edit", 26, edit), {});
+  assert.deepEqual(await fire(bob, "pre-edit", 27, edit), {});
+
+  // The other order is Claude Code's and Codex's: after a pre-edit that warned, the post-edit has nothing to add.
+  await fire(bob, "session-start", 30);
+  assert.deepEqual(await fire(bob, "pre-edit", 31, edit), { context: authWarning(31) });
+  assert.deepEqual(await fire(bob, "post-edit", 32, edit), {});
+
+  // A subagent was warned before its edit, as it is before every edit. Its post-edit stays a sign of life, and
+  // uses up nothing that the session itself has yet to be told.
+  await fire(bob, "session-start", 40);
+  assert.deepEqual(await fire(bob, "post-edit", 41, { ...edit, subagent: true }), {});
+  assert.deepEqual(await warnedPaths(bob), []);
+  assert.deepEqual(await fire(bob, "post-edit", 42, edit), { context: authWarning(42) });
+
+  // A file that nobody else is working on, and paths as agents give them.
+  assert.deepEqual(await fire(bob, "post-edit", 43, { paths: [join(bob.dir, "README.md")] }), {});
+  await fire(bob, "session-start", 50);
+  assert.deepEqual(await fire(bob, "post-edit", 51, { cwd: join(bob.dir, "src"), paths: ["auth.ts", "../src/auth.ts"] }), { context: authWarning(51) });
+  assert.equal(asked.waited.length, 3, "only the three session-starts waited for the network");
+});
+
+test("a post-edit that may brief brings what a prompt would bring as well: after the warning, in one text, with one memory for both", async (t) => {
+  const { h, alice, bob } = await aliceBuildsAuth(t);
+  await fire(bob, "session-start", 20);
+  await fire(bob, "prompt", 22, { prompt: "Add the login page" });
+  const asked = record(t);
+  // What an adapter hands over for an agent whose prompt hook cannot speak to the model (Cursor): its event after a
+  // tool call says that the session may be briefed there.
+  const auth = { brief: true, paths: [join(bob.dir, "src/auth.ts")] };
+  const readme = { brief: true, paths: [join(bob.dir, "README.md")] };
+  const SESSIONS = "Switch the JWT middleware to sessions";
+
+  // Nothing is new since the briefing a moment ago.
+  assert.deepEqual(await fire(bob, "post-edit", 25, readme), {});
+  assert.deepEqual(await fire(bob, "post-edit", 26, { brief: true }), {}, "a shell command names no files");
+
+  // Alice changes course, and bob's clone hears of it.
+  await fire(alice, "prompt", 30, { prompt: SESSIONS });
+  await publish(alice, 31);
+  await publish(bob, 32);
+  // An event that does not say so brings no update. On Claude Code and Codex that is for the prompt to bring.
+  assert.deepEqual(await fire(bob, "post-edit", 35, { paths: readme.paths }), {});
+  // One that does brings both: first what is in the way of this edit, then what changed in the team.
+  const warning = text(overlapHead("src/auth.ts"), `- alice / claude-code on main (${ago(30, 36)}) has it in flight: "${SESSIONS}".`, SAY_SO);
+  const update = text(DELTA_HEAD, `- alice / claude-code on main (${ago(30, 36)}): "${SESSIONS}". Files: src/auth.ts`, OVERLAP_HINT);
+  assert.deepEqual(await fire(bob, "post-edit", 36, auth), { context: text(warning, update) });
+  assert.deepEqual(
+    (await seenKeys(bob)).filter((key) => !key.startsWith("s:")),
+    ["briefed", "tasks", "w:src/auth.ts"],
+  );
+  // One memory: told is told, whichever event asks next.
+  assert.deepEqual(await fire(bob, "post-edit", 37, auth), {});
+  assert.deepEqual(await fire(bob, "prompt", 38, { prompt: "continue" }), {});
+  assert.deepEqual(await fire(bob, "pre-edit", 39, { paths: auth.paths }), {});
+  // And it is still a post-edit: each one kept the session alive and left its sync to the throttle.
+  assert.equal((await sessionOf(bob))?.seenAt, at(39));
+  const quiet = throttled(bob);
+  assert.deepEqual(asked.background, [quiet, quiet, forced(alice), quiet, quiet, quiet, quiet], "bob's five post-edits and his prompt; only alice's change of course was rushed out");
+  assert.deepEqual(asked.waited, []);
+
+  // A subagent's event is a sign of life whatever it says it may do, and uses up nothing.
+  await fire(alice, "session-end", 40);
+  await publish(alice, 41);
+  await publish(bob, 42);
+  assert.deepEqual(await fire(bob, "post-edit", 45, { ...auth, subagent: true }), {});
+  assert.deepEqual(await fire(bob, "post-edit", 46, auth), { context: text(DELTA_HEAD, "Left: alice / claude-code (main).") });
+  assert.deepEqual(await warnedPaths(bob), [], "nobody is on the file any more, so nothing is remembered about it");
+
+  // A session with no briefing to compare with (an agent that reports no session start, hooks installed while it
+  // was running) gets the full one, here in a clone that has never reached the remote. Being new, it is published
+  // at once.
+  const carol = await h.clone("carol");
+  assert.deepEqual(await fire(carol, "post-edit", 50, { brief: true }), { context: text(ALONE, NEVER_FETCHED) });
+  assert.deepEqual(asked.background.at(-1), forced(carol));
+  assert.deepEqual(await fire(carol, "post-edit", 51, { brief: true }), {});
+});
+
+test("a warning and an update in one text never pass 4000 characters: the update is cut down to the room the warning leaves, and waits when that is too little", async (t) => {
+  const { h, bob } = await team(t);
+  const carol = await h.clone("carol");
+  await fire(bob, "session-start", 0);
+  const big = { brief: true, paths: ["big.ts"] };
+  /** The two parts of a text that has a warning and then an update whose first line is `head`. */
+  const parts = (both: string, head: string): [string, string] => {
+    const cut = both.indexOf(`\n${head}\n`);
+    assert.ok(cut > 0, `no update after the warning: ${both.slice(-300)}`);
+    return [both.slice(0, cut), both.slice(cut + 1)];
+  };
+
+  // Twelve teammates on one file, new to the session each time: the warning that names them all takes most of the
+  // room. Shortening the last intents step by step lets what is left for the update grow from under 700 characters
+  // to over 1000, so that whatever a briefing drops to fit is dropped somewhere along the way.
+  for (const [round, tag] of ["a", "b", "c", "d", "e", "f", "g", "h"].entries()) {
+    await cacheTeam(bob, 10, crowd(12, ["big.ts"], tag, round * 50));
+    const both = (await fire(bob, "post-edit", 20 + round, big)).context ?? "";
+    assert.ok(both.length <= 4000, `${both.length} characters in round ${round}`);
+    const [warning] = parts(both, DELTA_HEAD);
+    assert.ok(warning.startsWith(overlapHead("big.ts")) && warning.endsWith(SAY_SO), "the warning comes first");
+    assert.equal(warning.split("\n").length, 14, "and is whole: all twelve are named");
+    assert.deepEqual(await fire(bob, "post-edit", 20 + round, big), {}, "both parts count as told");
+
+    // The same for a session with no briefing to compare with, in a clone whose team state is two minutes old: the
+    // full briefing and its note about that have to fit in as well.
+    const fresh = { ...big, sessionId: `s-fresh-${round}` };
+    await cacheTeam(carol, 10, crowd(12, ["big.ts"], tag, round * 50));
+    const first = (await fire(carol, "post-edit", 140 + round, fresh)).context ?? "";
+    assert.ok(first.length <= 4000, `${first.length} characters in round ${round}, for a session that was never briefed`);
+    const [, full] = parts(first, FULL_HEAD);
+    assert.ok(full.endsWith(staleNote("2m ago")), full.slice(-200));
+    await fire(carol, "session-end", 140 + round, fresh);
+  }
+
+  // Twenty on one file: the warning alone has to be cut, and leaves no room worth using. The update is not given, so
+  // it is not used up either: it comes with the next event that may brief.
+  await cacheTeam(bob, 10, crowd(20, ["vast.ts"], "z"));
+  const vast = { brief: true, paths: ["vast.ts"] };
+  const alone = (await fire(bob, "post-edit", 40, vast)).context ?? "";
+  assert.ok(alone.length > 3500 && alone.length <= 4000, `${alone.length} characters`);
+  assert.equal(alone.split("\n")[0], overlapHead("vast.ts"));
+  assert.equal(alone.split("\n").at(-1), CUT_NOTE);
+  assert.ok(!alone.includes(DELTA_HEAD), "there was no room for an update");
+  const late = (await fire(bob, "post-edit", 41, vast)).context ?? "";
+  assert.ok(late.startsWith(`${DELTA_HEAD}\n`) && late.length <= 4000, late.slice(0, 200));
+  assert.deepEqual(await fire(bob, "post-edit", 42, vast), {});
 });
 
 test("turn-end has the turn's work published at once, whatever the throttle says, and does not wait for it", async (t) => {
@@ -729,6 +875,34 @@ test("an agent that wanders out of the repository keeps its session alive there,
   assert.deepEqual(await fire(bob, "session-end", 50, { cwd: scratch }), {});
   assert.deepEqual(await sessionsOf(bob), []);
   assert.deepEqual(asked.background.at(-1), forced(bob));
+});
+
+test("an agent that is away sees the team from where its session is: another worktree's files are still someone else's", async (t) => {
+  const { h, alice } = await aliceBuildsAuth(t);
+  // A second agent of alice's. Its hooks are started in the project directory, and it works in a worktree of its own.
+  const worktree = await alice.addWorktree("wt");
+  const scratch = join(h.root, "scratch");
+  await mkdir(scratch);
+  await fire(alice, "session-start", 20, { sessionId: "s-second", cwd: worktree.dir });
+  assert.equal((await sessionOf(alice, "s-second"))?.worktree, worktree.dir);
+  const first = (now: number, files: string): string => `- alice / claude-code (same clone) on main (${ago(10, now)}): "${AUTH_PROMPT}". Files: ${files}`;
+
+  // The first agent goes on to another file. The second has wandered off to a scratch directory by then, and its
+  // events are handled in the checkout its hooks were started in. That is the first agent's worktree, and not its
+  // own: if it were taken for its own, the first agent's files would count as the second's and not be named.
+  const away = { sessionId: "s-second", cwd: scratch };
+  await alice.write("src/login.ts", "export const login = true;\n");
+  await publish(alice, 25);
+  assert.deepEqual(await fire(alice, "post-edit", 30, { ...away, brief: true }), { context: text(DELTA_HEAD, first(30, "src/auth.ts, src/login.ts"), OVERLAP_HINT) });
+  await alice.write("src/logout.ts", "export const logout = true;\n");
+  await publish(alice, 35);
+  assert.deepEqual(await fire(alice, "prompt", 40, { ...away, prompt: "Tidy up the scratch notes" }), {
+    context: text(DELTA_HEAD, first(40, "src/auth.ts, src/login.ts, src/logout.ts"), OVERLAP_HINT),
+  });
+  // And a file of the first agent's that it names in full from over there is in the first agent's flight.
+  const warned = await fire(alice, "pre-edit", 41, { ...away, paths: [join(alice.dir, "src/login.ts")] });
+  assert.equal(warned.context, text(overlapHead("src/login.ts"), `- alice / claude-code (same clone) on main (${ago(10, 41)}) has it in flight: "${AUTH_PROMPT}".`, SAY_SO));
+  assert.equal((await sessionOf(alice, "s-second"))?.worktree, worktree.dir, "being away moved nothing");
 });
 
 test("a worktree of the same clone on a branch from before huddle init still counts: the session moves there", async (t) => {
@@ -928,6 +1102,31 @@ test("damaged state files do not stop a hook: local.json, the cache, a seen file
   assert.match(await logOf(bob), /\[config\] .*merge conflict markers/);
 });
 
+test("an edit whose check for overlap fails loses the warning and nothing else: the session is kept alive, and its sync is started", async (t) => {
+  const { bob } = await aliceBuildsAuth(t);
+  await fire(bob, "session-start", 20);
+  const asked = record(t);
+  const edit = { paths: [join(bob.dir, "src/auth.ts")] };
+  const paths = await bob.paths();
+
+  // Something sits where the clone's id is kept, so nobody can say which of the sessions in the cache are this
+  // clone's own and which are teammates': there is no check. Keeping the session alive needs no id.
+  await rm(paths.actorFile);
+  await mkdir(join(paths.actorFile, "in the way"), { recursive: true });
+
+  assert.deepEqual(await fire(bob, "post-edit", 25, edit), {});
+  assert.equal((await sessionOf(bob))?.seenAt, at(25));
+  assert.deepEqual(asked.background, [throttled(bob)]);
+  assert.deepEqual(await fire(bob, "pre-edit", 26, edit), {});
+  assert.equal((await sessionOf(bob))?.seenAt, at(26));
+  assert.deepEqual(asked.background, [throttled(bob)], "a pre-edit of a session that is known starts no sync, checked or not");
+  const log = await logOf(bob);
+  assert.match(log, /\[hook\] post-edit: could not check for overlap/);
+  assert.match(log, /\[hook\] pre-edit: could not check for overlap/);
+  assert.doesNotMatch(log, /an event failed/);
+  assert.deepEqual(await warnedPaths(bob), [], "what was never said is not remembered as said");
+});
+
 test("a state directory that cannot be used costs the briefing, never the hook", async (t) => {
   const { alice } = await team(t);
   await writeFile((await alice.paths()).stateDir, "in the way\n");
@@ -988,6 +1187,8 @@ test("an event that cannot finish gives up at its deadline with nothing to say, 
   const { h, alice, bob } = await team(t);
   const carol = await h.clone("carol");
   const dave = await h.clone("dave");
+  const erin = await h.clone("erin");
+  const frank = await h.clone("frank");
   // None of these clones has an actor id yet. Minting one needs the identity lock, which is held here for all of them.
   const stuck = [
     { clone: alice, type: "session-start" as const, deadline: 4000, over: {} },
@@ -995,6 +1196,9 @@ test("an event that cannot finish gives up at its deadline with nothing to say, 
     { clone: carol, type: "pre-edit" as const, deadline: 150, over: { paths: ["a.ts"] } },
     // A pre-edit that names no session is a commit, which has longer.
     { clone: dave, type: "pre-edit" as const, deadline: 1500, over: { paths: ["a.ts"], ambient: true, agent: "git", sessionId: "" } },
+    { clone: erin, type: "post-edit" as const, deadline: 150, over: { paths: ["a.ts"] } },
+    // A post-edit that also briefs does a prompt's work, and has a prompt's time for it.
+    { clone: frank, type: "post-edit" as const, deadline: 300, over: { brief: true } },
   ];
   record(t, never);
   const releases = await Promise.all(stuck.map(({ clone }) => hold(clone, "identity")));
