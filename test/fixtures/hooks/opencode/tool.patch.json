@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "tool",
+  "session_id": "ses_5d2a91c0e3f4KQ8xT1mZb7RwYp",
+  "cwd": "/home/dev/acme",
+  "tool": "patch",
+  "input": {
+    "patchText": "*** Begin Patch\n*** Update File: src/auth/session.ts\n*** Move to: src/auth/sessions.ts\n@@ export function open() {\n-  return null;\n+  return load();\n*** Add File: src/auth/limits.ts\n+export const LIMIT = 5;\n+// *** Delete File: not/a/header.ts\n*** Delete File: src/auth/legacy.ts\n*** End Patch"
+  }
+}

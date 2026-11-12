@@ -3,9 +3,10 @@
 import { claudeCode } from "./claude-code.ts";
 import { codex } from "./codex.ts";
 import { gitHooks } from "./git-hooks.ts";
+import { opencode } from "./opencode.ts";
 import type { Adapter } from "./types.ts";
 
-export const ADAPTERS: readonly Adapter[] = [claudeCode, codex, gitHooks];
+export const ADAPTERS: readonly Adapter[] = [claudeCode, codex, opencode, gitHooks];
 
 export function getAdapter(name: string): Adapter | undefined {
   return ADAPTERS.find((adapter) => adapter.name === name);

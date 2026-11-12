@@ -1,0 +1,9 @@
+{
+  "hook_event_name": "tool",
+  "session_id": "ses_5d2a91c0e3f4KQ8xT1mZb7RwYp",
+  "cwd": "/home/dev/acme",
+  "tool": "apply_patch",
+  "input": {
+    "patchText": "*** Begin Patch\n*** Update File: /home/dev/acme/src/auth/jwt.ts\n@@\n-export const verify = false;\n+export const verify = true;\n*** Add File: docs/auth.md\n+# Auth\n*** End Patch"
+  }
+}
