@@ -96,11 +96,30 @@ function toJson(value: unknown): string {
 
 type Loaded = { kind: "missing" } | { kind: "corrupt" } | { kind: "ok"; value: unknown };
 
+/**
+ * readFile, retried a few times on Windows when the file is in use for a
+ * moment: a writer's rename, an indexer or a scanner can hold it with a
+ * sharing mode that makes a read fail with EBUSY, EPERM or EACCES. Readers
+ * never take a lock, so they meet this. About 150 ms at most, then the error.
+ */
+async function readFileRetrying(file: string): Promise<string> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await readFile(file, "utf8");
+    } catch (error) {
+      const code = errno(error);
+      const transient = WINDOWS && (code === "EPERM" || code === "EACCES" || code === "EBUSY");
+      if (!transient || attempt >= 5) throw error;
+      await sleep(10 * (attempt + 1));
+    }
+  }
+}
+
 /** Reads a JSON file. Throws only for errors other than "not there" and "not JSON". */
 async function loadJson(file: string): Promise<Loaded> {
   let text: string;
   try {
-    text = await readFile(file, "utf8");
+    text = await readFileRetrying(file);
   } catch (error) {
     if (errno(error) === "ENOENT") return { kind: "missing" };
     throw error;
@@ -625,6 +644,32 @@ export async function readCache(paths: RepoPaths): Promise<Cache> {
   } catch {
     return normalizeCache(undefined);
   }
+}
+
+/**
+ * Whether cache.json could be used, for callers that must not mistake a
+ * damaged cache for a clone that has simply never fetched:
+ * - "missing": there is no cache.json (nothing fetched yet in this clone);
+ * - "unreadable": cache.json exists but could not be read, is not JSON, or is
+ *   not a cache object (its `refs` is not an object);
+ * - "ok": it was read. Single entries may still have been dropped or carry
+ *   doc: null, exactly as readCache returns them.
+ * `cache` is what readCache returns in every case (empty unless "ok").
+ */
+export type CacheState = "ok" | "missing" | "unreadable";
+
+export async function readCacheStatus(paths: RepoPaths): Promise<{ cache: Cache; state: CacheState }> {
+  let loaded: Loaded;
+  try {
+    loaded = await loadJson(paths.cacheFile);
+  } catch {
+    return { cache: normalizeCache(undefined), state: "unreadable" };
+  }
+  if (loaded.kind === "missing") return { cache: normalizeCache(undefined), state: "missing" };
+  if (loaded.kind === "corrupt" || !isRecord(loaded.value) || !isRecord(loaded.value.refs)) {
+    return { cache: normalizeCache(undefined), state: "unreadable" };
+  }
+  return { cache: normalizeCache(loaded.value), state: "ok" };
 }
 
 /** Atomic. The caller (sync) holds sync.lock. */
