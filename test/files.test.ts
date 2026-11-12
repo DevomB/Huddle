@@ -1,10 +1,11 @@
 // T1.4: src/core/files.ts against real repositories.
 
 import assert from "node:assert/strict";
+import { realpathSync } from "node:fs";
 import { mkdir, rm, symlink } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
-import { currentBranch, DETACHED, filesInFlight, resolveBase, toRepoPath, toRepoPattern } from "../src/core/files.ts";
+import { currentBranch, DETACHED, filesInFlight, resolveBase, resolveExisting, toRepoPath, toRepoPattern } from "../src/core/files.ts";
 import { DEFAULT_CONFIG } from "../src/core/types.ts";
 import { createHarness } from "./harness.ts";
 
@@ -262,12 +263,13 @@ test("toRepoPath answers at once for a path no file system would take", async (t
   assert.ok(refused.ms < 1000, `took ${Math.round(refused.ms)} ms`);
 
   // As long as a path can be, thousands of directories that do not exist, reached through a symlink
-  // and from outside: both ask the file system, and give up on the missing tail after a bounded number of looks.
+  // and from outside: both ask the file system, a handful of times however long the missing tail is
+  // (the count is pinned in the next test; the clock here only catches a return to seconds).
   const tail = Array.from({ length: 10_000 }, () => "d");
   const through = timed(() => toRepoPath(paths, clone.dir, join(link, ...tail, "f.ts")));
   const outside = timed(() => toRepoPath(paths, clone.dir, join(h.root, "elsewhere", ...tail, "f.ts")));
   assert.equal(outside.value, null);
-  assert.equal(through.value, null, "past the bound the path is taken as given, and as given it is not in the worktree");
+  assert.equal(through.value, [...tail, "f.ts"].join("/"), "the symlink is resolved however deep the new file is");
   for (const { ms } of [through, outside]) assert.ok(ms < 1000, `took ${Math.round(ms)} ms`);
 
   // Inside the worktree as given, the file system is not asked at all; a deep new file is still found through a symlink.
@@ -276,6 +278,52 @@ test("toRepoPath answers at once for a path no file system would take", async (t
   assert.ok(deepInside.ms < 1000, `took ${Math.round(deepInside.ms)} ms`);
   const fewMissing = Array.from({ length: 40 }, (_, i) => `new${i}`);
   assert.equal(toRepoPath(paths, clone.dir, join(link, ...fewMissing, "f.ts")), [...fewMissing, "f.ts"].join("/"));
+});
+
+test("resolveExisting finds the existing part of a path in a handful of looks, whatever its length", async (t) => {
+  // It runs before an edit, inside a hook's 150 ms, and each look is synchronous. One look per
+  // missing directory took 0.2 s for the longest path there is; the number of looks is what is pinned
+  // here, because a clock in a test says more about the machine than about the code.
+  const h = await createHarness(t);
+  const clone = await h.clone("alice");
+  await mkdir(join(clone.dir, "src", "deep"), { recursive: true });
+  const link = join(h.root, "link-to-alice");
+  await symlink(clone.dir, link);
+  const counted = (path: string): { value: string; looks: number } => {
+    let looks = 0;
+    const value = resolveExisting(path, (prefix) => {
+      looks++;
+      return realpathSync(prefix);
+    });
+    return { value, looks };
+  };
+
+  // The longest path taken (32,767 characters) of one-letter directories, through the symlink.
+  const letters = Array.from({ length: 16_000 }, () => "d");
+  const longest = counted(join(link, ...letters, "f.ts"));
+  assert.equal(longest.value, join(clone.dir, ...letters, "f.ts"));
+  assert.ok(longest.looks <= 20, `${longest.looks} looks`);
+
+  // Every place the existing part can end, counted from the symlink: nothing below it, one directory, two, the file itself.
+  assert.deepEqual(counted(join(link, "new.ts")).value, join(clone.dir, "new.ts"));
+  assert.deepEqual(counted(join(link, "src", "new.ts")).value, join(clone.dir, "src", "new.ts"));
+  assert.deepEqual(counted(join(link, "src", "deep", "a", "b", "c", "new.ts")).value, join(clone.dir, "src", "deep", "a", "b", "c", "new.ts"));
+  assert.deepEqual(counted(join(link, "README.md")), { value: join(clone.dir, "README.md"), looks: 1 }, "a path that exists is one look");
+  for (let missing = 1; missing <= 70; missing++) {
+    const extra = Array.from({ length: missing }, (_, i) => `n${i}`);
+    assert.equal(counted(join(link, "src", ...extra)).value, join(clone.dir, "src", ...extra), `${missing} missing`);
+  }
+
+  // A file where a directory is expected, and a symlink that points nowhere: resolved up to there, the rest as given.
+  assert.equal(counted(join(link, "README.md", "x", "y")).value, join(clone.dir, "README.md", "x", "y"));
+  await symlink(join(h.root, "nowhere"), join(clone.dir, "dangling"));
+  assert.equal(counted(join(link, "dangling", "x")).value, join(clone.dir, "dangling", "x"));
+
+  // Nothing resolves, not even the root: the path comes back as it was given.
+  const never = (): string => {
+    throw new Error("no file system");
+  };
+  assert.equal(resolveExisting(join(link, "a", "b"), never), join(link, "a", "b"));
 });
 
 test("toRepoPattern resolves claim globs from where they were typed", async (t) => {

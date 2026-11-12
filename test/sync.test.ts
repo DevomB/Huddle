@@ -9,7 +9,7 @@ import { test } from "node:test";
 import { openContext } from "../src/core/context.ts";
 import type { Io } from "../src/core/io.ts";
 import { withLock } from "../src/core/store.ts";
-import { contentHash, deferredSyncDue, foreignSessions, shouldPublish, spawnBackgroundSync, syncWithin } from "../src/core/sync.ts";
+import { contentHash, deferredSyncDue, deferSync, foreignSessions, shouldPublish, spawnBackgroundSync, syncWithin } from "../src/core/sync.ts";
 import { DEFAULT_CONFIG } from "../src/core/types.ts";
 import type { ActorDoc, Cache, LocalState, Session } from "../src/core/types.ts";
 import { BUNDLE, createHarness } from "./harness.ts";
@@ -1082,4 +1082,104 @@ test("a deferred sync that died is replaced; one that may still be alive is not"
   await until("the deferred sync to publish", async () => (await remoteRefs(h)) !== second);
   await until("the deferred sync to finish", () => settled(alice));
   assert.equal((await actorDocs(h))[0]!.sessions[0]!.intent, "three");
+});
+
+test("a deferred sync is the clone's: it runs although the worktree it was started in was removed while it waited", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  await ok(alice, ["intent", "one"], at(0));
+  await ok(alice, ["sync"], at(0));
+  const first = await remoteRefs(h);
+
+  // An event in a linked worktree falls inside the interval and starts the process that waits.
+  const linked = await alice.addWorktree("linked");
+  await ok(linked, ["sync", "--background"], at(12), LIVE);
+  const one = await waiting(alice);
+  assert.ok(one, "the skipped sync left nothing behind to make up for it");
+
+  // An event in the main checkout finds it waiting and leaves its own sync to it.
+  await ok(alice, ["intent", "two"], at(12));
+  await ok(alice, ["sync", "--background"], at(12), LIVE);
+  assert.equal((await waiting(alice))?.token, one.token);
+  assert.equal(await remoteRefs(h), first);
+
+  // The linked worktree is removed before the interval is over (an agent's worktree, cleaned up when it is done).
+  await alice.git("worktree", "remove", "--force", linked.dir);
+  assert.equal(existsSync(linked.dir), false);
+
+  await until("the deferred sync to publish", async () => (await remoteRefs(h)) !== first);
+  await until("the deferred sync to finish", () => settled(alice));
+  assert.equal((await actorDocs(h))[0]!.sessions[0]!.intent, "two");
+  assert.doesNotMatch(await readFile((await alice.paths()).logFile, "utf8").catch(() => ""), /deferred sync/, "the deferred sync logged a failure");
+});
+
+test("a deferred sync that cannot be started leaves no claim behind to hold the next one off", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  const paths = await alice.paths();
+  const now = new Date();
+  await ok(alice, ["intent", "x"], now.toISOString());
+  await ok(alice, ["sync"], now.toISOString());
+  const before = await remoteRefs(h);
+  await ok(alice, ["intent", "y"], now.toISOString());
+  const settings = { ...DEFAULT_CONFIG, syncIntervalSeconds: 3 };
+  const later = new Date(now.getTime() + 1000);
+
+  const saved = process.env.HUDDLE_NO_BACKGROUND;
+  delete process.env.HUDDLE_NO_BACKGROUND;
+  try {
+    // No process can be started with this script path: spawn throws before there is a child to hear an error from.
+    deferSync(paths, "no\0such/huddle.mjs", settings, later);
+    assert.equal(await waiting(alice), null, "the claim of a deferred sync that was never started is still there");
+    assert.match(await readFile(paths.logFile, "utf8"), /could not defer a background sync/);
+
+    // So the next skipped sync is deferred at once, and not after the grace time of a process that never was.
+    deferSync(paths, BUNDLE, settings, later);
+    assert.ok(await waiting(alice), "the next deferred sync was held off");
+    await until("the deferred sync to publish", async () => (await remoteRefs(h)) !== before);
+    assert.equal((await actorDocs(h))[0]!.sessions[0]!.intent, "y");
+  } finally {
+    process.env.HUDDLE_NO_BACKGROUND = saved;
+    await until("the deferred sync to finish", () => settled(alice));
+  }
+});
+
+test("a command in a worktree whose branch has no .huddle goes by the settings of a set-up checkout of the clone", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  // The team syncs with `team`. `origin` is something else: a personal fork, say.
+  const fork = join(h.root, "fork.git");
+  await alice.git("init", "--quiet", "--bare", "--initial-branch=main", fork);
+  await alice.git("remote", "rename", "origin", "team");
+  await alice.git("remote", "add", "origin", fork);
+  await alice.git("push", "--quiet", "origin", "main");
+  const onFork = () => alice.git("ls-remote", fork, "refs/huddle/*");
+  const old = await alice.addWorktree("old"); // a branch from before `huddle init`
+  await alice.write(".huddle/config.json", `${JSON.stringify({ remote: "team" })}\n`);
+  await alice.commit("huddle init");
+  assert.equal(existsSync(join(old.dir, ".huddle")), false);
+
+  // On the defaults this session would be pushed to origin, where the team does not look and someone else might.
+  await ok(old, ["intent", "work on the old branch"], at(0));
+  const synced = await ok(old, ["sync"], at(0));
+  assert.match(synced.stdout, /^synced with team: /);
+  assert.equal(await onFork(), "");
+  assert.deepEqual(
+    (await actorDocs(h)).map((doc) => doc.sessions.map((session) => [session.branch, session.intent])),
+    [[["old", "work on the old branch"]]],
+  );
+
+  // The same for the sync a hook leaves to a detached process, and for the one that makes up for a skipped one.
+  await ok(old, ["intent", "still on the old branch"], at(12));
+  const before = await remoteRefs(h);
+  await ok(old, ["sync", "--background"], at(12), LIVE);
+  assert.ok(await waiting(alice));
+  await until("the deferred sync to publish", async () => (await remoteRefs(h)) !== before);
+  await until("the deferred sync to finish", () => settled(alice));
+  assert.equal(await onFork(), "");
+  assert.equal((await actorDocs(h))[0]!.sessions[0]!.intent, "still on the old branch");
+
+  // In a clone nobody ran init in, a command works on the defaults, as before.
+  const bob = await h.clone("bob");
+  assert.match((await ok(bob, ["sync"], at(20))).stdout, /^synced with origin: /);
 });

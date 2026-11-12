@@ -7,7 +7,8 @@ import { currentBranch } from "../core/files.ts";
 import { EXIT, UsageError } from "../core/io.ts";
 import type { Io } from "../core/io.ts";
 import { log } from "../core/log.ts";
-import { locateRepo } from "../core/paths.ts";
+import { listCheckouts, locateRepo, sameDirectory } from "../core/paths.ts";
+import type { RepoPaths } from "../core/paths.ts";
 import { currentView, resolveSession } from "../core/session.ts";
 import { touchSession } from "../core/store.ts";
 import { deferredSyncDue, deferSync, releaseDeferredSync, sync } from "../core/sync.ts";
@@ -91,16 +92,24 @@ async function deferred(io: Io, token: string): Promise<number> {
   try {
     // While it waits, this process must not sit in the worktree: on Windows a
     // directory that is some process's working directory cannot be renamed or removed.
-    const home = process.cwd();
     try {
       process.chdir(tmpdir());
     } catch {
       // Then it waits where it is.
     }
     if (!(await deferredSyncDue(paths, token))) return EXIT.OK;
-    process.chdir(home); // throws when the worktree is gone: nothing left to sync
+    const from = await checkoutToSyncFrom(paths, io.cwd);
+    if (from === null) {
+      log(paths, "sync", "deferred sync: no checkout of this clone is left to sync from");
+      return EXIT.OK;
+    }
+    try {
+      process.chdir(from);
+    } catch {
+      // Nothing below depends on it: every git call is given its directory.
+    }
     // Opened after the wait: the round works with the clock and the settings as they are now.
-    const ctx = await openContext(io);
+    const ctx = await openContext({ ...io, cwd: from });
     const result = await sync(ctx, { force: true });
     if (result.error) log(ctx.paths, "sync", `deferred sync: ${result.error}`);
     else if (!result.ran) log(ctx.paths, "sync", "deferred sync: another sync held the lock for too long");
@@ -110,4 +119,17 @@ async function deferred(io: Io, token: string): Promise<number> {
     releaseDeferredSync(paths, token);
   }
   return EXIT.OK;
+}
+
+/**
+ * Where a deferred sync runs once its wait is over. The sync is the clone's,
+ * not the checkout's that happened to start it: events in every worktree of
+ * the clone found it waiting and left their own sync to it. So when the
+ * worktree it was started in has been removed in the meantime, it runs in
+ * another checkout of the clone. Null only when none is left.
+ */
+async function checkoutToSyncFrom(paths: RepoPaths, startedIn: string): Promise<string | null> {
+  const still = await locateRepo(startedIn).catch(() => null);
+  if (still !== null && (await sameDirectory(still.commonDir, paths.commonDir))) return startedIn;
+  return (await listCheckouts(paths))[0]?.worktree ?? null;
 }

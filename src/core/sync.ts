@@ -466,15 +466,19 @@ function claimPending(paths: RepoPaths, pending: Pending): boolean {
  * lock). Never throws. Does nothing when HUDDLE_NO_BACKGROUND=1 (tests).
  */
 export function deferSync(paths: RepoPaths, self: string, config: Config, now: Date = new Date()): void {
+  if (backgroundDisabled() || !self) return;
+  const token = randomBytes(8).toString("hex");
+  let claimed = false;
   try {
-    if (backgroundDisabled() || !self) return;
-    const token = randomBytes(8).toString("hex");
     const wait = Math.min(throttleLeftMs(readStamp(paths), config, now), PENDING_MAX_WAIT_MS);
-    if (!claimPending(paths, { token, dueAt: Date.now() + wait })) return;
+    claimed = claimPending(paths, { token, dueAt: Date.now() + wait });
+    if (!claimed) return;
     const child = startDetached(paths, self, ["--deferred", token]);
     child.on("error", () => clearPending(paths, token));
     child.unref();
   } catch (error) {
+    // A claim with no process behind it would hold every later one off until its grace time is over.
+    if (claimed) clearPending(paths, token);
     log(paths, "sync", "could not defer a background sync", error);
   }
 }
