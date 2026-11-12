@@ -118,7 +118,7 @@ test("teammate text cannot forge briefing lines: newlines, control and bidi char
   for (const ch of ["\n", "\r", BEL, RLO, ZWSP, LSEP]) assert.equal(JSON.stringify(doc).includes(JSON.stringify(ch).slice(1, -1)) || JSON.stringify(doc).includes(ch), false);
 });
 
-test("lengths are capped: intent at 200 characters, files at 200 entries", () => {
+test("lengths are capped: intent at 200 characters, files at 200 entries, and what is cut stays covered", () => {
   const doc = normalizeDoc(
     actorDoc({
       sessions: [
@@ -134,8 +134,10 @@ test("lengths are capped: intent at 200 characters, files at 200 entries", () =>
   assert.equal(Array.from(s.intent).length, LIMITS.intent);
   assert.ok(s.intent.endsWith(ELLIPSIS));
   assert.equal(s.files.length, LIMITS.files);
-  assert.equal(s.claims.length, LIMITS.claims);
   assert.equal(s.files[0], "src/file0.ts");
+  // 300 files cut and 500 claims, more than LIMITS.claims: nothing may vanish, so one glob covers it all.
+  assert.deepEqual(s.claims, ["**"]);
+  assert.deepEqual(s.partial, { total: 500, cover: ["**"] });
 });
 
 test("truncation never splits a surrogate pair", () => {
@@ -268,8 +270,10 @@ test("text a reader cannot see does not get through: tag characters, variation s
   const parsed = parseDoc(planted, actorRef("abcd2345")) as ActorDoc;
   assert.equal(parsed.user, "alice");
   assert.equal(parsed.sessions[0]!.intent, "fix typo");
-  assert.deepEqual(parsed.sessions[0]!.files, ["src/a.ts"]);
-  assert.deepEqual(parsed.sessions[0]!.claims, ["docs/**"]);
+  // A path cleaning would change is not that file any more: it is covered instead, never rewritten into another name.
+  assert.deepEqual(parsed.sessions[0]!.files, []);
+  assert.deepEqual(parsed.sessions[0]!.claims, ["docs/**", "src/**"]);
+  assert.deepEqual(parsed.sessions[0]!.partial, { total: 1, cover: ["src/**"] });
   for (const ch of JSON.stringify(parsed)) {
     const codePoint = ch.codePointAt(0)!;
     assert.ok(!UNSAFE_RANGES.some(([from, to]) => codePoint >= from && codePoint <= to), `U+${codePoint.toString(16)} survived parseDoc`);

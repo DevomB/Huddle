@@ -7,8 +7,8 @@ import { stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { ageMs } from "./clock.ts";
 import type { Ctx } from "./context.ts";
-import { normalizeDoc } from "./docs.ts";
-import { currentBranch, filesInFlight } from "./files.ts";
+import { normalizeDoc, wireSession } from "./docs.ts";
+import { currentBranch, workInFlight } from "./files.ts";
 import { log } from "./log.ts";
 import { ensureStateDir } from "./paths.ts";
 import type { RepoPaths } from "./paths.ts";
@@ -16,7 +16,7 @@ import { toActorDoc } from "./session.ts";
 import { readCache, readLocal, removeSeen, updateLocal, withLock, writeCache } from "./store.ts";
 import type { LockResult } from "./store.ts";
 import { actorRef } from "./types.ts";
-import type { ActorDoc, CacheEntry, Config, Doc, FailReason, LocalState, PublishResult } from "./types.ts";
+import type { ActorDoc, CacheEntry, Config, Doc, FailReason, LocalState, PublishResult, SessionPartial } from "./types.ts";
 
 export interface SyncOptions {
   /** Ignore syncIntervalSeconds, and wait for a sync that is already running instead of skipping. */
@@ -126,7 +126,7 @@ async function round(ctx: Ctx): Promise<SyncResult> {
   const cache = await readCache(paths);
   const ownRef = actorRef(identity.actor);
 
-  const doc = toActorDoc(identity, state.sessions, now, config.ttlMinutes);
+  const doc = publishable(toActorDoc(identity, state.sessions, now, config.ttlMinutes), state);
   const hash = contentHash(doc);
   const known = new Map(Object.entries(cache.refs).map(([ref, entry]) => [ref, entry.sha]));
 
@@ -198,6 +198,24 @@ async function round(ctx: Ctx): Promise<SyncResult> {
 }
 
 /**
+ * The document to publish: each session in its published form (wireSession),
+ * with the coverage local state keeps for the files that did not fit. Covers
+ * a toActorDoc that does not carry `partial` over itself; wireSession is
+ * idempotent, so one that does is unchanged.
+ */
+export function publishable(doc: ActorDoc, state: LocalState): ActorDoc {
+  const partials = new Map<string, SessionPartial>();
+  for (const session of state.sessions) if (session.partial) partials.set(session.id, session.partial);
+  return {
+    ...doc,
+    sessions: doc.sessions.map((session) => {
+      const partial = session.partial ?? partials.get(session.id);
+      return wireSession(partial ? { ...session, partial } : session);
+    }),
+  };
+}
+
+/**
  * Evidence that another clone writes this clone's ref: the live sessions in
  * `remote`, the doc found there, that this clone does not have. Empty when the
  * doc is one this clone pushed (`ownHashes`: recorded, attempted, or being
@@ -230,7 +248,7 @@ async function refreshSessions(ctx: Ctx): Promise<LocalState> {
   const before = await readLocal(paths);
   // Sessions that share a worktree share its branch and files: inspect each worktree once.
   const worktrees = [...new Set(before.sessions.filter((session) => live(session.seenAt)).map((session) => session.worktree))];
-  const inspected = new Map<string, { branch: string; files: string[] }>();
+  const inspected = new Map<string, { branch: string; files: string[]; partial: SessionPartial | null }>();
   await Promise.all(
     worktrees.map(async (worktree) => {
       const found = await inspectWorktree(worktree, config);
@@ -251,6 +269,9 @@ async function refreshSessions(ctx: Ctx): Promise<LocalState> {
       if (found) {
         session.branch = found.branch;
         session.files = found.files;
+        // What did not fit in `files`, as generated coverage. Kept apart from the user's own claims.
+        if (found.partial) session.partial = found.partial;
+        else delete session.partial;
       }
     }
   });
@@ -259,14 +280,17 @@ async function refreshSessions(ctx: Ctx): Promise<LocalState> {
 }
 
 /** Null when the worktree is gone; its sessions then keep what they last reported until the TTL drops them. */
-async function inspectWorktree(worktree: string, config: Config): Promise<{ branch: string; files: string[] } | null> {
+async function inspectWorktree(
+  worktree: string,
+  config: Config,
+): Promise<{ branch: string; files: string[]; partial: SessionPartial | null } | null> {
   try {
     if (!(await stat(worktree)).isDirectory()) return null;
   } catch {
     return null;
   }
-  const [branch, files] = await Promise.all([currentBranch(worktree), filesInFlight(worktree, config)]);
-  return { branch, files };
+  const [branch, work] = await Promise.all([currentBranch(worktree), workInFlight(worktree, config)]);
+  return { branch, files: work.files, partial: work.partial };
 }
 
 /**
@@ -298,6 +322,7 @@ export function contentHash(doc: ActorDoc): string {
         [...session.files].sort(),
         [...session.claims].sort(),
         session.startedAt,
+        session.partial ? [session.partial.total, [...session.partial.cover].sort()] : null,
       ])
       .sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
   ];

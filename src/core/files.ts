@@ -4,10 +4,10 @@
 
 import { realpathSync } from "node:fs";
 import { isAbsolute, parse, relative, resolve, sep } from "node:path";
-import { LIMITS } from "./docs.ts";
+import { cutFiles } from "./docs.ts";
 import { git } from "./git.ts";
 import type { RepoPaths } from "./paths.ts";
-import type { Config } from "./types.ts";
+import type { Config, SessionPartial } from "./types.ts";
 
 export const DETACHED = "(detached)";
 
@@ -38,23 +38,37 @@ export async function resolveBase(worktree: string, config: Config): Promise<str
   return candidates.find((candidate) => existing.has(candidate)) ?? null;
 }
 
+/** What a worktree has in flight. */
+export interface WorkInFlight {
+  /** Every file in flight: dirty files first, then files changed in commits, each group sorted. Not capped. */
+  all: string[];
+  /** What a session records and publishes exactly: at most LIMITS.files of `all`, each one exact on the wire. */
+  files: string[];
+  /** Null when `files` is all of it; otherwise the count and the generated globs that cover the rest. */
+  partial: SessionPartial | null;
+}
+
 /**
- * Repo-relative paths, at most 200: dirty files (staged, unstaged, deleted,
- * untracked and not ignored) first, then files changed in commits since the
- * merge-base with the base branch (without a base: in commits not pushed to
- * the remote, see unpushedFiles). Each group is sorted, so the list is stable
- * between calls. On any git failure the affected group is simply missing.
+ * Repo-relative paths: dirty files (staged, unstaged, deleted, untracked and
+ * not ignored) first, then files changed in commits since the merge-base with
+ * the base branch (without a base: in commits not pushed to the remote, see
+ * unpushedFiles). Each group is sorted, so the list is stable between calls.
+ * On any git failure the affected group is simply missing.
+ *
+ * Nothing is dropped: past LIMITS.files, or for a path the wire cannot carry
+ * exactly, `partial` holds coverage globs for the rest (see cutFiles).
  */
-export async function filesInFlight(worktree: string, config: Config): Promise<string[]> {
+export async function workInFlight(worktree: string, config: Config): Promise<WorkInFlight> {
   const [dirty, committed] = await Promise.all([dirtyFiles(worktree), committedFiles(worktree, config)]);
-  const files = new Set<string>();
-  for (const group of [dirty, committed]) {
-    for (const file of [...group].sort()) {
-      if (files.size >= LIMITS.files) return [...files];
-      files.add(file);
-    }
-  }
-  return [...files];
+  const all = new Set<string>();
+  for (const group of [dirty, committed]) for (const file of [...group].sort()) all.add(file);
+  const list = [...all];
+  return { all: list, ...cutFiles(list) };
+}
+
+/** The exact part of workInFlight: at most LIMITS.files paths. What is cut is in workInFlight's `partial`. */
+export async function filesInFlight(worktree: string, config: Config): Promise<string[]> {
+  return (await workInFlight(worktree, config)).files;
 }
 
 async function dirtyFiles(worktree: string): Promise<string[]> {
