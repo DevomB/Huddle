@@ -897,23 +897,84 @@ test("through the bundle: each event gets its work done in less than its budget 
   }
 });
 
+/**
+ * Stands in for a git that waits: on a dead network file system, on a lock, on a credential helper. Like git, it has
+ * a child in its process group (git's would be ssh), and like git it does something when it is asked to stop with
+ * SIGTERM (git removes its lock files). It notes each of those steps.
+ */
+const HANGING_GIT = [
+  "#!/bin/sh",
+  'echo "start $$" >> "$HUDDLE_TEST_PIDS"',
+  `trap 'echo "stopped $$" >> "$HUDDLE_TEST_PIDS"; exit 143' TERM`,
+  "sleep 20 &",
+  'echo "child $! $$" >> "$HUDDLE_TEST_PIDS"',
+  "wait",
+  "",
+].join("\n");
+
+/** Has the process ended? A zombie has: what is left of it is an exit status that nobody has read yet. */
+async function ended(pid: string): Promise<boolean> {
+  try {
+    process.kill(Number(pid), 0);
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ESRCH";
+  }
+  const stat = await readFile(`/proc/${pid}/stat`, "utf8").catch(() => "");
+  return stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z");
+}
+
+/** HANGING_GIT in `root`: what a hook's environment needs to run it as git, and what the stand-ins noted. */
+async function hangingGit(root: string) {
+  const bin = join(root, "bin");
+  const notes = join(root, "git.pids");
+  await mkdir(bin);
+  await writeFile(join(bin, "git"), HANGING_GIT);
+  await chmod(join(bin, "git"), 0o755);
+  const lines = async (): Promise<string[]> => (await readFile(notes, "utf8").catch(() => "")).split("\n").filter(Boolean);
+  return {
+    env: { PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`, HUDDLE_TEST_PIDS: notes, ...ON_THE_CLOCK },
+    lines,
+    /** How many times git was started. */
+    starts: async (): Promise<number> => (await lines()).filter((line) => line.startsWith("start ")).length,
+    /** Each stand-in that got as far as starting its child, which it does once it would note a SIGTERM: [stand-in, child]. */
+    pairs: async (): Promise<Array<[string, string]>> =>
+      (await lines()).filter((line) => line.startsWith("child ")).map((line): [string, string] => [line.split(" ")[2] ?? "", line.split(" ")[1] ?? ""]),
+    /** For a test that fails before the hooks have ended them. */
+    killAll: async (): Promise<void> => {
+      for (const pid of (await lines()).flatMap((line) => line.split(" ").slice(1))) {
+        try {
+          process.kill(Number(pid), "SIGKILL");
+        } catch {
+          // Gone already.
+        }
+      }
+    },
+  };
+}
+
+/**
+ * Every stand-in that got as far as starting its child was asked to stop with SIGTERM, and it and its child have
+ * ended: the hook signalled the process group. Returns how many there were.
+ */
+async function noGitLeft(git: Awaited<ReturnType<typeof hangingGit>>): Promise<number> {
+  const pairs = await git.pairs();
+  for (const [standIn, child] of pairs) {
+    await until(`stand-in ${standIn} and its child ${child} to end`, async () => (await ended(standIn)) && (await ended(child)), 10_000);
+    assert.ok((await git.lines()).includes(`stopped ${standIn}`), `stand-in ${standIn} ended without a SIGTERM`);
+  }
+  return pairs.length;
+}
+
 test(
-  "through the bundle: when git itself hangs, every event gives up at its deadline, exits 0 and says nothing",
+  "through the bundle: when git itself hangs, every event gives up at its deadline, exits 0, says nothing and leaves no git behind",
   { skip: process.platform === "win32" ? "needs a shell script to stand in for git" : false },
   async (t) => {
     const { h, bob } = await team(t);
-    const bin = join(h.root, "bin");
-    const pids = join(h.root, "git.pids");
-    await mkdir(bin);
-    // Stands in for a git that waits: on a dead network file system, on a lock, on a credential helper.
-    await writeFile(join(bin, "git"), '#!/bin/sh\necho "$$" >> "$HUDDLE_TEST_PIDS"\nexec sleep 20\n');
-    await chmod(join(bin, "git"), 0o755);
-    const env = { PATH: `${bin}${delimiter}${process.env.PATH ?? ""}`, HUDDLE_TEST_PIDS: pids, ...ON_THE_CLOCK };
-    const started = async (): Promise<string[]> => (await readFile(pids, "utf8").catch(() => "")).split("\n").filter(Boolean);
+    const git = await hangingGit(h.root);
 
     try {
       const runs = await Promise.all(
-        SIX_OF_CLAUDE.map(([, name]) => timed(() => bob.huddle(["hook", "claude-code"], { stdin: recorded("claude-code", name, bob), env, now: at(0) }))),
+        SIX_OF_CLAUDE.map(([, name]) => timed(() => bob.huddle(["hook", "claude-code"], { stdin: recorded("claude-code", name, bob), env: git.env, now: at(0) }))),
       );
       for (const [index, [type]] of SIX_OF_CLAUDE.entries()) {
         const run = runs[index]!;
@@ -923,17 +984,46 @@ test(
         assert.ok(run.ms >= deadline && run.ms < deadline + 2500, `${type} came back after ${Math.round(run.ms)} ms; its deadline is ${deadline} ms`);
       }
       // It was the stand-in that ran, for each event, and nothing got as far as writing anything.
-      assert.ok((await started()).length >= SIX_OF_CLAUDE.length, `the stand-in for git ran ${(await started()).length} times`);
+      assert.ok((await git.starts()) >= SIX_OF_CLAUDE.length, `the stand-in for git ran ${await git.starts()} times`);
       assert.equal(existsSync(join(bob.dir, ".git", "huddle")), false);
+      // Its time limit was a timer in the hook, and the hook is gone: on its way out it ended every git it had started.
+      assert.ok((await noGitLeft(git)) >= 1, "no stand-in got as far as starting its child");
     } finally {
-      // Nobody is left to end them: the hook that started each one exited at its deadline.
-      for (const pid of await started()) {
-        try {
-          process.kill(Number(pid), "SIGKILL");
-        } catch {
-          // Gone already.
-        }
+      await git.killAll();
+    }
+  },
+);
+
+test(
+  "through the bundle: a hook that a signal stops ends the gits it started, and exits 0",
+  { skip: process.platform === "win32" ? "needs a shell script to stand in for git, and signals" : false },
+  async (t) => {
+    const { bob, h } = await team(t);
+    const git = await hangingGit(h.root);
+
+    try {
+      // What an agent sends a hook that runs over its own time limit, and what a terminal sends on Ctrl-C or when it closes.
+      for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
+        const before = (await git.pairs()).length;
+        const hook = spawn(BUNDLE_NODE, [BUNDLE, "hook", "claude-code"], {
+          cwd: bob.dir,
+          env: { ...process.env, ...git.env, HUDDLE_NOW: at(0) },
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+        const output: string[] = [];
+        hook.stdout.on("data", (chunk: Buffer) => output.push(chunk.toString()));
+        hook.stderr.on("data", (chunk: Buffer) => output.push(chunk.toString()));
+        const exited = new Promise<[number | null, NodeJS.Signals | null]>((resolve) => hook.once("close", (code, by) => resolve([code, by])));
+        hook.stdin.end(recorded("claude-code", "session-start.startup", bob));
+
+        // The start has 4 s for its work, and the git it waits for never answers: it is waiting when the signal comes.
+        await until(`the git of the hook that gets ${signal} to start`, async () => (await git.pairs()).length > before);
+        hook.kill(signal);
+        assert.deepEqual([await exited, output.join("")], [[0, null], ""], signal);
       }
+      assert.ok((await noGitLeft(git)) >= 3);
+    } finally {
+      await git.killAll();
     }
   },
 );
