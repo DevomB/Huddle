@@ -78,10 +78,11 @@ const EXPECTED: Record<string, Omit<HookEvent, "native"> | null> = {
   "before-tool.write-file": { type: "pre-edit", ...base, paths: ["/home/dev/acme/src/auth/jwt.ts"] },
   "before-tool.replace": { type: "pre-edit", ...base, paths: ["/home/dev/acme/src/auth/session.ts"] },
   "before-tool.run-shell-command": null,
-  // After an edit: asked for again, at the first moment Gemini CLI lets a hook say something to the model.
-  "after-tool.write-file": { type: "pre-edit", ...base, paths: ["/home/dev/acme/src/auth/jwt.ts"] },
-  "after-tool.replace": { type: "pre-edit", ...base, paths: ["/home/dev/acme/src/auth/session.ts"] },
-  "after-tool.replace.failed": { type: "pre-edit", ...base, paths: ["/home/dev/acme/src/auth/session.ts"] },
+  // After an edit: a post-edit that names the file. The engine gives the warning there if the session has not had it:
+  // the first moment Gemini CLI lets a hook say something to the model.
+  "after-tool.write-file": { type: "post-edit", ...base, paths: ["/home/dev/acme/src/auth/jwt.ts"] },
+  "after-tool.replace": { type: "post-edit", ...base, paths: ["/home/dev/acme/src/auth/session.ts"] },
+  "after-tool.replace.failed": { type: "post-edit", ...base, paths: ["/home/dev/acme/src/auth/session.ts"] },
   "after-tool.run-shell-command": { type: "post-edit", ...base },
   "after-tool.mcp": { type: "post-edit", ...base },
   "after-tool.read-file": { type: "post-edit", ...base },
@@ -179,7 +180,7 @@ test("parse: only write_file and replace name the file they write", () => {
   for (const tool of ["read_file", "mcp_fs_write_file", "write_file_v2", "replace_all", "Write", "Edit", "run_shell_command", "", 7, null]) {
     assert.deepEqual(bare(afterEdit({ tool_name: tool, tool_input: named })), { type: "post-edit", ...base }, String(tool));
   }
-  for (const tool of ["write_file", "replace"]) assert.equal(afterEdit({ tool_name: tool, tool_input: named })?.type, "pre-edit", tool);
+  for (const tool of ["write_file", "replace"]) assert.deepEqual(bare(afterEdit({ tool_name: tool, tool_input: named })), { type: "post-edit", ...base, paths: ["/home/dev/acme/src/app.ts"] }, tool);
 });
 
 test("parse: before a tool call only an edit that names its file is an event", () => {
@@ -519,16 +520,19 @@ test("with the engine: a briefing at the start, the user warned before the edit,
   assert.deepEqual(await gemini("notification", 35), NOTHING);
   assert.equal((await sessionOf(bob, SESSION))?.seenAt, at(34));
 
+  // Each of the four AfterTool events of an edit asked for the sync that publishes it; none of the four BeforeTool events did.
+  assert.deepEqual(asked.background.slice(0, syncsSoFar), [forced(bob), throttled(bob), throttled(bob), throttled(bob), throttled(bob)]);
+
   // AfterAgent: output there could start the turn again. SessionEnd: the session is gone.
   assert.deepEqual(await gemini("after-agent", 40), NOTHING);
   assert.deepEqual(await gemini("session-end.exit", 50), NOTHING);
   assert.deepEqual(await sessionsOf(bob), []);
 
-  // What was asked of the network on the way. One sync waited for at the start. Then: the new intent at once; no
-  // sync for any of the eight tool events around edits; one left to the throttle after each of the two other tools;
-  // the ends of the turn and of the session at once.
+  // What was asked of the network in all. One sync waited for at the start. Then: the new intent at once; one left
+  // to the throttle after each of the four edits and after each of the two other tools; the ends of the turn and of
+  // the session at once.
   assert.equal(asked.waited.length, 1);
-  assert.deepEqual(asked.background, [forced(bob), throttled(bob), throttled(bob), forced(bob), forced(bob)]);
+  assert.deepEqual(asked.background, [forced(bob), ...Array.from({ length: 6 }, () => throttled(bob)), forced(bob), forced(bob)]);
 });
 
 /** Alice's agent has src/auth/jwt.ts in flight, published; bob's Gemini CLI session is replayed against that. */

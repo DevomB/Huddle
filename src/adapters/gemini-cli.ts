@@ -16,8 +16,9 @@
 //   SessionStart       session-start                    timeout 10 s
 //   BeforeAgent        prompt                           timeout 5 s
 //   BeforeTool         pre-edit, shown to the user      timeout 5 s, matcher: write_file and replace
-//   AfterTool          pre-edit after write_file or     timeout 5 s, matcher: every tool but the
-//                      replace, post-edit otherwise       ones in READ_ONLY_TOOLS
+//   AfterTool          post-edit: with the file after   timeout 5 s, matcher: every tool but the
+//                      write_file or replace, without     ones in READ_ONLY_TOOLS
+//                      one after any other tool
 //   AfterAgent         turn-end                         timeout 5 s
 //   SessionEnd         session-end                      timeout 5 s
 //
@@ -28,15 +29,15 @@
 //   ahead: the scheduler reads a decision, a system message and tool_input
 //   from its answer, and nothing else. An AfterTool hook can: the
 //   additionalContext it returns is appended to the tool's result. huddle
-//   never blocks an edit. So the overlap warning, which is the engine's
-//   answer to pre-edit, is asked for twice. Before the edit it goes to the
-//   user as systemMessage, ahead of Gemini CLI's own question whether to
-//   allow the edit, and the engine is told that the agent was not shown it
-//   (HookOutput.unshown), so it does not count as said. After the edit the
-//   same warning comes up again and the agent reads it with the result of
-//   that edit; now it counts, and neither is told a second time. For the
-//   agent that is later than on Claude Code or Codex, and it is the earliest
-//   Gemini CLI allows.
+//   never blocks an edit. So the overlap warning is asked for twice. Before
+//   the edit, as the engine's pre-edit: it goes to the user as systemMessage,
+//   ahead of Gemini CLI's own question whether to allow the edit, and the
+//   engine is told that the agent was not shown it (HookOutput.unshown), so
+//   it does not count as said. After the edit, as a post-edit that names the
+//   file: the engine gives the warning the session has not had yet, the
+//   agent reads it with the result of that edit, now it counts, and neither
+//   is told a second time. For the agent that is later than on Claude Code
+//   or Codex, and it is the earliest Gemini CLI allows.
 // - Not after an edit that failed, though. For a tool that returned an error
 //   the model is given the error's message and nothing else (tool-executor.ts
 //   builds the response from error.message alone), so what a hook adds to
@@ -49,9 +50,8 @@
 //   hook, there is no async form, so the built-in tools that cannot change a
 //   file in the worktree are left out (READ_ONLY_TOOLS). Every other built-in
 //   tool and every tool of an MCP server costs one node process.
-// - The engine starts a background sync on post-edit and not on pre-edit, so
-//   an edit by itself asks for none: it is published by the sync that the
-//   next tool call of another kind asks for, or the end of the turn.
+// - The post-edit after an edit is also what asks for the sync that publishes
+//   it. BeforeTool asks for none.
 //
 // What else differs from Claude Code, and matters here:
 // - A handler is a command line for a shell: `bash -c` on macOS and Linux,
@@ -152,7 +152,7 @@ const REGISTRATIONS: readonly Registration[] = [
   { event: "SessionStart", type: "session-start", timeout: 10 },
   { event: "BeforeAgent", type: "prompt", timeout: 5 },
   { event: "BeforeTool", type: "pre-edit", timeout: 5, matcher: EDITS },
-  { event: "AfterTool", type: "pre-edit", timeout: 5, matcher: NOT_READ_ONLY },
+  { event: "AfterTool", type: "post-edit", timeout: 5, matcher: NOT_READ_ONLY },
   { event: "AfterAgent", type: "turn-end", timeout: 5 },
   // Gemini CLI's docs say a SessionEnd hook is not waited for. Its source awaits it, on /clear and in the
   // cleanup at exit, so a slow one delays both; the engine gives session-end one second.
@@ -165,7 +165,15 @@ const EVENTS: ReadonlySet<string> = new Set(REGISTRATIONS.map((registration) => 
 // parse: a Gemini CLI payload on stdin -> a normalized event
 // ---------------------------------------------------------------------------
 
-/** The file an edit tool was called on, as the model wrote it: absolute as a rule, else relative to the payload's cwd. */
+/**
+ * The file an edit tool was called on, as the model wrote it. Each of the two
+ * tools takes one file_path. Gemini CLI resolves a relative one against its
+ * workspace directory, which is the payload's cwd, and so does the engine.
+ * Two cases where the file that was edited can be another one, neither
+ * handled here: a session started with --include-directories has more than
+ * one workspace directory, and replace corrects a path that does not exist to
+ * a file of that name it finds elsewhere in the workspace.
+ */
 function editedPath(payload: Json): string {
   if (!EDIT_TOOLS.includes(asText(payload.tool_name))) return "";
   return asText(asRecord(payload.tool_input)?.file_path).trim();
@@ -219,11 +227,10 @@ function parsePayload(input: HookInput): HookEvent | null {
       break;
     }
     case "AfterTool": {
+      // A post-edit. After an edit it names the file: the engine then gives the warning that
+      // BeforeTool could not give the model, and asks for the sync that publishes the edit.
       const path = editedPath(payload);
-      if (path !== "") {
-        event.type = "pre-edit";
-        event.paths = [path];
-      }
+      if (path !== "") event.paths = [path];
       // tool_response.error is there exactly when the tool failed. The model
       // then reads the error and nothing a hook adds: see format().
       const error = asRecord(payload.tool_response)?.error;
