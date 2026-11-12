@@ -14,20 +14,26 @@ permissions:
 
 jobs:
   test:
-    name: Typecheck and test (Node 22, ${{ matrix.os }})
+    name: Typecheck and test (Node 22, ${{ matrix.os }}, shard ${{ matrix.shard }}/3)
     strategy:
       # Linux and native Windows are both MVP platforms: one failing must not
       # cancel the other's evidence.
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
+        # Hosted runners are several times slower than a workstation (ubuntu took
+        # about 5 minutes for the whole suite), so each OS runs it in three shards.
+        shard: [1, 2, 3]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 40
     defaults:
       run:
         # PowerShell 7 on both runners: it is the documented Windows shell, and
         # one shell keeps the steps identical across platforms.
         shell: pwsh
+    env:
+      # test/mvp-delivery-platform.test.ts fails unless the suite really runs here.
+      HUDDLE_EXPECT_PLATFORM: ${{ matrix.os == 'windows-latest' && 'win32' || 'linux' }}
     steps:
       # Windows runners default core.autocrlf to true. Keep that: users on
       # Windows check out the vendored bundle and fixtures with CRLF too.
@@ -44,6 +50,9 @@ jobs:
           git --version
           npm --version
           if ($IsWindows) { [System.Environment]::OSVersion.VersionString; cmd /c ver }
+          git config --show-origin --show-scope --get-all core.autocrlf
+          "runner image: $env:ImageOS $env:ImageVersion"
+          exit 0
       - run: npm ci
       - run: npm run typecheck
       - run: npm run build
@@ -54,12 +63,13 @@ jobs:
           node dist/huddle.mjs --version
           node dist/huddle.mjs --help
       - name: Test
-        run: node --test --test-reporter=spec --test-reporter-destination=stdout --test-reporter=junit --test-reporter-destination=test-results.xml "test/**/*.test.ts"
+        timeout-minutes: 30
+        run: node --test --test-shard=${{ matrix.shard }}/3 --test-reporter=spec --test-reporter-destination=stdout --test-reporter=junit --test-reporter-destination=test-results.xml "test/**/*.test.ts"
       - name: Keep the test report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-results-${{ matrix.os }}
+          name: test-results-${{ matrix.os }}-shard${{ matrix.shard }}
           path: test-results.xml
           if-no-files-found: ignore
 
