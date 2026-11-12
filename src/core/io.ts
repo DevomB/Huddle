@@ -18,8 +18,22 @@ export interface Io {
   out(text: string): void;
   /** Write one line to stderr. A trailing newline is added. */
   err(text: string): void;
-  /** All of stdin as text. Empty when stdin is a terminal. Never hangs: gives up after a short timeout. */
-  readStdin(): Promise<string>;
+  /**
+   * Stdin as text. Empty when stdin is a terminal. Never hangs: without end of
+   * input it returns what has arrived after `timeoutMs` (default 2000).
+   */
+  readStdin(opts?: StdinOptions): Promise<string>;
+}
+
+export interface StdinOptions {
+  /** How long to wait for end of input. A hook passes its own budget. */
+  timeoutMs?: number;
+  /**
+   * Return as soon as what has arrived is one complete JSON value. Agents send
+   * a hook its payload as one JSON object, and some keep the pipe open
+   * afterwards; without this such a hook would wait for the whole timeout.
+   */
+  json?: boolean;
 }
 
 export interface Command {
@@ -74,24 +88,39 @@ export function processIo(self: string): Io {
     self,
     out: (text) => void process.stdout.write(text.endsWith("\n") ? text : text + "\n"),
     err: (text) => void process.stderr.write(text.endsWith("\n") ? text : text + "\n"),
-    readStdin: () => readAll(process.stdin, STDIN_TIMEOUT_MS),
+    readStdin: (opts = {}) => readAll(process.stdin, opts.timeoutMs ?? STDIN_TIMEOUT_MS, opts.json === true),
   };
 }
 
-function readAll(stream: NodeJS.ReadStream, timeoutMs: number): Promise<string> {
+/** Exported for tests. `stream` is anything shaped like process.stdin. */
+export function readAll(stream: NodeJS.ReadableStream & { isTTY?: boolean }, timeoutMs: number, json = false): Promise<string> {
   if (stream.isTTY) return Promise.resolve("");
   return new Promise((resolve) => {
     const chunks: Buffer[] = [];
     let settled = false;
+    const text = () => Buffer.concat(chunks).toString("utf8");
     const finish = () => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       stream.pause();
-      resolve(Buffer.concat(chunks).toString("utf8"));
+      resolve(text());
     };
-    const timer = setTimeout(finish, timeoutMs);
-    stream.on("data", (chunk: Buffer | string) => chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk));
+    const timer = setTimeout(finish, Math.max(0, timeoutMs));
+    stream.on("data", (chunk: Buffer | string) => {
+      const bytes = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+      chunks.push(bytes);
+      if (!json) return;
+      // Only worth a parse when the chunk ends the way a JSON object or array does.
+      const last = bytes.toString("latin1").trimEnd().slice(-1);
+      if (last !== "}" && last !== "]") return;
+      try {
+        JSON.parse(text());
+        finish();
+      } catch {
+        // Not complete yet.
+      }
+    });
     stream.on("end", finish);
     stream.on("error", finish);
     stream.resume();

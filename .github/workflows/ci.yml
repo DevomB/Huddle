@@ -28,16 +28,26 @@ jobs:
       - run: npm test
 
   bundle-node20:
-    name: Bundle runs on Node 20
+    name: CLI tests with the bundle on Node 20
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      # Node 20 first, only to learn where it is installed. The tests themselves
+      # need Node 22 (they import TypeScript directly); every test that runs the
+      # CLI then runs the bundle with the Node 20 binary.
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+      - run: echo "HUDDLE_TEST_NODE=$(which node)" >> "$GITHUB_ENV"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
           cache: npm
       - run: npm ci
       - run: npm run build
-      - run: node dist/huddle.mjs --version
-      - run: node dist/huddle.mjs --help
+      - run: |
+          "$HUDDLE_TEST_NODE" --version
+          "$HUDDLE_TEST_NODE" dist/huddle.mjs --version
+          "$HUDDLE_TEST_NODE" dist/huddle.mjs --help
+      - run: npm test
