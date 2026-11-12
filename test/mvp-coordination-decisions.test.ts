@@ -1,7 +1,13 @@
-// MVP sprint, worker 2 (audit A04; CONTRACT 4.4): two actors replacing one
-// decision at the same moment make an unresolved conflict, never two rules in
-// force. The race is held at the real publication seam of both writers, with
-// a real bare remote and real clones.
+// MVP sprint, worker 2 (audit A04; MVP_SCOPE: gate the unsafe supersession,
+// no redesign). Two actors replacing one decision at the same moment both
+// land, because each author's log is compare-and-swapped on its own. huddle
+// must not silently pick one, nor present them as two independent rules:
+// both stay listed, each marked as conflicting, in every reader. Replacing
+// the contested decision once more is refused; the existing --supersedes on
+// the one that should go settles it.
+//
+// The race is held at the real publication seam of both writers, against a
+// real bare remote and real clones.
 
 import assert from "node:assert/strict";
 import { after, before, describe, test } from "node:test";
@@ -12,8 +18,8 @@ import { renderBriefing } from "../src/core/render.ts";
 import { currentView } from "../src/core/session.ts";
 import { sync } from "../src/core/sync.ts";
 import { decisionsRef } from "../src/core/types.ts";
-import { settleDecisions } from "../src/core/view.ts";
-import type { ViewDecision } from "../src/core/view.ts";
+import type { Cache } from "../src/core/types.ts";
+import { buildView } from "../src/core/view.ts";
 import { BUNDLE, createHarness } from "./harness.ts";
 import type { Clone, Harness } from "./harness.ts";
 
@@ -24,7 +30,7 @@ function context(clone: Clone, now: string): Promise<Ctx> {
   return openContext({ cwd: clone.dir, env: { ...(process.env as Record<string, string>), HUDDLE_NOW: now }, self: BUNDLE, out() {}, err() {}, readStdin: async () => "" });
 }
 
-/** Holds every writer at its real publish call for its own decision log until all `count` have arrived. */
+/** Holds every writer at its real publish call for its own decision log until all of them have arrived. */
 function holdAtPublish(contexts: Ctx[]): void {
   let arrivals = 0;
   let release!: () => void;
@@ -49,12 +55,14 @@ async function viewOf(clone: Clone, now: string) {
   return currentView(ctx, "observer");
 }
 
-describe("A04: concurrent replacement of one decision", () => {
+describe("A04: concurrent replacement of one decision is marked as a conflict", () => {
   let h: Harness;
   let seed: Clone;
   let bob: Clone;
   let carol: Clone;
   let first = "";
+  let bobs = "";
+  let carols = "";
 
   before(async () => {
     h = await createHarness();
@@ -67,85 +75,51 @@ describe("A04: concurrent replacement of one decision", () => {
   });
   after(() => h.cleanup());
 
-  test("both replacements land, and the team sees one unresolved conflict, not two rules", async () => {
+  test("both replacements land; every reader shows both, each marked as conflicting with the other", async () => {
     const [b, c] = await Promise.all([context(bob, at(10)), context(carol, at(10))]);
     holdAtPublish([b, c]);
     const results = await Promise.all([
       addDecision(b, "Use format B exclusively", { supersedes: first }),
       addDecision(c, "Use format C exclusively", { supersedes: first }),
     ]);
-    assert.ok(results.every((result) => result.ok), JSON.stringify(results));
+    assert.ok(results[0].ok && results[1].ok, JSON.stringify(results));
+    bobs = results[0].decision.id;
+    carols = results[1].decision.id;
 
     const view = await viewOf(seed, at(20));
-    assert.deepEqual(view.decisions.map((d) => d.text), [], "neither competing rule is in force, and A is replaced");
-    assert.equal(view.conflicts.length, 1);
-    const conflict = view.conflicts[0]!;
-    assert.equal(conflict.over, first);
-    assert.equal(conflict.replaced?.text, "Use format A");
-    assert.deepEqual(conflict.candidates.map((d) => [d.text, d.user]), [["Use format B exclusively", "bob"], ["Use format C exclusively", "carol"]]);
+    const byText = new Map(view.decisions.map((d) => [d.text, d]));
+    assert.equal(byText.has("Use format A"), false, "the replaced decision is gone");
+    assert.deepEqual(byText.get("Use format B exclusively")?.conflictsWith, [carols]);
+    assert.deepEqual(byText.get("Use format C exclusively")?.conflictsWith, [bobs]);
 
-    // Every reader says the same: the list, status and the agent's briefing.
     const listed = await seed.huddle(["decisions"], { now: at(20) });
     assert.equal(listed.code, 0, listed.stderr);
-    assert.match(listed.stdout, new RegExp(`Unresolved decision conflict over \\[${first}\\]`));
-    assert.match(listed.stdout, /None of them is in force/);
-    assert.match(listed.stdout, new RegExp(`huddle decide --resolve ${first} "<the rule>"`));
-    assert.doesNotMatch(listed.stdout, /^- \[[a-z2-7]{8}\] Use format B exclusively\. \(/m, "not listed as a rule");
+    for (const [mine, theirs] of [[bobs, carols], [carols, bobs]]) {
+      assert.match(listed.stdout, new RegExp(`^- \\[${mine}\\] .* CONFLICT: this and \\[${theirs}\\] both replace \\[${first}\\], and huddle does not pick one\\.`, "m"));
+    }
     const status = await seed.huddle(["status"], { now: at(20) });
-    assert.match(status.stdout, /Unresolved decision conflict/);
+    assert.equal((status.stdout.match(/CONFLICT: this and/g) ?? []).length, 2);
     const briefing = renderBriefing(view).text;
-    assert.match(briefing, /Unresolved decision conflict over/);
-    assert.doesNotMatch(briefing, /Decisions \(/, "the briefing lists no competing rule as a decision");
-    const json = JSON.parse((await seed.huddle(["decisions", "--json"], { now: at(20) })).stdout) as { decisions: unknown[]; conflicts?: unknown };
-    assert.deepEqual(json.decisions, []);
+    assert.equal((briefing.match(/CONFLICT: this and/g) ?? []).length, 2, briefing);
+    const json = JSON.parse((await seed.huddle(["decisions", "--json"], { now: at(20) })).stdout) as { decisions: { id: string; conflictsWith?: string[] }[] };
+    assert.deepEqual(json.decisions.map((d) => [d.id, d.conflictsWith]).sort(), [[bobs, [carols]], [carols, [bobs]]].sort());
+  });
 
-    // Replacing the contested decision again is refused with the way out.
+  test("replacing the contested decision once more is refused, exit 3, and says how to settle it", async () => {
     const again = await seed.huddle(["decide", "--supersedes", first, "Use format D"], { now: at(21) });
     assert.equal(again.code, 3, again.stdout + again.stderr);
-    assert.match(again.stderr, /unresolved conflict/);
-    assert.match(again.stderr, new RegExp(`--resolve ${first}`));
+    assert.match(again.stderr, /They conflict, and huddle does not pick one\. The decision was NOT recorded/);
+    assert.match(again.stderr, /huddle decide --supersedes <its id>/);
+    assert.equal((await viewOf(seed, at(22))).decisions.some((d) => d.text === "Use format D"), false);
   });
 
-  test("--resolve settles it: one rule in force for everyone, and a later --supersedes of it replaces it whole", async () => {
-    const settled = await bob.huddle(["decide", "--resolve", first, "Use format B exclusively"], { now: at(30) });
-    assert.equal(settled.code, 0, settled.stdout + settled.stderr);
-    assert.match(settled.stdout, new RegExp(`settling the conflict over ${first}`));
-
-    const view = await viewOf(carol, at(31));
-    assert.deepEqual(view.conflicts, []);
-    assert.deepEqual(view.decisions.map((d) => d.text), ["Use format B exclusively"]);
-    const rule = view.decisions[0]!;
-    assert.ok(rule.sameAs && rule.sameAs.length >= 1, "the same rule was recorded for each competing decision");
-
-    const next = await carol.huddle(["decide", "--supersedes", rule.id, "Use format E"], { now: at(40) });
-    assert.equal(next.code, 0, next.stdout + next.stderr);
-    const later = await viewOf(seed, at(41));
-    assert.deepEqual([later.decisions.map((d) => d.text), later.conflicts.length], [["Use format E"], 0]);
-
-    // --resolve of something that is in no conflict changes nothing.
-    const none = await seed.huddle(["decide", "--resolve", later.decisions[0]!.id, "Whatever"], { now: at(42) });
-    assert.equal(none.code, 2, none.stdout + none.stderr);
-    assert.match(none.stderr, /in no unresolved conflict/);
-  });
-
-  test("two different resolutions at the same moment are a conflict again; no clock picks one", async () => {
-    const base = await addDecision(await context(seed, at(50)), "Logs go to stdout");
-    assert.ok(base.ok);
-    const [b1, c1] = await Promise.all([context(bob, at(51)), context(carol, at(51))]);
-    holdAtPublish([b1, c1]);
-    await Promise.all([addDecision(b1, "Logs go to a file", { supersedes: base.decision.id }), addDecision(c1, "Logs go to syslog", { supersedes: base.decision.id })]);
-    const [b2, c2] = await Promise.all([context(bob, at(60)), context(carol, at(61))]);
-    holdAtPublish([b2, c2]);
-    const both = await Promise.all([
-      addDecision(b2, "Logs go to a file", { resolve: base.decision.id }),
-      addDecision(c2, "Logs go to syslog", { resolve: base.decision.id }),
-    ]);
-    assert.ok(both.every((result) => result.ok), JSON.stringify(both));
-    const view = await viewOf(seed, at(70));
-    const conflict = view.conflicts.find((candidate) => candidate.over === base.decision.id);
-    assert.ok(conflict, "still unresolved");
-    assert.deepEqual([...new Set(conflict.candidates.map((d) => d.text))], ["Logs go to a file", "Logs go to syslog"]);
-    assert.ok(!view.decisions.some((d) => d.text.startsWith("Logs go to")));
+  test("the existing --supersedes on the one that should go settles it for everyone", async () => {
+    const yielded = await carol.huddle(["decide", "--supersedes", carols, "Use format B exclusively, as bob decided"], { now: at(30) });
+    assert.equal(yielded.code, 0, yielded.stdout + yielded.stderr);
+    const view = await viewOf(bob, at(31));
+    assert.deepEqual(view.decisions.filter((d) => d.conflictsWith).map((d) => d.id), [], "no conflict is left");
+    assert.deepEqual(view.decisions.map((d) => d.text).sort(), ["Use format B exclusively", "Use format B exclusively, as bob decided"]);
+    assert.doesNotMatch((await bob.huddle(["decisions"], { now: at(31) })).stdout, /CONFLICT/);
   });
 
   test("sequential, nonconflicting decisions still propagate and render", async () => {
@@ -158,47 +132,33 @@ describe("A04: concurrent replacement of one decision", () => {
     const listed = await carol.huddle(["decisions"], { now: at(82) });
     assert.match(listed.stdout, /API errors use problem\+json, version 2\. \(bob/);
     assert.doesNotMatch(listed.stdout, /API errors use problem\+json\. \(/);
+    assert.doesNotMatch(listed.stdout, /problem\+json.*CONFLICT/);
   });
 });
 
-describe("settleDecisions (pure)", () => {
-  const d = (id: string, text: string, supersedes?: string, atSeconds = 0, actor = "aaaaaaaa"): ViewDecision => ({
-    id, at: at(atSeconds), agent: "manual", text, actor, user: actor.slice(0, 3), ...(supersedes === undefined ? {} : { supersedes }),
+describe("the conflict mark (pure)", () => {
+  const log = (actor: string, decisions: { id: string; text: string; supersedes?: string; at: number }[]): Cache["refs"][string] => ({
+    sha: "1".repeat(40),
+    doc: { v: 0, kind: "decisions", actor, user: actor.slice(0, 4), decisions: decisions.map((d) => ({ id: d.id, at: at(d.at), agent: "manual", text: d.text, ...(d.supersedes ? { supersedes: d.supersedes } : {}) })) },
   });
+  const view = (b: number, c: number) =>
+    buildView(
+      {
+        fetchedAt: at(0),
+        refs: {
+          "refs/huddle/decisions/aaaaaaaa": log("aaaaaaaa", [{ id: "aaaaaaaa", text: "A", at: 0 }]),
+          "refs/huddle/decisions/bbbbbbbb": log("bbbbbbbb", [{ id: "bbbbbbbb", text: "B", supersedes: "aaaaaaaa", at: b }]),
+          "refs/huddle/decisions/cccccccc": log("cccccccc", [{ id: "cccccccc", text: "C", supersedes: "aaaaaaaa", at: c }, { id: "dddddddd", text: "D", at: 5 }]),
+        },
+      } as Cache,
+      { actor: "zzzzzzzz", session: "me" },
+      new Date(T0 + 60_000),
+    );
 
-  test("a chain is one rule; a fork is a conflict at its top, following the chains below it", () => {
-    assert.deepEqual(settleDecisions([d("aaaaaaaa", "A"), d("bbbbbbbb", "B", "aaaaaaaa")]).inForce.map((x) => x.id), ["bbbbbbbb"]);
-    const forked = settleDecisions([d("aaaaaaaa", "A"), d("bbbbbbbb", "B", "aaaaaaaa"), d("cccccccc", "C", "aaaaaaaa"), d("dddddddd", "D", "bbbbbbbb")]);
-    assert.deepEqual(forked.inForce, []);
-    assert.deepEqual(forked.conflicts.map((c) => [c.over, c.kind, c.candidates.map((x) => x.id)]), [["aaaaaaaa", "fork", ["cccccccc", "dddddddd"]]]);
-  });
-
-  test("the result does not depend on the clocks", () => {
-    const early = settleDecisions([d("aaaaaaaa", "A", undefined, 0), d("bbbbbbbb", "B", "aaaaaaaa", 1), d("cccccccc", "C", "aaaaaaaa", 999)]);
-    const late = settleDecisions([d("aaaaaaaa", "A", undefined, 0), d("bbbbbbbb", "B", "aaaaaaaa", 999), d("cccccccc", "C", "aaaaaaaa", 1)]);
-    assert.deepEqual(early.conflicts.map((c) => c.candidates.map((x) => x.id)), late.conflicts.map((c) => c.candidates.map((x) => x.id)));
-    assert.deepEqual([early.inForce, late.inForce], [[], []]);
-  });
-
-  test("competing replacements that say the same thing are one rule, under its smallest id", () => {
-    const same = settleDecisions([d("aaaaaaaa", "A"), d("cccccccc", "Same", "aaaaaaaa"), d("bbbbbbbb", "Same", "aaaaaaaa")]);
-    assert.deepEqual(same.conflicts, []);
-    assert.deepEqual(same.inForce.map((x) => [x.id, x.sameAs]), [["bbbbbbbb", ["cccccccc"]]]);
-  });
-
-  test("a replacement of a decision nobody can read still competes with another one", () => {
-    const orphans = settleDecisions([d("bbbbbbbb", "B", "zzzzzzzz"), d("cccccccc", "C", "zzzzzzzz")]);
-    assert.deepEqual(orphans.conflicts.map((c) => [c.over, c.replaced, c.candidates.length]), [["zzzzzzzz", null, 2]]);
-    assert.deepEqual(settleDecisions([d("bbbbbbbb", "B", "zzzzzzzz")]).inForce.map((x) => x.id), ["bbbbbbbb"]);
-  });
-
-  test("a loop is never silently gone: with nothing at its end it is a conflict; something at its end is in force", () => {
-    const loop = settleDecisions([d("aaaaaaaa", "A", "bbbbbbbb"), d("bbbbbbbb", "B", "aaaaaaaa")]);
-    assert.deepEqual(loop.inForce, []);
-    assert.deepEqual(loop.conflicts.map((c) => [c.over, c.kind, c.candidates.map((x) => x.id).sort()]), [["aaaaaaaa", "loop", ["aaaaaaaa", "bbbbbbbb"]]]);
-    const out = settleDecisions([d("aaaaaaaa", "A", "bbbbbbbb"), d("bbbbbbbb", "B", "aaaaaaaa"), d("cccccccc", "C", "aaaaaaaa")]);
-    assert.deepEqual(out.inForce.map((x) => x.id), ["cccccccc"]);
-    const selfish = settleDecisions([d("aaaaaaaa", "A", "aaaaaaaa")]);
-    assert.deepEqual(selfish.inForce.map((x) => x.id), ["aaaaaaaa"], "a decision that names itself replaces nothing");
+  test("both rivals are listed and marked, whatever the clocks say; an unrelated decision is not", () => {
+    for (const [b, c] of [[1, 2], [2, 1], [3, 3]] as [number, number][]) {
+      const marks = Object.fromEntries(view(b, c).decisions.map((d) => [d.id, d.conflictsWith ?? null]));
+      assert.deepEqual(marks, { bbbbbbbb: ["cccccccc"], cccccccc: ["bbbbbbbb"], dddddddd: null }, `clocks ${b}, ${c}`);
+    }
   });
 });

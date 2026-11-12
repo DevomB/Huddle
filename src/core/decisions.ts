@@ -13,9 +13,7 @@ import { log } from "./log.ts";
 import { ensureStateDir } from "./paths.ts";
 import { readCache, writeCache } from "./store.ts";
 import { FORCED_LOCK_WAIT_MS, withSyncLock } from "./sync.ts";
-import { decisionsRef, parseRef, REF_PREFIX } from "./types.ts";
-import { settleDecisions } from "./view.ts";
-import type { ViewDecision } from "./view.ts";
+import { decisionsRef, REF_PREFIX } from "./types.ts";
 import type { Cache, Decision, DecisionDoc, FailReason, Identity } from "./types.ts";
 
 export type DecideFailure =
@@ -29,9 +27,7 @@ export type DecideFailure =
   /** The remote holds something at this clone's decisions ref that this version cannot read; it is left alone. */
   | "unreadable"
   /** A sync held the lock for too long. */
-  | "busy"
-  /** --resolve names a decision that is in no unresolved conflict. */
-  | "no-conflict";
+  | "busy";
 
 /** A decision and whose log it is in. */
 export interface Attributed {
@@ -40,19 +36,7 @@ export interface Attributed {
 }
 
 export type DecideResult =
-  | {
-      ok: true;
-      decision: Decision;
-      dropped: number;
-      /**
-       * The same rule recorded once more for each other decision it replaces,
-       * in the same push: with --resolve, one per competing candidate; with
-       * --supersedes of a settled rule (ViewDecision.sameAs), one per id of it.
-       */
-      also?: Decision[];
-      /** What the new decision(s) replaced. */
-      replaced?: string[];
-    }
+  | { ok: true; decision: Decision; dropped: number }
   | {
       ok: false;
       reason: DecideFailure;
@@ -198,23 +182,7 @@ export function fitLog(identity: Identity, mine: Decision[], everyone: Decision[
  * `text` must already be one clean line within the limit; `agent` is the
  * agent of the session that decided.
  */
-/** Every decision in the cache as the view sees it, with its log's actor and user. */
-function viewDecisions(cache: Cache): ViewDecision[] {
-  const out: ViewDecision[] = [];
-  for (const [name, entry] of Object.entries(cache.refs)) {
-    const where = parseRef(name);
-    const doc = entry.doc;
-    if (where?.kind !== "decisions" || doc?.kind !== "decisions" || doc.actor !== where.id) continue;
-    for (const decision of doc.decisions) out.push({ ...decision, actor: doc.actor, user: doc.user });
-  }
-  return out;
-}
-
-export async function addDecision(
-  ctx: Ctx,
-  text: string,
-  opts: { supersedes?: string; resolve?: string; agent?: string } = {},
-): Promise<DecideResult> {
+export async function addDecision(ctx: Ctx, text: string, opts: { supersedes?: string; agent?: string } = {}): Promise<DecideResult> {
   const { paths, identity, transport, now } = ctx;
   const clean = cleanText(text, LIMITS.decisionText);
   if (clean === "") throw new TypeError("a decision needs text");
@@ -254,41 +222,13 @@ export async function addDecision(
         }
       }
 
-      // What the new rule replaces: the one decision named, every id of a settled rule it names, or
-      // with --resolve every candidate of the conflict. One decision per replaced id, all in this push.
-      const settled = settleDecisions(viewDecisions(cache));
-      let targets: string[] = opts.supersedes === undefined ? [] : [opts.supersedes];
-      if (opts.supersedes !== undefined) {
-        const rule = settled.inForce.find((candidate) => candidate.id === opts.supersedes || candidate.sameAs?.includes(opts.supersedes!));
-        if (rule?.sameAs) targets = [rule.id, ...rule.sameAs];
-      }
-      if (opts.resolve !== undefined) {
-        const conflict = settled.conflicts.find((candidate) => candidate.over === opts.resolve || candidate.candidates.some((c) => c.id === opts.resolve));
-        if (!conflict) {
-          await writeCache(paths, cache);
-          return { ok: false, reason: "no-conflict" };
-        }
-        // An end of a chain is replaced directly. In a loop with no end, every member is.
-        const ends = conflict.candidates.map((candidate) => candidate.id);
-        targets = ends;
-      }
-
       const taken = new Set(everyone.map((decision) => decision.id));
-      const fresh = (): string => {
-        let id = newId();
-        while (taken.has(id)) id = newId();
-        taken.add(id);
-        return id;
-      };
-      const made = (target: string | undefined): Decision => {
-        const next: Decision = { id: fresh(), at: now.toISOString(), agent: cleanText(opts.agent, LIMITS.name) || "manual", text: clean };
-        if (target !== undefined) next.supersedes = target;
-        return next;
-      };
-      const [decision, ...also] = targets.length === 0 ? [made(undefined)] : targets.map(made);
-      if (decision === undefined) throw new Error("unreachable: no decision to record");
+      let id = newId();
+      while (taken.has(id)) id = newId();
+      const decision: Decision = { id, at: now.toISOString(), agent: cleanText(opts.agent, LIMITS.name) || "manual", text: clean };
+      if (opts.supersedes !== undefined) decision.supersedes = opts.supersedes;
 
-      const kept = fitLog(identity, [decision, ...also, ...mine], everyone, logsComplete(cache));
+      const kept = fitLog(identity, [decision, ...mine], everyone, logsComplete(cache));
       if (kept === null) {
         await writeCache(paths, cache);
         return { ok: false, reason: "full" };
@@ -299,10 +239,7 @@ export async function addDecision(
       if (published.ok) {
         cache.refs[ref] = { sha: published.sha, doc: normalizeDoc(doc) };
         await writeCache(paths, cache);
-        const result: Extract<DecideResult, { ok: true }> = { ok: true, decision, dropped: mine.length + 1 + also.length - kept.length };
-        if (also.length > 0) result.also = also;
-        if (targets.length > 0) result.replaced = targets;
-        return result;
+        return { ok: true, decision, dropped: mine.length + 1 - kept.length };
       }
       await writeCache(paths, cache);
       log(paths, "decide", `publish failed: ${published.reason} (attempt ${attempt} of ${ATTEMPTS})`);

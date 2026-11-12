@@ -15,7 +15,7 @@ import { ELLIPSIS, cleanText } from "./docs.ts";
 import type { Iso, Seen } from "./types.ts";
 import { countTasks, taskState } from "./view.ts";
 import type { Completeness, FreshnessReport } from "./view.ts";
-import type { DecisionConflict, Overlap, TeamView, ViewDecision, ViewSession, ViewTask } from "./view.ts";
+import type { Overlap, TeamView, ViewDecision, ViewSession, ViewTask } from "./view.ts";
 
 /**
  * Agents cap injected hook context (Claude Code: 10,000 characters, after
@@ -176,36 +176,24 @@ function sessionLine(session: ViewSession, nowMs: number, detail: Level): string
   return line;
 }
 
-/** "[id] text (bob / codex)" for one candidate of a conflict. */
-function candidateOf(decision: ViewDecision, chars: number): string {
-  return `[${shownText(decision.id, 40)}] ${quote(shownText(decision.text, chars))} (${who(decision)})`;
-}
-
 /**
- * One line per unresolved decision conflict: what competes, that none of it is
- * in force, and the command that settles it. Shared by the briefing, status
- * and `huddle decisions`.
+ * " CONFLICT: …" for a decision that competes with another one in force
+ * (ViewDecision.conflictsWith), "" otherwise. huddle does not pick one, so
+ * both are shown, and each says so.
  */
-function conflictLine(conflict: DecisionConflict, chars: number): string {
-  const over = shownText(conflict.over, 40);
-  const what =
-    conflict.kind === "loop"
-      ? `Unresolved decision conflict: decisions that replace one another (${conflict.candidates.map((c) => candidateOf(c, chars)).join("; ")})`
-      : `Unresolved decision conflict over [${over}]${conflict.replaced ? ` ${quote(shownText(conflict.replaced.text, chars))}` : ""}: competing replacements ${conflict.candidates.map((c) => candidateOf(c, chars)).join(" vs ")}`;
-  return `${what}. None of them is in force. Agree on one rule, then: huddle decide --resolve ${over} "<the rule>"`;
-}
-
-function conflictLines(conflicts: DecisionConflict[], detail: Level): string[] {
-  if (conflicts.length === 0) return [];
-  if (detail.decisions <= 0) return [`${conflicts.length} unresolved decision ${plural(conflicts.length, "conflict", "conflicts")}: run \`huddle decisions\`.`];
-  return conflicts.slice(0, Math.max(1, detail.decisions)).map((conflict) => conflictLine(conflict, detail.decisionChars));
+function conflictNote(decision: ViewDecision): string {
+  const others = decision.conflictsWith ?? [];
+  if (others.length === 0) return "";
+  const ids = others.map((id) => `[${shownText(id, 40)}]`).join(", ");
+  const replaced = shownText(decision.supersedes ?? "", 40);
+  return ` CONFLICT: this and ${ids} both replace [${replaced}], and huddle does not pick one. Settle it together, then replace the one that should go: huddle decide --supersedes <its id> "<the rule>"`;
 }
 
 function decisionLines(decisions: ViewDecision[], fresh: boolean, detail: Level): string[] {
   if (decisions.length === 0) return [];
   const head = `Decisions (${decisions.length}${fresh ? " new" : ""})`;
   if (detail.decisions <= 0) return [`${head}: run \`huddle decisions\` to read them.`];
-  const shown = decisions.slice(0, detail.decisions).map((decision) => sentence(shownText(decision.text, detail.decisionChars)));
+  const shown = decisions.slice(0, detail.decisions).map((decision) => sentence(shownText(decision.text, detail.decisionChars)) + conflictNote(decision));
   const more = decisions.length - shown.length;
   if (shown.length === 1 && more === 0) return [`${head}: ${shown[0]}`];
   const lines = [`${head}:`, ...shown.map((line) => `- ${line}`)];
@@ -272,15 +260,6 @@ function decisionItem(decision: ViewDecision): string {
   return `${DECISION_ITEM}${decision.actor}/${decision.id}`;
 }
 
-/** A conflict is news when it appears or its candidates change. */
-function conflictItem(conflict: DecisionConflict): string {
-  return `${DECISION_ITEM}conflict/${conflict.over}`;
-}
-
-function conflictPrint(conflict: DecisionConflict): string {
-  return fingerprint(JSON.stringify(conflict.candidates.map((candidate) => [candidate.id, candidate.text])));
-}
-
 /** Everything a full briefing of `view` conveys, as Seen.items. A session's seenAt is left out: being alive is not news. */
 function itemsOf(view: TeamView): Record<string, string> {
   const items: Record<string, string> = {};
@@ -288,8 +267,8 @@ function itemsOf(view: TeamView): Record<string, string> {
     const shown = JSON.stringify([session.user, session.agent, session.branch, session.intent, [...session.files].sort(), [...session.claims].sort()]);
     items[sessionItem(session)] = `${fingerprint(shown)} ${who(session)} (${branchOf(session)})`;
   }
-  for (const decision of view.decisions) items[decisionItem(decision)] = fingerprint(decision.text);
-  for (const conflict of view.conflicts ?? []) items[conflictItem(conflict)] = conflictPrint(conflict);
+  // A decision that becomes conflicted (or stops being) is news again.
+  for (const decision of view.decisions) items[decisionItem(decision)] = fingerprint(`${decision.text}${conflictNote(decision)}`);
   items[TASKS_ITEM] = taskSummary(view);
   return items;
 }
@@ -311,7 +290,6 @@ interface Content {
   sessions: ViewSession[];
   left: string[];
   decisions: ViewDecision[];
-  conflicts: DecisionConflict[];
   tasks: string;
 }
 
@@ -323,8 +301,8 @@ function leftLine(left: string[], max: number): string {
 
 /** `sessionLines` holds one rendered line per session in `content`, at this detail's file budget. */
 function compose(content: Content, sessionLines: string[], detail: Detail): string {
-  const { delta, sessions, left, decisions, conflicts, tasks } = content;
-  if (!delta && sessions.length === 0 && decisions.length === 0 && conflicts.length === 0 && tasks === "") {
+  const { delta, sessions, left, decisions, tasks } = content;
+  if (!delta && sessions.length === 0 && decisions.length === 0 && tasks === "") {
     const alone = "[huddle] No teammates' agents are active on this repo right now.";
     return detail.commands ? `${alone}\n${COMMANDS}` : alone;
   }
@@ -342,7 +320,6 @@ function compose(content: Content, sessionLines: string[], detail: Detail): stri
 
   if (detail.extras) {
     lines.push(...decisionLines(decisions, delta, detail));
-    lines.push(...conflictLines(conflicts, detail));
     if (tasks !== "") lines.push(tasks);
   }
 
@@ -377,7 +354,7 @@ export function renderBriefing(view: TeamView, opts: BriefingOptions = {}): Brie
 
   let content: Content;
   if (since === null) {
-    content = { delta: false, sessions: view.sessions, left: [], decisions: view.decisions, conflicts: view.conflicts ?? [], tasks: seen.items[TASKS_ITEM] ?? "" };
+    content = { delta: false, sessions: view.sessions, left: [], decisions: view.decisions, tasks: seen.items[TASKS_ITEM] ?? "" };
   } else {
     const sessions = view.sessions.filter((session) => since[sessionItem(session)] !== seen.items[sessionItem(session)]);
     const left: string[] = [];
@@ -387,12 +364,11 @@ export function renderBriefing(view: TeamView, opts: BriefingOptions = {}): Brie
       left.push(shownText(value.slice(value.indexOf(" ") + 1), 160) || "a teammate's agent");
     }
     const decisions = view.decisions.filter((decision) => since[decisionItem(decision)] !== seen.items[decisionItem(decision)]);
-    const conflicts = (view.conflicts ?? []).filter((conflict) => since[conflictItem(conflict)] !== seen.items[conflictItem(conflict)]);
     const before = since[TASKS_ITEM] ?? "";
     const after = seen.items[TASKS_ITEM] ?? "";
     const tasks = after === before ? "" : after || "Tasks: none open.";
-    if (sessions.length === 0 && left.length === 0 && decisions.length === 0 && conflicts.length === 0 && tasks === "") return { text: "", seen };
-    content = { delta: true, sessions, left, decisions, conflicts, tasks };
+    if (sessions.length === 0 && left.length === 0 && decisions.length === 0 && tasks === "") return { text: "", seen };
+    content = { delta: true, sessions, left, decisions, tasks };
   }
   if (maxChars <= 0) return { text: "", seen };
 
@@ -460,10 +436,8 @@ function decisionLog(view: TeamView, notice: boolean): string[] {
   const nowMs = Date.parse(view.now);
   const lines = [`Decisions (${view.decisions.length}), newest first.${notice ? ` ${NOTICE}` : ""}`];
   for (const decision of view.decisions) {
-    const same = decision.sameAs && decision.sameAs.length > 0 ? ` (also recorded as ${decision.sameAs.map((id) => shownText(id, 40)).join(", ")})` : "";
-    lines.push(`- [${shownText(decision.id, 40)}] ${sentence(shownText(decision.text, 500))} (${who(decision)}, ${ageOf(decision.at, nowMs)})${same}`);
+    lines.push(`- [${shownText(decision.id, 40)}] ${sentence(shownText(decision.text, 500))} (${who(decision)}, ${ageOf(decision.at, nowMs)})${conflictNote(decision)}`);
   }
-  for (const conflict of view.conflicts ?? []) lines.push(`- ${conflictLine(conflict, 500)}`);
   return lines;
 }
 
@@ -475,7 +449,7 @@ function taskList(view: TeamView, notice: boolean): string[] {
 
 /** `huddle decisions`: every decision in force, newest first, with the id that --supersedes takes. */
 export function renderDecisions(view: TeamView): string {
-  if (view.decisions.length === 0 && (view.conflicts ?? []).length === 0) return 'No decisions recorded. Record one with: huddle decide "<choice others must follow>"';
+  if (view.decisions.length === 0) return 'No decisions recorded. Record one with: huddle decide "<choice others must follow>"';
   return decisionLog(view, true).join("\n");
 }
 
@@ -491,7 +465,7 @@ export function renderStatus(view: TeamView): string {
   const synced = view.fetchedAt === null ? "never synced: run `huddle sync`" : `last synced ${ageOf(view.fetchedAt, nowMs)}`;
   const count = view.sessions.length;
   const lead = count === 0 ? "No teammates' agents are live on this repo" : `${count} ${plural(count, "teammate's agent", "teammates' agents")} live on this repo`;
-  const anything = count > 0 || view.decisions.length > 0 || (view.conflicts ?? []).length > 0 || view.tasks.length > 0;
+  const anything = count > 0 || view.decisions.length > 0 || view.tasks.length > 0;
   const lines = [`[huddle] ${lead} (${synced}).${anything ? ` ${NOTICE}` : ""}`];
 
   for (const session of view.sessions) {
@@ -499,7 +473,7 @@ export function renderStatus(view: TeamView): string {
     if (session.files.length > 0) lines.push(`    Files (${session.files.length}): ${fileList(session.files, STATUS_FILES, Number.MAX_SAFE_INTEGER)}`);
     if (session.claims.length > 0) lines.push(`    Claims: ${claimList(session.claims, 20)}`);
   }
-  if (view.decisions.length > 0 || (view.conflicts ?? []).length > 0) lines.push(...decisionLog(view, false));
+  if (view.decisions.length > 0) lines.push(...decisionLog(view, false));
   if (view.tasks.length > 0) lines.push(...taskList(view, false));
   return lines.join("\n");
 }

@@ -14,11 +14,10 @@ import { ID_RE } from "../core/types.ts";
 
 export const summary = "Record a decision others must follow: huddle decide \"<text>\"";
 
-const USAGE =
-  'huddle decide [--supersedes <id> | --resolve <id>] [--] "<choice others must follow>"   (put -- before a text that starts with a dash; --resolve settles a decision conflict)';
+const USAGE = 'huddle decide [--supersedes <id>] [--] "<choice others must follow>"   (put -- before a text that starts with a dash)';
 
 export async function run(args: string[], io: Io): Promise<number> {
-  const { values, positionals } = parse(args, { supersedes: { type: "string", multiple: true }, resolve: { type: "string", multiple: true } }, USAGE);
+  const { values, positionals } = parse(args, { supersedes: { type: "string", multiple: true } }, USAGE);
   const typed = cleanText(positionals.join(" "), Number.MAX_SAFE_INTEGER);
   if (typed === "") throw new UsageError(`the decision is empty\nUsage: ${USAGE}`);
   // A rule that others must follow is not cut short behind the author's back.
@@ -46,21 +45,10 @@ export async function run(args: string[], io: Io): Promise<number> {
     throw new UsageError(`"${cleanText(supersedes, 40)}" is not a decision id; run "huddle decisions" to see them\nUsage: ${USAGE}`);
   }
 
-  const resolving = values.resolve ?? [];
-  if (resolving.length > 1) throw new UsageError(`a decision settles one conflict; --resolve was given ${resolving.length} times\nUsage: ${USAGE}`);
-  const resolve = resolving[0]?.trim();
-  if (resolve !== undefined && supersedes !== undefined) throw new UsageError(`--supersedes and --resolve do not go together: --resolve replaces every competing decision\nUsage: ${USAGE}`);
-  if (resolve !== undefined && !ID_RE.test(resolve)) {
-    throw new UsageError(`"${cleanText(resolve, 40)}" is not a decision id; run "huddle decisions" to see the conflict and its id\nUsage: ${USAGE}`);
-  }
-
   const ctx = await openContext(io);
   const me = await resolveSession(ctx);
-  const opts: { agent: string; supersedes?: string; resolve?: string } = { agent: me.agent };
-  if (supersedes !== undefined) opts.supersedes = supersedes;
-  if (resolve !== undefined) opts.resolve = resolve;
-  const result = await addDecision(ctx, text, opts);
-  return report(result, { remote: ctx.config.remote, supersedes, resolve }, io);
+  const result = await addDecision(ctx, text, supersedes === undefined ? { agent: me.agent } : { agent: me.agent, supersedes });
+  return report(result, { remote: ctx.config.remote, supersedes }, io);
 }
 
 /**
@@ -78,17 +66,10 @@ function shown({ decision, user }: Attributed): string {
  * a reason that running the command again as it is will not change by itself,
  * 2 a mistake in the command, 3 someone else got there first.
  */
-export function report(result: DecideResult, asked: { remote: string; supersedes?: string | undefined; resolve?: string | undefined }, io: Pick<Io, "out" | "err">): number {
-  const { remote, supersedes, resolve } = asked;
+export function report(result: DecideResult, asked: { remote: string; supersedes?: string | undefined }, io: Pick<Io, "out" | "err">): number {
+  const { remote, supersedes } = asked;
   if (result.ok) {
-    const replaced = result.replaced ?? (supersedes === undefined ? [] : [supersedes]);
-    const how =
-      resolve !== undefined
-        ? `, settling the conflict over ${shownText(resolve, 40)} (replacing ${replaced.join(", ")})`
-        : replaced.length === 0
-          ? ""
-          : `, replacing ${replaced.join(", ")}`;
-    io.out(`decision ${result.decision.id} recorded${how}: ${result.decision.text}`);
+    io.out(`decision ${result.decision.id} recorded${supersedes === undefined ? "" : `, replacing ${supersedes}`}: ${result.decision.text}`);
     if (result.dropped > 0) {
       const n = result.dropped;
       io.out(`(${n} superseded decision${n === 1 ? " was" : "s were"} removed from this clone's log to make room)`);
@@ -99,17 +80,15 @@ export function report(result: DecideResult, asked: { remote: string; supersedes
   switch (result.reason) {
     case "unknown-supersedes":
       throw new UsageError(`there is no decision ${supersedes}; run "huddle decisions" to see the ids. Nothing was recorded.`);
-    case "no-conflict":
-      throw new UsageError(`decision ${resolve} is in no unresolved conflict; run "huddle decisions" to see what is in force. Nothing was recorded.`);
     case "already-superseded": {
       const inForce = result.inForce ?? [];
       const first = inForce[0];
       const more = inForce.length > 1 ? ` (and ${inForce.length - 1} more; see "huddle decisions")` : "";
       if (inForce.length > 1 && new Set(inForce.map((entry) => entry.decision.text)).size > 1) {
-        // Competing replacements: an unresolved conflict, which --supersedes of one side does not settle.
+        // Competing replacements (audit A04). Replacing the decision they compete for once more would add a third.
         io.err(
-          `huddle: decision ${supersedes} was replaced by competing decisions: ${inForce.map(shown).join("; ")}. That is an unresolved conflict and none of them is in force. ` +
-            `The decision was NOT recorded. To settle it, agree on one rule and run: huddle decide --resolve ${supersedes} "<the rule>"`,
+          `huddle: decision ${supersedes} was replaced by competing decisions: ${inForce.map(shown).join("; ")}. They conflict, and huddle does not pick one. ` +
+            "The decision was NOT recorded. Settle it together, then replace the one that should go: huddle decide --supersedes <its id> \"<the rule>\"",
         );
         return EXIT.CONFLICT;
       }
