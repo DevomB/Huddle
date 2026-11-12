@@ -1,0 +1,29 @@
+{
+  "name": "git-huddle",
+  "version": "0.1.0",
+  "description": "Coding agents on different laptops coordinating through the git remote they already share.",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "huddle": "dist/huddle.mjs",
+    "git-huddle": "dist/huddle.mjs"
+  },
+  "files": [
+    "dist/huddle.mjs"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "pretest": "npm run build",
+    "test": "node --test \"test/**/*.test.ts\""
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2"
+  }
+}
