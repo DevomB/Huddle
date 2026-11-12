@@ -314,8 +314,11 @@ export const DELTA_HEAD = `[huddle] Update on teammates' agents. ${NOTICE}`;
 export const FULL_FOOT = `${OVERLAP_HINT} ${COMMANDS}`;
 export const overlapHead = (path: string): string => `[huddle] ${path} overlaps teammates' work in flight. ${NOTICE}`;
 export const SAY_SO = "Say so before editing, and coordinate or pick a different file if you can.";
-export const moreNote = (count: number): string => `[huddle] ${count} more of the paths in this edit overlap teammates' work as well: run \`huddle check\`.`;
-export const CUT_NOTE = "[huddle] Cut short to fit: run `huddle check` for the rest.";
+export const moreNote = (count: number): string =>
+  `[huddle] ${count} more of the paths in this edit overlap teammates' work as well: run \`huddle check\` with those paths.`;
+/** The line after the block of a path that has `count` more sessions on it than the block names. */
+export const unnamedNote = (count: number, path: string): string =>
+  `[huddle] ${count} more ${count === 1 ? "session overlaps" : "sessions overlap"} ${path} as well: run \`huddle check\` with that path to see them all.`;
 
 /** Joins the lines of an expected text. */
 export const text = (...lines: string[]): string => lines.join("\n");

@@ -18,7 +18,6 @@ import { REDACTED } from "../src/hooks/intent.ts";
 import {
   ALONE,
   AUTH_PROMPT,
-  CUT_NOTE,
   DELTA_HEAD,
   FULL_FOOT,
   FULL_HEAD,
@@ -58,6 +57,7 @@ import {
   text,
   throttled,
   timed,
+  unnamedNote,
 } from "./engine.kit.ts";
 import { createHarness } from "./harness.ts";
 import type { Clone } from "./harness.ts";
@@ -523,7 +523,28 @@ test("an edit of many files spells out five overlapping paths and counts the res
   assert.deepEqual(await fire(bob, "pre-edit", 22, edit), {});
 });
 
-test("a warning never grows past 4000 characters: what does not fit is counted, and one path that is too long alone is cut", async (t) => {
+test("a warning names first whoever is new to the session, whatever the order of the team view", async (t) => {
+  const { bob } = await team(t);
+  await fire(bob, "session-start", 0);
+  const on = (actor: string, user: string, seen: number): ActorDoc => teammate(actor, user, [remoteSession(`s-${user}`, seen, { files: ["a.ts"] })]);
+  const line = (user: string, seen: number, now: number): string => `- ${user} / codex on main (${ago(seen, now)}) has it in flight: no stated intent.`;
+
+  await cacheTeam(bob, 30, [on("aliceaaa", "alice", 30)]);
+  assert.equal((await fire(bob, "pre-edit", 31, { paths: ["a.ts"] })).context, text(overlapHead("a.ts"), line("alice", 30, 31), SAY_SO));
+
+  // Dave and erin turn up on the file. Both were last seen before alice, so the team view has them after her.
+  await cacheTeam(bob, 32, [on("aliceaaa", "alice", 30), on("daveaaaa", "dave", 20), on("erinaaaa", "erin", 25)]);
+  assert.equal((await fire(bob, "pre-edit", 33, { paths: ["a.ts"] })).context, text(overlapHead("a.ts"), line("erin", 25, 33), line("dave", 20, 33), line("alice", 30, 33), SAY_SO));
+  assert.deepEqual(await fire(bob, "pre-edit", 34, { paths: ["a.ts"] }), {});
+
+  // A subagent has been told about nobody: for it, the order is the team view's.
+  assert.equal(
+    (await fire(bob, "pre-edit", 35, { paths: ["a.ts"], subagent: true })).context,
+    text(overlapHead("a.ts"), line("alice", 30, 35), line("erin", 25, 35), line("dave", 20, 35), SAY_SO),
+  );
+});
+
+test("a warning never grows past 4000 characters: what does not fit is counted, and of one path that is too long alone the sessions are", async (t) => {
   const { bob } = await team(t);
   await fire(bob, "session-start", 0);
 
@@ -540,15 +561,106 @@ test("a warning never grows past 4000 characters: what does not fit is counted, 
   assert.ok(second.startsWith(overlapHead("huge.ts")) && second.endsWith(SAY_SO), second.slice(-200));
   assert.ok(second.length <= 4000);
 
-  // Twenty on one file: its warning alone is too long. It is cut at the end of a line, says so, and counts as told.
+  // Twenty on one file: its warning cannot name them all. It names as many as fit and counts the others.
   await cacheTeam(bob, 10, crowd(20, ["vast.ts"]));
+  /** A warning about vast.ts as the letters of the teammates it names, and its other lines. */
+  const about = (warning: string): { named: string; frame: string[]; lineLength: number } => {
+    const all = warning.split("\n");
+    const named = all.slice(1, -2).map((line) => /^- teammate-([a-t]) \/ codex on main \(\d\ds ago\) has it in flight: "(?:\1 ){99}\1"\.$/.exec(line)?.[1] ?? "?");
+    return { named: named.join(""), frame: [all[0] ?? "", ...all.slice(-2)], lineLength: all[1]?.length ?? 0 };
+  };
   const cut = (await fire(bob, "pre-edit", 22, { paths: ["vast.ts"] })).context ?? "";
-  assert.ok(cut.length > 3000 && cut.length <= 4000, `${cut.length} characters`);
-  const cutLines = cut.split("\n");
-  assert.equal(cutLines[0], overlapHead("vast.ts"));
-  assert.equal(cutLines.at(-1), CUT_NOTE);
-  for (const line of cutLines.slice(1, -1)) assert.match(line, /^- teammate-[a-t] \/ codex on main \(12s ago\) has it in flight: "(?:[a-t] ){99}[a-t]"\.$/);
-  assert.deepEqual(await fire(bob, "pre-edit", 23, { paths: ["vast.ts"] }), {});
+  assert.deepEqual(about(cut), { named: "abcdefghijklmn", frame: [overlapHead("vast.ts"), SAY_SO, unnamedNote(6, "vast.ts")], lineLength: 259 });
+  assert.ok(cut.length <= 4000 && cut.length + 260 > 4000, `${cut.length} characters: no room was left for one more of them`);
+
+  // Only the ones it named count as told. The next edit of the file is warned about with the others, and the
+  // fourteen from before are the ones that are counted now.
+  const rest = (await fire(bob, "pre-edit", 23, { paths: ["vast.ts"] })).context ?? "";
+  assert.deepEqual(about(rest), { named: "opqrst", frame: [overlapHead("vast.ts"), SAY_SO, unnamedNote(14, "vast.ts")], lineLength: 259 });
+  assert.deepEqual(await fire(bob, "pre-edit", 24, { paths: ["vast.ts"] }), {}, "now the session has been told about all twenty");
+
+  // One more arrives. The warning is about that one, and does not go through the twenty again.
+  await cacheTeam(bob, 10, [...crowd(20, ["vast.ts"]), teammate("teamlate", "zoe", [remoteSession("s-zoe", 5, { files: ["vast.ts"] })])]);
+  assert.equal(
+    (await fire(bob, "pre-edit", 25, { paths: ["vast.ts"] })).context,
+    text(overlapHead("vast.ts"), "- zoe / codex on main (20s ago) has it in flight: no stated intent.", SAY_SO, unnamedNote(20, "vast.ts")),
+  );
+  assert.deepEqual(await fire(bob, "pre-edit", 26, { paths: ["vast.ts"] }), {});
+
+  // A subagent has no memory: it gets the first fourteen each time.
+  for (const now of [27, 28]) assert.equal(about((await fire(bob, "pre-edit", now, { paths: ["vast.ts"], subagent: true })).context ?? "").named, "abcdefghijklmn");
+
+  // Twenty other people on two files, both in one edit. The line that counts the second file needs its room too,
+  // so the first file's block names one fewer; and the second file waits until the first has been told in full.
+  await cacheTeam(bob, 10, crowd(20, ["east.ts", "west.ts"], "y"));
+  const both = { paths: ["east.ts", "west.ts"] };
+  const turns: string[] = [];
+  for (let now = 30; now < 36; now++) {
+    const warning = (await fire(bob, "pre-edit", now, both)).context ?? "";
+    assert.ok(warning.length <= 4000, `${warning.length} characters`);
+    const all = warning.split("\n");
+    const counted = all.at(-1) === moreNote(1) ? 1 : 0;
+    const named = all.filter((line) => line.startsWith("- teammate-")).map((line) => line.charAt(11));
+    turns.push(`${/^\[huddle\] (\S+) overlaps/.exec(all[0] ?? "")?.[1] ?? "nothing"}: ${named.join("")}${counted === 1 ? ", and one more path" : ""}`);
+    if (warning !== "") assert.equal(all.at(-1 - counted), unnamedNote(20 - named.length, turns.at(-1)?.split(":")[0] ?? ""));
+  }
+  assert.deepEqual(turns, ["east.ts: abcdefghijklm, and one more path", "east.ts: nopqrst, and one more path", "west.ts: abcdefghijklmn", "west.ts: opqrst", "nothing: ", "nothing: "]);
+
+  // Fifteen on one file is one too many, and the line that says so counts in the singular.
+  await cacheTeam(bob, 10, crowd(15, ["tall.ts"], "x"));
+  assert.deepEqual(about((await fire(bob, "pre-edit", 40, { paths: ["tall.ts"] })).context ?? ""), {
+    named: "abcdefghijklmn",
+    frame: [overlapHead("tall.ts"), SAY_SO, unnamedNote(1, "tall.ts")],
+    lineLength: 259,
+  });
+  const fifteenth = `- teammate-o / codex on main (${ago(10, 41)}) has it in flight: "${"o ".repeat(100).trim()}".`;
+  assert.equal((await fire(bob, "pre-edit", 41, { paths: ["tall.ts"] })).context, text(overlapHead("tall.ts"), fifteenth, SAY_SO, unnamedNote(14, "tall.ts")));
+
+  // Eight on one file and six on another: each block fits, and the two together are a few characters too long. A
+  // block that does not fit whole is left for the next edit, however little is missing.
+  await cacheTeam(bob, 10, [...crowd(8, ["north.ts"], "n"), ...crowd(6, ["south.ts"], "s")]);
+  const poles = { paths: ["north.ts", "south.ts"] };
+  const north = (await fire(bob, "pre-edit", 50, poles)).context ?? "";
+  assert.equal(north.split("\n").length, 11);
+  assert.ok(north.startsWith(`${overlapHead("north.ts")}\n`) && north.endsWith(`\n${SAY_SO}\n${moreNote(1)}`), north.slice(-300));
+  const south = (await fire(bob, "pre-edit", 51, poles)).context ?? "";
+  assert.equal(south.split("\n").length, 8);
+  assert.ok(south.startsWith(`${overlapHead("south.ts")}\n`) && south.endsWith(`\n${SAY_SO}`), south.slice(-300));
+  const together = north.length - moreNote(1).length + south.length;
+  assert.ok(together > 4000 && together < 4100, `the two blocks and the line break between them are ${together} characters`);
+});
+
+test("one session always fits in a warning: the longest names there can be, in characters that count double", async (t) => {
+  const { bob } = await team(t);
+  await fire(bob, "session-start", 0);
+  // Outside the basic plane a character is two in a JavaScript string, and every limit on a name counts characters.
+  const wide = (count: number): string => String.fromCodePoint(0x1f600).repeat(count);
+  const dir = Array.from({ length: 4 }, () => wide(49)).join("/");
+  const worst = (letter: string): ActorDoc =>
+    teammate(`worst${letter.repeat(3)}`, `${letter}${wide(79)}`, [
+      remoteSession(`s-${letter}`, 10, { agent: wide(80), branch: wide(200), intent: wide(200), intentSource: "prompt", files: [`${dir}/${wide(49)}`] }),
+    ]);
+  await cacheTeam(bob, 10, ["a", "b", "c", "d"].map(worst));
+  const edit = { paths: [join(bob.dir, dir)] };
+
+  // Four of them do not fit, and neither do three with the line that counts the fourth. Two do.
+  const first = ((await fire(bob, "pre-edit", 20, edit)).context ?? "").split("\n");
+  assert.deepEqual([first.length, first[0], ...first.slice(-2)], [5, overlapHead(dir), SAY_SO, unnamedNote(2, dir)]);
+  assert.deepEqual(
+    first.slice(1, 3).map((line) => line.slice(0, 3)),
+    ["- a", "- b"],
+  );
+  // Each line is as long as a line gets: every name in it was cut to its limit.
+  for (const line of first.slice(1, 3)) assert.ok(line.length > 1100 && line.length < 1200, `${line.length} characters`);
+  assert.ok(first.join("\n").length > 3000 && first.join("\n").length <= 4000, `${first.join("\n").length} characters`);
+
+  const second = ((await fire(bob, "pre-edit", 21, edit)).context ?? "").split("\n");
+  assert.deepEqual([second.length, second[0], ...second.slice(-2)], [5, overlapHead(dir), SAY_SO, unnamedNote(2, dir)]);
+  assert.deepEqual(
+    second.slice(1, 3).map((line) => line.slice(0, 3)),
+    ["- c", "- d"],
+  );
+  assert.deepEqual(await fire(bob, "pre-edit", 22, edit), {});
 });
 
 test("a pre-edit that is the first sign of a session records it and has it published at once", async (t) => {
@@ -718,17 +830,21 @@ test("a warning and an update in one text never pass 4000 characters: the update
     await fire(carol, "session-end", 140 + round, fresh);
   }
 
-  // Twenty on one file: the warning alone has to be cut, and leaves no room worth using. The update is not given, so
-  // it is not used up either: it comes with the next event that may brief.
+  // Twenty on one file: the warning names as many of them as fit, and that leaves no room worth using. The update
+  // is not given, so it is not used up either: it comes with the next event that may brief.
   await cacheTeam(bob, 10, crowd(20, ["vast.ts"], "z"));
   const vast = { brief: true, paths: ["vast.ts"] };
   const alone = (await fire(bob, "post-edit", 40, vast)).context ?? "";
   assert.ok(alone.length > 3500 && alone.length <= 4000, `${alone.length} characters`);
   assert.equal(alone.split("\n")[0], overlapHead("vast.ts"));
-  assert.equal(alone.split("\n").at(-1), CUT_NOTE);
+  assert.deepEqual(alone.split("\n").slice(-2), [SAY_SO, unnamedNote(6, "vast.ts")]);
   assert.ok(!alone.includes(DELTA_HEAD), "there was no room for an update");
+  // That event has the six who were only counted, which is a short warning, and the update after it.
   const late = (await fire(bob, "post-edit", 41, vast)).context ?? "";
-  assert.ok(late.startsWith(`${DELTA_HEAD}\n`) && late.length <= 4000, late.slice(0, 200));
+  assert.ok(late.length <= 4000, `${late.length} characters`);
+  const [others, update] = parts(late, DELTA_HEAD);
+  assert.deepEqual([others.split("\n").length, others.split("\n")[0], ...others.split("\n").slice(-2)], [9, overlapHead("vast.ts"), SAY_SO, unnamedNote(14, "vast.ts")]);
+  assert.ok(update.length >= 500, `an update of ${update.length} characters`);
   assert.deepEqual(await fire(bob, "post-edit", 42, vast), {});
 });
 
