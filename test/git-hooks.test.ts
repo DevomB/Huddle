@@ -124,6 +124,9 @@ const install = (clone: Clone, bundle = BUNDLE) => installGitHooks({ repoRoot: c
 
 const HUSKY_8_FIRST = '. "$(dirname -- "$0")/_/husky.sh"';
 
+const NODE_NOTE =
+  "The git hooks need node on the PATH of whatever runs git. A graphical git client or an editor's source control panel may not have it there (nvm, fnm and volta set it up in the shell). The hooks then do nothing and say nothing, and commits made there do not reach teammates.";
+
 const SCRIPTS: Array<{ name: string; text: string; before: string }> = [
   { name: "an empty file", text: "", before: "" },
   { name: "only a shebang, no line break", text: "#!/bin/sh", before: "#!/bin/sh\n" },
@@ -155,7 +158,7 @@ test("git block: goes after the first line that must stay first, and comes out a
 });
 
 test("git block: an older block is replaced where it stands and nothing else moves", () => {
-  const old = "# >>> huddle >>> an older wording\nnode old.mjs hook git pre-commit\nexit 3\n# <<< huddle <<<\n";
+  const old = "# >>> huddle >>> an older wording\nnode old.mjs hook git pre-commit || exit 3\n# <<< huddle <<<\n";
   const block = hookBlock("pre-commit", BUNDLE, false);
   for (const [head, tail] of [
     ["#!/bin/sh\necho before\n", "echo after\n"],
@@ -169,6 +172,45 @@ test("git block: an older block is replaced where it stands and nothing else mov
   assert.equal(withBlock(`#!/bin/sh\n${old.trimEnd()}`, block), `#!/bin/sh\n${block.trimEnd()}`);
   // A file with no block is returned as it is.
   assert.equal(withoutBlock("#!/bin/sh\nnpm test\n"), "#!/bin/sh\nnpm test\n");
+});
+
+test("git block: a marker line that is not part of a whole block is the user's text, and so is everything next to it", () => {
+  const block = hookBlock("pre-commit", BUNDLE, false);
+  const begin = "# >>> huddle >>> (the other two lines were deleted by hand)\n";
+  const end = "# <<< huddle <<<\n";
+  const leftovers: Array<[name: string, text: string]> = [
+    // b6's case: a husky 8 hook, two of the three lines deleted. The block goes below husky's line, so the stray marker is above it.
+    ["a begin line above the place the block goes", `#!/bin/sh\n${begin}npm test\n${HUSKY_8_FIRST}\nnpx lint-staged\n`],
+    ["a begin line and nothing else", `#!/bin/sh\n${begin}npm test\n`],
+    ["an end line and nothing else", `#!/bin/sh\nnpm test\n${end}npx lint-staged\n`],
+    ["a begin and an end with the user's lines between them", `#!/bin/sh\n${begin}npm test\nnpx lint-staged\n${end}echo done\n`],
+    ["a begin and an end with nothing between them", `#!/bin/sh\n${begin}${end}npm test\n`],
+    // Three lines, and the one in the middle is not huddle's command.
+    ["a begin and an end around one line of the user's", `#!/bin/sh\n${begin}npm test\n${end}npx lint-staged\n`],
+    ["a begin and an end around a line that only mentions huddle", `#!/bin/sh\n${begin}echo "see the huddle hook, git people"\n${end}`],
+    ["a begin line right above where a block will go", `#!/bin/sh\n${begin}`],
+    ["an end line with something after the marker", "#!/bin/sh\n# >>> huddle >>>\nnpm test\n# <<< huddle <<< kept\n"],
+    ["the begin marker indented", "#!/bin/sh\nif true; then\n  # >>> huddle >>>\n  npm test\n  # <<< huddle <<<\nfi\n"],
+  ];
+  for (const [name, text] of leftovers) {
+    assert.equal(withoutBlock(text), text, `${name}: there is no block to take out`);
+    const once = withBlock(text, block);
+    // Every line of the user's is still there, in order, and the block was added whole.
+    assert.equal(withoutBlock(once), text, `${name}: adding and removing gives back every line`);
+    assert.equal(once.split(commandLine("pre-commit", BUNDLE)).length, 2, name);
+    // The next `huddle init`, and the one after: nothing more changes.
+    assert.equal(withBlock(once, block), once, `${name}: a second init changes nothing`);
+    assert.equal(withBlock(withBlock(once, hookBlock("pre-commit", "tools/huddle.mjs", false)), block), once, `${name}: moving the bundle and back`);
+  }
+});
+
+test("git block: two whole blocks, as a merge kept by hand can leave them, become one and are both taken out", () => {
+  const block = hookBlock("pre-commit", BUNDLE, false);
+  const other = hookBlock("pre-commit", "tools/huddle.mjs", false);
+  const text = `#!/bin/sh\n${other}npm test\n${block}npx lint-staged\n${other.trimEnd()}`;
+  assert.equal(withBlock(text, block), `#!/bin/sh\n${block}npm test\nnpx lint-staged\n`);
+  assert.equal(withoutBlock(text), "#!/bin/sh\nnpm test\nnpx lint-staged\n");
+  assert.equal(withBlock(withBlock(text, block), block), withBlock(text, block));
 });
 
 test("git block: the command lines, word for word", () => {
@@ -303,17 +345,21 @@ test("git install: a clone with no hooks gets four files that hold nothing but t
 
   const result = await install(alice);
   assert.deepEqual(result.changed, GIT_HOOKS.map((hook) => `.git/hooks/${hook}`));
-  assert.equal(result.notes.length, 2);
+  assert.equal(result.notes.length, 3);
   assert.match(result.notes[0] ?? "", /each teammate runs huddle init once in their own clone/);
   assert.equal(result.notes[1], "The git hooks run .huddle/huddle.mjs from whatever is checked out, also right after a checkout or a merge. Checking out a branch you do not trust runs its copy.");
+  // Without node the hooks are silent by design, so this is the only place anyone hears of it.
+  assert.equal(result.notes[2], NODE_NOTE);
+  // Hooks under .git are nobody's to commit.
+  assert.deepEqual(result.files, []);
   for (const hook of GIT_HOOKS) {
     assert.equal(await readFile(hookFile(alice, hook), "utf8"), `#!/bin/sh\n${hookBlock(hook, BUNDLE, true)}`);
     assert.equal(await modeOf(hookFile(alice, hook)), 0o755);
   }
   assert.deepEqual((await readdir(join(alice.dir, ".git/hooks"))).sort(), [...before, ...GIT_HOOKS].sort(), "no other file appeared, none went away");
 
-  assert.deepEqual(await install(alice), { changed: [], notes: result.notes }, "a second run changes nothing");
-  assert.deepEqual(await install(alice, "./.huddle/huddle.mjs"), { changed: [], notes: result.notes }, "the bundle path is one spelling");
+  assert.deepEqual(await install(alice), { changed: [], notes: result.notes, files: [] }, "a second run changes nothing");
+  assert.deepEqual(await install(alice, "./.huddle/huddle.mjs"), { changed: [], notes: result.notes, files: [] }, "the bundle path is one spelling");
   assert.deepEqual(await checkGitHooks(alice.dir), { installed: true, detail: "4 git hooks in .git/hooks", notes: result.notes });
   assert.equal(await alice.git("status", "--porcelain", "--", ".git"), "", "nothing git tracks was touched");
 });
@@ -541,7 +587,8 @@ test("git install: a hook huddle cannot add itself to is left exactly as it is, 
   const check = await checkGitHooks(alice.dir);
   assert.equal(check.installed, true);
   assert.equal(check.detail, "1 git hook in .git/hooks; pre-commit, post-commit, post-checkout left alone");
-  assert.equal(check.notes[2], "The pre-commit, post-commit, post-checkout hooks in .git/hooks are not shell scripts huddle can add itself to, so they were left alone.");
+  assert.equal(check.notes[3], "The pre-commit, post-commit, post-checkout hooks in .git/hooks are not shell scripts huddle can add itself to, so they were left alone.");
+  assert.equal("broken" in check, false, "left alone on purpose is not broken");
 });
 
 test("git install: which first lines count as a shell script", { skip: !POSIX }, async (t) => {
@@ -612,11 +659,11 @@ test("git install: a hook manager that rewrites its files is pointed out", { ski
   await script(hookFile(alice, "pre-commit"), '#!/bin/sh\n\nif [ "$LEFTHOOK" = "0" ]; then\n  exit 0\nfi\n\ncall_lefthook run "pre-commit" "$@"\n');
   await script(hookFile(alice, "post-merge"), "#!/usr/bin/env bash\n# File generated by pre-commit: https://pre-commit.com\n# ID: 138fd403232d2ddd5efb44317e38bf03\nexec pre-commit hook-impl\n");
   const first = await install(alice);
-  assert.equal(first.notes.length, 4);
-  assert.match(first.notes[2] ?? "", /^lefthook rewrites the hook files it manages/);
-  assert.match(first.notes[3] ?? "", /^pre-commit rewrites its hook file when `pre-commit install` runs/);
+  assert.equal(first.notes.length, 5);
+  assert.match(first.notes[3] ?? "", /^lefthook rewrites the hook files it manages/);
+  assert.match(first.notes[4] ?? "", /^pre-commit rewrites its hook file when `pre-commit install` runs/);
   // The reminder does not depend on huddle's own lines being new.
-  assert.deepEqual(await install(alice), { changed: [], notes: first.notes });
+  assert.deepEqual(await install(alice), { changed: [], notes: first.notes, files: [] });
 });
 
 // ---------------------------------------------------------------------------
@@ -629,8 +676,10 @@ test("git check: says what is missing, changed, switched off or pointing nowhere
   assert.deepEqual(await checkGitHooks(alice.dir), { installed: false, detail: "no huddle git hooks in .git/hooks. Run huddle init.", notes: [] });
 
   await install(alice);
+  // Never installed is one thing; there and not able to work is `broken`, which doctor warns about.
   assert.deepEqual(await checkGitHooks(alice.dir), {
     installed: false,
+    broken: true,
     detail: "git hooks in .git/hooks run .huddle/huddle.mjs, which is not in this checkout. Run huddle init.",
     notes: [],
   });
@@ -642,6 +691,7 @@ test("git check: says what is missing, changed, switched off or pointing nowhere
   await writeFile(hookFile(alice, "pre-commit"), edited);
   assert.deepEqual(await checkGitHooks(alice.dir), {
     installed: false,
+    broken: true,
     detail: "huddle git hooks in .git/hooks are missing for post-merge and not what this version installs for pre-commit. Run huddle init.",
     notes: [],
   });
@@ -651,6 +701,7 @@ test("git check: says what is missing, changed, switched off or pointing nowhere
   await chmod(hookFile(alice, "post-commit"), 0o644);
   assert.deepEqual(await checkGitHooks(alice.dir), {
     installed: false,
+    broken: true,
     detail: "git ignores the post-commit hook in .git/hooks: not executable. Run chmod +x on it.",
     notes: [],
   });
@@ -668,7 +719,21 @@ test("git check: says what is missing, changed, switched off or pointing nowhere
   const mixed = await checkGitHooks(alice.dir);
   assert.equal(mixed.installed, true);
   assert.equal(mixed.detail, "3 git hooks in .git/hooks; pre-commit left alone");
-  assert.match(mixed.notes[2] ?? "", /^The pre-commit hook in \.git\/hooks is not a shell script huddle can add itself to, so it was left alone\.$/);
+  assert.equal(mixed.notes[2], NODE_NOTE);
+  assert.match(mixed.notes[3] ?? "", /^The pre-commit hook in \.git\/hooks is not a shell script huddle can add itself to, so it was left alone\.$/);
+
+  // Two whole blocks in one hook, as a merge kept by hand leaves them: huddle would run twice for every commit.
+  await install(alice, BUNDLE);
+  const twice = hookFile(alice, "post-commit");
+  await writeFile(twice, `${await readFile(twice, "utf8")}${hookBlock("post-commit", BUNDLE, false)}`);
+  assert.deepEqual(await checkGitHooks(alice.dir), {
+    installed: false,
+    broken: true,
+    detail: "huddle git hooks in .git/hooks are not what this version installs for post-commit. Run huddle init.",
+    notes: [],
+  });
+  assert.deepEqual((await install(alice)).changed, [".git/hooks/post-commit"], "init makes them one");
+  assert.equal(await readFile(twice, "utf8"), `#!/bin/sh\n${hookBlock("post-commit", BUNDLE, true)}`);
 });
 
 test("git install: moving the bundle updates the one block in each hook", { skip: !POSIX }, async (t) => {
@@ -698,7 +763,10 @@ test("git install: core.hooksPath inside the repository is where the hooks go, a
   assert.deepEqual(result.notes, [
     "The git hooks are in .githooks, which is part of the working tree: commit them, and teammates whose git reads hooks from there get them too.",
     "The git hooks run .huddle/huddle.mjs from whatever is checked out, also right after a checkout or a merge. Checking out a branch you do not trust runs its copy.",
+    NODE_NOTE,
   ]);
+  // These are files the team commits: init names them, changed by this run or not.
+  assert.deepEqual(result.files, GIT_HOOKS.map((hook) => `.githooks/${hook}`));
   assert.deepEqual((await readdir(join(alice.dir, ".git/hooks"))).sort(), before, "the directory git no longer reads is left alone");
   assert.deepEqual(await checkGitHooks(alice.dir), { installed: true, detail: "4 git hooks in .githooks", notes: result.notes });
 
@@ -708,7 +776,7 @@ test("git install: core.hooksPath inside the repository is where the hooks go, a
 
   // The same directory named by its absolute path is still inside the repository.
   await alice.git("config", "core.hooksPath", join(alice.dir, ".githooks"));
-  assert.deepEqual(await install(alice), { changed: [], notes: result.notes });
+  assert.deepEqual(await install(alice), { changed: [], notes: result.notes, files: GIT_HOOKS.map((hook) => `.githooks/${hook}`) });
 });
 
 test("git install: a hooks directory outside the repository is not huddle's to change", { skip: !POSIX }, async (t) => {
@@ -760,6 +828,7 @@ test("git install: with husky 9 the hooks go next to the team's own, not into th
   const result = await install(alice);
   assert.deepEqual(result.changed, GIT_HOOKS.map((hook) => `.husky/${hook}`));
   assert.match(result.notes[0] ?? "", /^The git hooks are in \.husky, which is part of the working tree: commit them/);
+  assert.deepEqual(result.files, GIT_HOOKS.map((hook) => `.husky/${hook}`), "not the directory husky generates");
   assert.equal(await readFile(join(alice.dir, ".husky/_/pre-commit"), "utf8"), generated);
   assert.equal(await alice.read(".husky/pre-commit"), `${hookBlock("pre-commit", BUNDLE, false)}echo "husky ran" >> "$USER_MARKER"\n`);
   assert.equal(await modeOf(join(alice.dir, ".husky/pre-commit")), 0o644);
@@ -820,6 +889,7 @@ test("git install: a linked worktree shares the clone's hooks, and each worktree
 
   const result = await install(tree);
   assert.deepEqual(result.changed, GIT_HOOKS.map((hook) => join(alice.dir, ".git/hooks", hook)), "outside this worktree, so named in full");
+  assert.deepEqual(result.files, [], "and not files anyone commits");
   assert.deepEqual(await checkGitHooks(tree.dir), { installed: true, detail: `4 git hooks in ${join(alice.dir, ".git/hooks")}`, notes: result.notes });
   assert.deepEqual((await install(alice)).changed, [], "the main checkout finds them in place");
 

@@ -202,8 +202,16 @@ export function hookBlock(hook: GitHook, bundle: string, created: boolean): stri
   return `${created ? CREATED : ADDED}\n${commandLine(hook, bundle)}\n${END}\n`;
 }
 
-/** From the BEGIN line through the END line, with the line break after it when there is one. */
-const BLOCK = /^# >>> huddle >>>[^\n]*\n(?:[^\n]*\n)*?# <<< huddle <<<\r?(?:\n|$)/m;
+/**
+ * Huddle's block: the BEGIN line, one line that runs `hook git`, the END line,
+ * and the line break after it when there is one. Exactly those three lines,
+ * because that is all huddle ever writes. A BEGIN or END line that is not
+ * part of such a triple (the other two deleted by hand, a merge of a committed
+ * hook resolved by hand) is the user's text, and so are the lines next to it:
+ * matching from a BEGIN to the next END, whatever lay between, would take
+ * those lines out.
+ */
+const BLOCK = /^# >>> huddle >>>[^\n]*\n[^\n]*\bhook git [^\n]*\n# <<< huddle <<<\r?(?:\n|$)/m;
 
 interface Split {
   before: string;
@@ -215,6 +223,17 @@ function splitBlock(text: string): Split | null {
   const found = BLOCK.exec(text);
   if (found === null) return null;
   return { before: text.slice(0, found.index), block: found[0], after: text.slice(found.index + found[0].length) };
+}
+
+/**
+ * `text` with every block taken out. Used on what follows the first block: a
+ * second one is a leftover (two branches that each got a block, merged with
+ * both kept) and would run huddle twice for every commit.
+ */
+function withoutMore(text: string): string {
+  let rest = text;
+  for (let split = splitBlock(rest); split !== null; split = splitBlock(rest)) rest = split.before + split.after;
+  return rest;
 }
 
 /** husky 8's first line of every hook. It runs the hook a second time, so whatever is above it runs twice. */
@@ -235,7 +254,7 @@ function insertionPoint(text: string): number {
  */
 export function withBlock(text: string, block: string): string {
   const split = splitBlock(text);
-  if (split !== null) return split.before + (split.block.endsWith("\n") ? block : block.slice(0, -1)) + split.after;
+  if (split !== null) return split.before + (split.block.endsWith("\n") ? block : block.slice(0, -1)) + withoutMore(split.after);
   const at = insertionPoint(text);
   // After a last line that has no line break: the break that separates that
   // line from the block is the block's, and the block gives up its own.
@@ -248,7 +267,13 @@ export function withoutBlock(text: string): string {
   const split = splitBlock(text);
   if (split === null) return text;
   if (!split.block.endsWith("\n") && split.before.endsWith("\n")) return split.before.slice(0, -1) + split.after;
-  return split.before + split.after;
+  return split.before + withoutMore(split.after);
+}
+
+/** Does the text hold more than one block? */
+function hasSecondBlock(text: string): boolean {
+  const split = splitBlock(text);
+  return split !== null && splitBlock(split.after) !== null;
 }
 
 /** The bundle a block runs, read back out of its command line. */
@@ -392,6 +417,20 @@ async function writeHook(file: string, text: string): Promise<void> {
 // install, remove, check, detect
 // ---------------------------------------------------------------------------
 
+/**
+ * `files`: the hook files the team commits, changed by this run or not, which
+ * init uses to say what is still to be committed. `broken`: the hooks are
+ * there and cannot work as they are, which doctor warns about. Both are
+ * optional fields of the contract that T2.3 adds to types.ts; until that is
+ * merged they are spelled out here.
+ */
+type Installed = InstallResult & { files?: string[] };
+type Check = CheckResult & { broken?: boolean };
+
+/** The hooks do nothing without node, and say nothing: so init and doctor say it. */
+const NODE_NOTE =
+  "The git hooks need node on the PATH of whatever runs git. A graphical git client or an editor's source control panel may not have it there (nvm, fnm and volta set it up in the shell). The hooks then do nothing and say nothing, and commits made there do not reach teammates.";
+
 const PER_CLONE_NOTE =
   "Git hooks are not committed: each teammate runs huddle init once in their own clone to get them. They cover commits, checkouts and merges made without an agent.";
 
@@ -425,7 +464,7 @@ function byHand(bundle: string): string {
  * install(), with the platform passed in for tests. Throws when no hook could
  * be installed at all, with the reason: `huddle init` reports it as a note.
  */
-export async function installGitHooks(opts: InstallOptions, platform: NodeJS.Platform = process.platform): Promise<InstallResult> {
+export async function installGitHooks(opts: InstallOptions, platform: NodeJS.Platform = process.platform): Promise<Installed> {
   const bundle = bundlePath(opts.bundle);
   if (!SHELL_INERT.test(bundle)) {
     throw new TypeError(`the bundle path ${JSON.stringify(bundle)} cannot be written into a shell command (letters, digits, ".", "_", "-" and "/" only)`);
@@ -448,13 +487,17 @@ export async function installGitHooks(opts: InstallOptions, platform: NodeJS.Pla
 
   const changed: string[] = [];
   const notes: string[] = [];
+  /** The files that hold huddle's lines when this is done. */
+  const holding: string[] = [];
   for (const { hook, file, shown, standing } of plans) {
     if (standing.kind === "absent") {
       await writeHook(file, OWN_FILE + hookBlock(hook, bundle, true));
       changed.push(shown);
+      holding.push(shown);
       continue;
     }
     if (standing.kind !== "script" || !standing.executable) continue;
+    holding.push(shown);
     for (const rewriter of REWRITERS) {
       if (rewriter.sign.test(withoutBlock(standing.text)) && !notes.includes(rewriter.note)) notes.push(rewriter.note);
     }
@@ -466,9 +509,10 @@ export async function installGitHooks(opts: InstallOptions, platform: NodeJS.Pla
     changed.push(shown);
   }
 
-  notes.unshift(place.inWorktree ? committedNote(place) : PER_CLONE_NOTE, RUNS_CHECKOUT_NOTE(bundle));
+  notes.unshift(place.inWorktree ? committedNote(place) : PER_CLONE_NOTE, RUNS_CHECKOUT_NOTE(bundle), NODE_NOTE);
   if (left.length > 0) notes.push(`huddle left ${left.length === 1 ? "one hook" : `${left.length} hooks`} alone: ${left.join("; ")}. ${byHand(bundle)}`);
-  return { changed, notes };
+  // Hooks under .git are nobody's to commit.
+  return { changed, notes, files: place.inWorktree ? holding : [] };
 }
 
 /**
@@ -493,7 +537,7 @@ export async function removeGitHooks(repoRoot: string, platform: NodeJS.Platform
 }
 
 /** check(), with the platform passed in for tests. */
-export async function checkGitHooks(repoRoot: string, platform: NodeJS.Platform = process.platform): Promise<CheckResult> {
+export async function checkGitHooks(repoRoot: string, platform: NodeJS.Platform = process.platform): Promise<Check> {
   const place = await findPlace(repoRoot);
   if (typeof place === "string") return { installed: false, detail: `no git hooks: ${place}`, notes: [] };
 
@@ -512,7 +556,7 @@ export async function checkGitHooks(repoRoot: string, platform: NodeJS.Platform 
       const bundle = bundleOf(standing.block);
       const created = standing.block.startsWith(CREATED);
       // The block at the very end of a file may have lost its last line break.
-      if (bundle === null || standing.block.trimEnd() !== hookBlock(hook, bundle, created).trimEnd()) differs.push(hook);
+      if (bundle === null || standing.block.trimEnd() !== hookBlock(hook, bundle, created).trimEnd() || hasSecondBlock(standing.text)) differs.push(hook);
       else if (!(await exists(join(place.root, bundle)))) strays.add(bundle);
       else bundles.add(bundle);
     }
@@ -526,15 +570,15 @@ export async function checkGitHooks(repoRoot: string, platform: NodeJS.Platform 
   const problems: string[] = [];
   if (missing.length > 0) problems.push(`missing for ${missing.join(", ")}`);
   if (differs.length > 0) problems.push(`not what this version installs for ${differs.join(", ")}`);
-  if (problems.length > 0) return { installed: false, detail: `huddle git hooks in ${place.shown} are ${problems.join(" and ")}. Run huddle init.`, notes: [] };
+  if (problems.length > 0) return { installed: false, broken: true, detail: `huddle git hooks in ${place.shown} are ${problems.join(" and ")}. Run huddle init.`, notes: [] };
   if (ignored.length > 0) {
     const one = ignored.length === 1;
-    return { installed: false, detail: `git ignores the ${ignored.join(", ")} ${one ? "hook" : "hooks"} in ${place.shown}: not executable. Run chmod +x on ${one ? "it" : "them"}.`, notes: [] };
+    return { installed: false, broken: true, detail: `git ignores the ${ignored.join(", ")} ${one ? "hook" : "hooks"} in ${place.shown}: not executable. Run chmod +x on ${one ? "it" : "them"}.`, notes: [] };
   }
   if (strays.size > 0) {
-    return { installed: false, detail: `git hooks in ${place.shown} run ${[...strays].join(", ")}, which is not in this checkout. Run huddle init.`, notes: [] };
+    return { installed: false, broken: true, detail: `git hooks in ${place.shown} run ${[...strays].join(", ")}, which is not in this checkout. Run huddle init.`, notes: [] };
   }
-  const notes = [place.inWorktree ? committedNote(place) : PER_CLONE_NOTE, ...[...bundles].map(RUNS_CHECKOUT_NOTE)];
+  const notes = [place.inWorktree ? committedNote(place) : PER_CLONE_NOTE, ...[...bundles].map(RUNS_CHECKOUT_NOTE), NODE_NOTE];
   const count = `${found} git ${found === 1 ? "hook" : "hooks"} in ${place.shown}`;
   if (foreign.length === 0) return { installed: true, detail: count, notes };
   const one = foreign.length === 1;
