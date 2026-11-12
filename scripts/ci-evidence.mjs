@@ -76,12 +76,14 @@ function parseJunit(xml) {
   for (const m of xml.matchAll(/<!-- (\w+) ([\d.]+) -->/g)) totals[m[1]] = Number(m[2]);
   const skipped = [];
   const failed = [];
-  for (const m of xml.matchAll(/<testcase\b([^>]*?)(\/>|>([\s\S]*?)<\/testcase>)/g)) {
+  // Node's reporter escapes quotes in attribute values but not ">", so a tag ends after its last quoted attribute,
+  // not at the first ">": a test name or skip reason may hold one.
+  for (const m of xml.matchAll(/<testcase((?:\s+[\w:-]+="[^"]*")*)\s*(\/>|>([\s\S]*?)<\/testcase>)/g)) {
     const name = attr(m[1], "name");
     const body = m[3] ?? "";
-    const skip = /<skipped\b([^>]*)\/?>/.exec(body);
+    const skip = /<skipped((?:\s+[\w:-]+="[^"]*")*)\s*\/?>/.exec(body);
     if (skip) skipped.push({ name, reason: attr(skip[1], "message"), type: attr(skip[1], "type") });
-    const fail = /<failure\b([^>]*)>/.exec(body);
+    const fail = /<failure((?:\s+[\w:-]+="[^"]*")*)\s*\/?>/.exec(body);
     if (fail) failed.push({ name, message: unescape(attr(fail[1], "message")).split("\n")[0].slice(0, 300) });
   }
   return { totals, skipped, failed };
