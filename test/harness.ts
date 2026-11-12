@@ -15,7 +15,7 @@
 
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -27,6 +27,34 @@ import type { RepoPaths } from "../src/core/paths.ts";
 
 /** The built CLI. */
 export const BUNDLE = fileURLToPath(new URL("../dist/huddle.mjs", import.meta.url));
+
+/**
+ * The node binary that runs the bundle. HUDDLE_TEST_NODE points it at another
+ * version (CI uses Node 20, the oldest supported), while the tests themselves
+ * need a Node that can load TypeScript.
+ */
+export const BUNDLE_NODE = process.env.HUDDLE_TEST_NODE || process.execPath;
+
+// `npm test` rebuilds the bundle; `node --test test/one.test.ts` does not. Running the tests
+// against a bundle older than the source gives false passes and false failures, so refuse.
+{
+  const root = fileURLToPath(new URL("..", import.meta.url));
+  const newest = (path: string): number => {
+    const info = statSync(path, { throwIfNoEntry: false });
+    if (!info) return 0;
+    if (!info.isDirectory()) return info.mtimeMs;
+    return Math.max(0, ...readdirSync(path).map((name) => newest(join(path, name))));
+  };
+  const built = statSync(BUNDLE, { throwIfNoEntry: false })?.mtimeMs ?? 0;
+  const source = Math.max(newest(join(root, "src")), newest(join(root, "scripts")), newest(join(root, "package.json")));
+  if (built < source) {
+    throw new Error(
+      built === 0
+        ? "dist/huddle.mjs does not exist. Run `npm run build` first (`npm test` does it for you)."
+        : "dist/huddle.mjs is older than the source it is built from. Run `npm run build` first (`npm test` does it for you).",
+    );
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Process-wide isolation, set up once on import.
@@ -129,6 +157,8 @@ export interface Snapshot {
   index: string | null;
   /** git status --porcelain, including untracked files. */
   status: string;
+  /** sha256 of the repository's config file: catches `push -u`, `remote set-url`, `git config`. */
+  config: string | null;
 }
 
 export interface Clone {
@@ -262,6 +292,7 @@ async function takeSnapshot(dir: string): Promise<Snapshot> {
     fetchHead: await hashFile(join(paths.gitDir, "FETCH_HEAD")),
     index: await hashFile(join(paths.gitDir, "index")),
     status,
+    config: await hashFile(join(paths.commonDir, "config")),
   };
 }
 
@@ -281,7 +312,7 @@ function runHuddle(dir: string, args: string[], opts: HuddleOptions): Promise<Ru
   Object.assign(env, opts.env ?? {});
 
   return new Promise((resolve) => {
-    const child = spawn(process.execPath, [BUNDLE, ...args], {
+    const child = spawn(BUNDLE_NODE, [BUNDLE, ...args], {
       cwd: opts.cwd ? join(dir, opts.cwd) : dir,
       env,
       stdio: ["pipe", "pipe", "pipe"],

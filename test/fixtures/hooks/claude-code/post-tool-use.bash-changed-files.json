@@ -1,0 +1,48 @@
+{
+  "session_id": "ccfbe5d0-8904-4150-b9ab-330b399c12e0",
+  "transcript_path": "/home/dev/.claude/projects/-home-dev-acme/ccfbe5d0-8904-4150-b9ab-330b399c12e0.jsonl",
+  "cwd": "/home/dev/acme",
+  "prompt_id": "2d00ad14-2a0f-4be5-8670-5d0f613c6dd7",
+  "permission_mode": "auto",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "echo three >> notes.txt",
+    "description": "Append \"three\" to notes.txt"
+  },
+  "tool_response": {
+    "stdout": "",
+    "stderr": "",
+    "interrupted": false,
+    "isImage": false,
+    "noOutputExpected": false,
+    "bashEditDiff": {
+      "files": [
+        {
+          "filePath": "/home/dev/acme/notes.txt",
+          "hunks": [
+            {
+              "oldStart": 1,
+              "oldLines": 1,
+              "newStart": 1,
+              "newLines": 1,
+              "lines": [
+                "-two",
+                "+twothree"
+              ]
+            }
+          ]
+        }
+      ],
+      "moreFiles": 0,
+      "changedFiles": [
+        "/home/dev/acme/notes.txt"
+      ]
+    }
+  },
+  "tool_use_id": "toolu_01S9sgXid4SyJBLtbh3fHN1Z",
+  "duration_ms": 234
+}

@@ -1,0 +1,7 @@
+{
+  "session_id": "6835a033-358b-4497-a94e-356ac1bac1e3",
+  "transcript_path": "/home/dev/.claude/projects/-home-dev-acme/6835a033-358b-4497-a94e-356ac1bac1e3.jsonl",
+  "cwd": "/home/dev/acme",
+  "hook_event_name": "SessionStart",
+  "source": "startup"
+}

@@ -1,24 +1,32 @@
 // T1.2 exit test (plan.md §5) and the cases around it.
 //
 // Every transport call in this file goes through `watched`, which snapshots the
-// clone before and after and fails if a local ref, HEAD, FETCH_HEAD, the index
-// or the working tree changed. That is the "after every call" clause of the
-// exit test, applied to every call rather than to a sample.
+// clone before and after and fails if a local ref, HEAD, FETCH_HEAD, the index,
+// the working tree or the clone's own object store changed. That is the "after
+// every call" clause of the exit test, applied to every call rather than to a
+// sample.
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { after, before, describe, test } from "node:test";
+import { pathToFileURL } from "node:url";
 import { LIMITS, serializeDoc } from "../src/core/docs.ts";
 import { NETWORK_TIMEOUT_MS } from "../src/core/git.ts";
 import {
   DOC_FILE,
+  OBJECT_MAX_AGE_MS,
+  alternatesEntry,
   classifyFailure,
   createTransport,
+  isMirror,
   parseLsRemote,
   parsePushStatus,
+  parseRemoteSettings,
+  pruneObjects,
   saysRefMoved,
   standInRemote,
   tracksRef,
@@ -119,6 +127,8 @@ function localState(dir: string): Record<string, string | null> {
     index: file("index"),
     status: sh(dir, ["status", "--porcelain=v1", "--untracked-files=all"]),
     files: digestTree(dir),
+    // The clone's own object store: loose objects, packs and their sizes. huddle's objects go elsewhere.
+    objects: sh(dir, ["count-objects", "-v"]),
   };
 }
 
@@ -126,7 +136,7 @@ function localState(dir: string): Record<string, string | null> {
 async function watched<T>(dir: string, call: () => Promise<T>): Promise<T> {
   const beforeCall = localState(dir);
   const result = await call();
-  assert.deepEqual(localState(dir), beforeCall, "a transport call changed local refs, HEAD, FETCH_HEAD, the index or the working tree");
+  assert.deepEqual(localState(dir), beforeCall, "a transport call changed local refs, HEAD, FETCH_HEAD, the index, the working tree or the clone's object store");
   return result;
 }
 
@@ -171,6 +181,58 @@ async function fetched(t: Transport, known = new Map<Ref, Sha>()) {
   const result = await t.fetchAll(known);
   assert.equal(result.ok, true, `expected ok, got ${JSON.stringify(result)}`);
   return result as Extract<typeof result, { ok: true }>;
+}
+
+/** huddle's own object directory for the clone that `dir` is a worktree of. */
+function huddleObjects(dir: string): string {
+  return join(resolve(dir, sh(dir, ["rev-parse", "--git-common-dir"])), "huddle", "objects");
+}
+
+/** Every file under `dir`, as sorted relative paths. */
+function filesUnder(dir: string): string[] {
+  const found: string[] = [];
+  const walk = (at: string, rel: string): void => {
+    if (!existsSync(at)) return;
+    for (const entry of readdirSync(at, { withFileTypes: true })) {
+      const path = rel === "" ? entry.name : `${rel}/${entry.name}`;
+      if (entry.isDirectory()) walk(join(at, entry.name), path);
+      else found.push(path);
+    }
+  };
+  walk(dir, "");
+  return found.sort();
+}
+
+/** Whether the user's own git, run the way a user runs it, can see an object. Never fetches it on demand. */
+function userSees(dir: string, sha: string): boolean {
+  try {
+    execFileSync("git", ["cat-file", "-e", sha], { cwd: dir, stdio: "ignore", env: { ...process.env, GIT_NO_LAZY_FETCH: "1" } });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Plain git that reads huddle's object directory, with the clone's own behind it. For inspection only. */
+function huddleGit(dir: string, args: string[]): string {
+  const own = join(resolve(dir, sh(dir, ["rev-parse", "--git-common-dir"])), "objects");
+  return execFileSync("git", args, {
+    cwd: dir,
+    encoding: "utf8",
+    stdio: ["pipe", "pipe", "pipe"],
+    env: { ...process.env, GIT_NO_LAZY_FETCH: "1", GIT_OBJECT_DIRECTORY: huddleObjects(dir), GIT_ALTERNATE_OBJECT_DIRECTORIES: alternatesEntry(own) },
+  }).replace(/\n$/, "");
+}
+
+/** The loose-object file of `oid`, relative to an object directory. */
+function loose(oid: string): string {
+  return `${oid.slice(0, 2)}/${oid.slice(2)}`;
+}
+
+/** Makes every file under `dir` look as if it was last written `ms` ago. */
+function age(dir: string, ms: number, only?: string[]): void {
+  const then = new Date(Date.now() - ms);
+  for (const file of only ?? filesUnder(dir)) utimesSync(join(dir, file), then, then);
 }
 
 function script(path: string, body: string): string {
@@ -548,7 +610,7 @@ describe("transport against awkward remotes and clones", () => {
     planted.push([actorRef("justablob"), blob]);
     // Refs huddle does not define are not reported at all: not as changed, and never as removed.
     for (const name of ["refs/huddle/actors/UPPERCASE", "refs/huddle/actors/aaaa/bbbb", "refs/huddle/unknown/abcdabcd", "refs/huddle/actors/a.b"]) {
-      sh(alice.dir, ["push", "--quiet", "--no-verify", "origin", `+${good}:${name}`]);
+      sh(h.remote, ["update-ref", name, good]);
     }
 
     const result = await fetched(transportFor(bob.dir));
@@ -710,6 +772,317 @@ describe("transport against awkward remotes and clones", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Where the objects go
+// ---------------------------------------------------------------------------
+
+/** refs/huddle/* as the remote holds them now: what a clone that is fully up to date would pass as `known`. */
+function remoteHuddleRefs(h: Harness): Map<Ref, Sha> {
+  return parseLsRemote(sh(h.remote, ["for-each-ref", "--format=%(objectname)%09%(refname)", "refs/huddle"]));
+}
+
+describe("transport keeps its objects out of the clone's own object store", () => {
+  let h: Harness;
+  let alice: Clone;
+  let bob: Clone;
+
+  before(async () => {
+    h = await createHarness();
+    alice = await h.clone("alice");
+    bob = await h.clone("bob");
+  });
+  after(() => h.cleanup());
+
+  test("publish, fetchAll and remove write only to huddle's object directory", async () => {
+    const own = { alice: sh(alice.dir, ["count-objects", "-v"]), bob: sh(bob.dir, ["count-objects", "-v"]) };
+    assert.deepEqual(filesUnder(huddleObjects(alice.dir)), [], "setup: nothing written yet");
+
+    const a = transportFor(alice.dir);
+    const b = transportFor(bob.dir);
+    const actor = okSha(await a.publish(actorRef("aaaaaaaa"), actorDoc("aaaaaaaa"), "own"));
+    // One document is three objects: the blob, the tree and the commit.
+    assert.equal(filesUnder(huddleObjects(alice.dir)).length, 3);
+    const first = okSha(await a.publish(taskRef("objectsa"), taskDoc("objectsa", 1), "absent"));
+    const second = okSha(await a.publish(taskRef("objectsa"), taskDoc("objectsa", 2), first));
+    assert.equal(filesUnder(huddleObjects(alice.dir)).length, 9);
+
+    const got = await fetched(b);
+    assert.deepEqual(got.changed.get(actorRef("aaaaaaaa")), { sha: actor, doc: actorDoc("aaaaaaaa") });
+    assert.deepEqual(got.changed.get(taskRef("objectsa")), { sha: second, doc: taskDoc("objectsa", 2) });
+    assert.deepEqual(await b.remove(taskRef("objectsa"), second), { ok: true, sha: second });
+
+    for (const [name, clone] of [["alice", alice], ["bob", bob]] as const) {
+      assert.equal(sh(clone.dir, ["count-objects", "-v"]), own[name], `${name}'s object store changed`);
+      // The user's git does not know these commits exist, so it never counts them, packs them or warns about them.
+      assert.equal(userSees(clone.dir, actor), false, `${name}'s git can see a huddle commit`);
+      assert.equal(userSees(clone.dir, second), false, `${name}'s git can see a huddle commit`);
+      assert.equal(huddleGit(clone.dir, ["cat-file", "-t", actor]), "commit", `${name}: the commit is in huddle's directory`);
+      assert.equal(sh(clone.dir, ["fsck", "--unreachable", "--no-progress"]), "", `${name}: the user's fsck finds something unreachable`);
+    }
+  });
+
+  test("a linked worktree uses the clone's one huddle object directory", async () => {
+    const linked = join(h.root, "alice-linked");
+    sh(alice.dir, ["worktree", "add", "--quiet", "-b", "side", linked]);
+    assert.equal(huddleObjects(linked), huddleObjects(alice.dir));
+    const before = filesUnder(huddleObjects(alice.dir)).length;
+
+    const sha = okSha(await transportFor(linked).publish(actorRef("linklink"), actorDoc("linklink"), "own"));
+    assert.equal(filesUnder(huddleObjects(alice.dir)).length, before + 3);
+    assert.equal(existsSync(join(sh(linked, ["rev-parse", "--absolute-git-dir"]), "huddle")), false, "nothing is kept per worktree");
+    assert.equal(userSees(linked, sha), false);
+    assert.deepEqual((await fetched(transportFor(linked))).changed.get(actorRef("linklink")), { sha, doc: actorDoc("linklink") });
+    assert.deepEqual((await fetched(transportFor(bob.dir))).changed.get(actorRef("linklink")), { sha, doc: actorDoc("linklink") });
+  });
+
+  test("objects older than an hour are deleted by the next fetchAll, and younger ones are kept", async () => {
+    const carol = await h.clone("carol");
+    const c = transportFor(carol.dir);
+    const dir = huddleObjects(carol.dir);
+    const added = async (publish: () => Promise<Sha>): Promise<{ sha: Sha; files: string[] }> => {
+      const had = filesUnder(dir);
+      const sha = await publish();
+      const files = filesUnder(dir).filter((file) => !had.includes(file));
+      assert.equal(files.length, 3);
+      return { sha, files };
+    };
+
+    // The limit has to dwarf the time any call can take (a push may last the whole network
+    // timeout), and still be short enough that the directory stays small.
+    assert.ok(OBJECT_MAX_AGE_MS >= 60 * NETWORK_TIMEOUT_MS, "objects are deleted too soon after they were written");
+    assert.ok(OBJECT_MAX_AGE_MS <= 24 * 60 * 60_000, "objects are kept for more than a day");
+
+    const old = await added(async () => okSha(await c.publish(actorRef("oldoldold"), actorDoc("oldoldold"), "own")));
+    age(dir, OBJECT_MAX_AGE_MS + 60_000, old.files);
+    const almost = await added(async () => okSha(await c.publish(actorRef("almostold"), actorDoc("almostold"), "own")));
+    age(dir, OBJECT_MAX_AGE_MS - 60_000, almost.files);
+    const fresh = await added(async () => okSha(await c.publish(actorRef("freshfresh"), actorDoc("freshfresh"), "own")));
+
+    // Carol is up to date, so this fetchAll has nothing to read. All it does is clean up.
+    const upToDate = await fetched(c, remoteHuddleRefs(h));
+    assert.equal(upToDate.changed.size, 0);
+    assert.deepEqual(filesUnder(dir), [...almost.files, ...fresh.files].sort(), "exactly the objects past the age limit were deleted");
+    // Only files go. A git process that is about to write into a directory must still find it there.
+    for (const file of old.files) assert.ok(existsSync(join(dir, file.split("/")[0]!)), "a directory was removed");
+
+    // Nothing is lost by it: asked for everything, fetchAll gets the deleted document from the remote again.
+    const everything = await fetched(c);
+    assert.deepEqual(everything.changed.get(actorRef("oldoldold")), { sha: old.sha, doc: actorDoc("oldoldold") });
+    assert.deepEqual(everything.changed.get(actorRef("almostold")), { sha: almost.sha, doc: actorDoc("almostold") });
+    assert.deepEqual(everything.changed.get(actorRef("freshfresh")), { sha: fresh.sha, doc: actorDoc("freshfresh") });
+
+    // A compare-and-swap against a commit whose objects are gone still works: the remote holds the comparison.
+    const task = okSha(await c.publish(taskRef("prunedtask"), taskDoc("prunedtask", 1), "absent"));
+    age(dir, OBJECT_MAX_AGE_MS + 60_000);
+    await fetched(c, remoteHuddleRefs(h));
+    assert.deepEqual(filesUnder(dir), [], "setup: everything should be cleaned up by now");
+    const next = okSha(await c.publish(taskRef("prunedtask"), taskDoc("prunedtask", 2), task));
+    assert.deepEqual(await c.publish(taskRef("prunedtask"), taskDoc("prunedtask", 3), task), { ok: false, reason: "lost-race" });
+    assert.deepEqual(await c.remove(taskRef("prunedtask"), next), { ok: true, sha: next });
+  });
+
+  test("publishing a document again makes its objects recent again", async () => {
+    // This is what protects a publish from a cleanup running in another process at the same
+    // moment: git refreshes the modification time of an object it is asked to write and already has.
+    const dana = await h.clone("dana");
+    const d = transportFor(dana.dir);
+    const dir = huddleObjects(dana.dir);
+    const sha = okSha(await d.publish(actorRef("samesame"), actorDoc("samesame"), "own"));
+    age(dir, OBJECT_MAX_AGE_MS + 60_000);
+    assert.equal(okSha(await d.publish(actorRef("samesame"), actorDoc("samesame"), "own")), sha);
+    const files = filesUnder(dir);
+    assert.equal(files.length, 3);
+    for (const file of files) assert.ok(Date.now() - statSync(join(dir, file)).mtimeMs < 60_000, `${file} still looks old`);
+  });
+
+  test("a document whose objects were only half cleaned up is fetched again, not reported as invalid", async () => {
+    const erin = await h.clone("erin");
+    const e = transportFor(erin.dir);
+    const dir = huddleObjects(erin.dir);
+    const sha = okSha(await transportFor(alice.dir).publish(actorRef("halfhalf"), actorDoc("halfhalf"), "own"));
+    const whole = { sha, doc: actorDoc("halfhalf") };
+    assert.deepEqual((await fetched(e)).changed.get(actorRef("halfhalf")), whole);
+    const commit = loose(sha);
+    const tree = loose(huddleGit(erin.dir, ["rev-parse", `${sha}^{tree}`]));
+    const blob = loose(huddleGit(erin.dir, ["rev-parse", `${sha}:${DOC_FILE}`]));
+    for (const file of [commit, tree, blob]) assert.ok(existsSync(join(dir, file)), "setup: the fetched objects should be loose files");
+
+    // The cleanup deletes one file at a time, so for a moment a commit can be here without its content.
+    for (const gone of [[blob], [tree], [tree, blob], [commit], [commit, tree]]) {
+      for (const file of gone) rmSync(join(dir, file));
+      assert.deepEqual((await fetched(e)).changed.get(actorRef("halfhalf")), whole, `after losing ${gone.join(" and ")}`);
+      for (const file of [commit, tree, blob]) assert.ok(existsSync(join(dir, file)), "the fetch should have brought every object back");
+    }
+  });
+});
+
+describe("transport in clones and against remotes with unusual settings", () => {
+  let h: Harness;
+  let alice: Clone;
+
+  before(async () => {
+    h = await createHarness();
+    alice = await h.clone("alice");
+    sh(h.remote, ["config", "uploadpack.allowFilter", "true"]);
+    // History to be shallow or partial about.
+    writeFileSync(join(alice.dir, "history.txt"), "one\n");
+    sh(alice.dir, ["add", "history.txt"]);
+    sh(alice.dir, ["commit", "--quiet", "-m", "one"]);
+    writeFileSync(join(alice.dir, "history.txt"), "two\n");
+    sh(alice.dir, ["commit", "--quiet", "-am", "two"]);
+    sh(alice.dir, ["push", "--quiet", "origin", "HEAD:main"]);
+  });
+  after(() => h.cleanup());
+
+  /** A clone of the harness remote made with extra `git clone` arguments, over file:// so that they take effect. */
+  const cloneWith = (name: string, args: string[]): string => {
+    const dir = join(h.root, name);
+    sh(h.root, ["clone", "--quiet", ...args, pathToFileURL(h.remote).href, dir]);
+    return dir;
+  };
+
+  /** Documents go both ways between the clone at `dir` and Alice, and every kind of write works from `dir`. */
+  const roundTrip = async (dir: string, id: string): Promise<Sha> => {
+    const t = transportFor(dir);
+    const a = transportFor(alice.dir);
+    const theirs = okSha(await a.publish(actorRef(`${id}a`), actorDoc(`${id}a`), "own"));
+    assert.deepEqual((await fetched(t)).changed.get(actorRef(`${id}a`)), { sha: theirs, doc: actorDoc(`${id}a`) });
+    const own = okSha(await t.publish(actorRef(`${id}b`), actorDoc(`${id}b`), "own"));
+    const created = okSha(await t.publish(taskRef(id), taskDoc(id, 1), "absent"));
+    assert.deepEqual(await t.publish(taskRef(id), taskDoc(id, 2), "absent"), { ok: false, reason: "lost-race" });
+    const replaced = okSha(await t.publish(taskRef(id), taskDoc(id, 3), created));
+    const seen = await fetched(a);
+    assert.deepEqual(seen.changed.get(actorRef(`${id}b`)), { sha: own, doc: actorDoc(`${id}b`) });
+    assert.deepEqual(seen.changed.get(taskRef(id)), { sha: replaced, doc: taskDoc(id, 3) });
+    assert.deepEqual(await t.remove(taskRef(id), replaced), { ok: true, sha: replaced });
+    assert.equal(userSees(dir, theirs), false);
+    return theirs;
+  };
+
+  test("a blobless partial clone gets whole documents", async () => {
+    const dir = cloneWith("blobless", ["--filter=blob:none"]);
+    const partial = (): string => sh(dir, ["config", "--get-regexp", "^remote\\.origin\\.(promisor|partialclonefilter)$"]);
+    assert.equal(partial(), "remote.origin.promisor true\nremote.origin.partialclonefilter blob:none", "setup: this should be a partial clone");
+    // git fetch applies the clone's filter unless told otherwise. With blob:none the
+    // commit and the tree would arrive without doc.json, and the document would read as invalid.
+    await roundTrip(dir, "blobless");
+    assert.equal(partial(), "remote.origin.promisor true\nremote.origin.partialclonefilter blob:none");
+  });
+
+  test("a shallow clone stays exactly as shallow as it was", async () => {
+    const dir = cloneWith("shallow", ["--depth", "1"]);
+    const shallow = join(dir, ".git", "shallow");
+    const before = readFileSync(shallow, "utf8");
+    assert.equal(sh(dir, ["rev-list", "--count", "HEAD"]), "1", "setup: this should be a shallow clone");
+    await roundTrip(dir, "shallow");
+    assert.equal(readFileSync(shallow, "utf8"), before);
+    assert.equal(sh(dir, ["rev-list", "--count", "HEAD"]), "1");
+  });
+
+  test("a clone that borrows its objects from another repository", async () => {
+    const dir = join(h.root, "borrower");
+    sh(h.root, ["clone", "--quiet", "--shared", alice.dir, dir]);
+    sh(dir, ["remote", "set-url", "origin", h.remote]);
+    assert.ok(existsSync(join(dir, ".git", "objects", "info", "alternates")), "setup: this clone should have an alternate of its own");
+    assert.equal(sh(dir, ["count-objects"]), "0 objects, 0 kilobytes", "setup: every object of this clone should be borrowed");
+    await roundTrip(dir, "borrowed");
+  });
+
+  test("a clone whose path contains the character git separates alternates with", { skip: process.platform === "win32" ? "a Windows path cannot contain a colon" : false }, async () => {
+    const dir = cloneWith('we:ird "dir', []);
+    const own = join(dir, ".git", "objects");
+    const empty = join(h.root, "empty-objects");
+    mkdirSync(empty, { recursive: true });
+    const headVisible = (alternates: string): boolean => {
+      try {
+        execFileSync("git", ["cat-file", "-e", "HEAD"], { cwd: dir, stdio: "ignore", env: { ...process.env, GIT_OBJECT_DIRECTORY: empty, GIT_ALTERNATE_OBJECT_DIRECTORIES: alternates } });
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    assert.equal(headVisible(own), false, "setup: git should split the unquoted path in two");
+    assert.equal(headVisible(alternatesEntry(own)), true);
+    await roundTrip(dir, "colonpath");
+  });
+
+  test("a remote configured as a push mirror gets the huddle ref and nothing else", async () => {
+    const mira = await h.clone("mira");
+    sh(mira.dir, ["commit", "--quiet", "--allow-empty", "-m", "not pushed yet"]);
+    sh(mira.dir, ["branch", "secret"]);
+    sh(mira.dir, ["config", "remote.origin.mirror", "true"]);
+    assert.throws(() => sh(mira.dir, ["push", "--quiet", "origin", "HEAD:refs/heads/elsewhere"]), /--mirror can't be combined with refspecs/, "setup: git should refuse a refspec for a mirror remote");
+    const branches = (): string => sh(h.remote, ["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads", "refs/tags"]);
+    const before = branches();
+    await roundTrip(mira.dir, "mirrored");
+    assert.equal(branches(), before, "a mirror push would have sent every local branch");
+  });
+
+  test("a huddle push does not open a second connection to negotiate", async () => {
+    // With push.negotiate git first runs a fetch against the remote to look for history in
+    // common. A document commit has none, and the extra connection is one more that can time out.
+    const nell = await h.clone("nell");
+    sh(nell.dir, ["config", "push.negotiate", "true"]);
+    sh(nell.dir, ["commit", "--quiet", "--allow-empty", "-m", "for the setup check"]);
+    const trace = join(h.root, "negotiate-trace");
+    /** What git ran, by its own account, while `run` was going: GIT_TRACE reaches every git this process starts. */
+    const traced = async (run: () => unknown): Promise<string> => {
+      writeFileSync(trace, "");
+      const had = process.env.GIT_TRACE;
+      process.env.GIT_TRACE = trace;
+      try {
+        await run();
+      } finally {
+        if (had === undefined) delete process.env.GIT_TRACE;
+        else process.env.GIT_TRACE = had;
+      }
+      return readFileSync(trace, "utf8");
+    };
+    assert.match(await traced(() => sh(nell.dir, ["push", "--quiet", "origin", "HEAD:refs/heads/nell"])), /fetch --negotiate-only/, "setup: the user's own push should negotiate");
+    const ours = await traced(() => roundTrip(nell.dir, "negotiate"));
+    assert.match(ours, /push --porcelain/, "setup: the trace should show huddle's pushes");
+    assert.doesNotMatch(ours, /negotiate-only/);
+  });
+
+  test("the user's push options do not break a huddle push", async () => {
+    const olga = await h.clone("olga");
+    sh(olga.dir, ["config", "push.pushOption", "merge_request.create"]);
+    sh(olga.dir, ["config", "--add", "push.pushOption", "ci.skip"]);
+    sh(olga.dir, ["commit", "--quiet", "--allow-empty", "-m", "for the setup check"]);
+    // A remote that does not take push options refuses the whole push when one is sent.
+    sh(h.remote, ["config", "receive.advertisePushOptions", "false"]);
+    try {
+      assert.throws(() => sh(olga.dir, ["push", "--quiet", "origin", "HEAD:refs/heads/olga"]), /does not support push options/, "setup: the user's own push should be refused");
+      await roundTrip(olga.dir, "pushopts");
+    } finally {
+      sh(h.remote, ["config", "--unset", "receive.advertisePushOptions"]);
+    }
+  });
+
+  test("the user's push options are not delivered with a huddle push", { skip: posixOnly }, async () => {
+    const pia = await h.clone("pia");
+    sh(pia.dir, ["config", "push.pushOption", "merge_request.create"]);
+    sh(pia.dir, ["config", "--add", "push.pushOption", "ci.skip"]);
+    sh(pia.dir, ["commit", "--quiet", "--allow-empty", "-m", "for the setup check"]);
+    const seen = join(h.root, "push-options-seen");
+    const hook = script(join(h.remote, "hooks", "pre-receive"), `echo "\${GIT_PUSH_OPTION_COUNT:-0}" >> "${seen}"\nexit 0`);
+    const counts = (): string[] => readFileSync(seen, "utf8").trim().split("\n");
+    sh(h.remote, ["config", "receive.advertisePushOptions", "true"]);
+    try {
+      sh(pia.dir, ["push", "--quiet", "origin", "HEAD:refs/heads/pia"]);
+      assert.deepEqual(counts(), ["2"], "setup: the user's own push should deliver both options");
+      const p = transportFor(pia.dir);
+      const created = okSha(await p.publish(taskRef("noptions"), taskDoc("noptions", 1), "absent"));
+      const replaced = okSha(await p.publish(taskRef("noptions"), taskDoc("noptions", 2), created));
+      assert.deepEqual(await p.remove(taskRef("noptions"), replaced), { ok: true, sha: replaced });
+      assert.deepEqual(counts(), ["2", "0", "0", "0"], "three huddle pushes, no option on any of them");
+    } finally {
+      rmSync(hook);
+      sh(h.remote, ["config", "--unset", "receive.advertisePushOptions"]);
+    }
+  });
+});
+
 describe("fetchAll when the remote moves under it", { skip: posixOnly }, () => {
   let h: Harness;
   let alice: Clone;
@@ -814,6 +1187,7 @@ describe("fetchAll when the remote moves under it", { skip: posixOnly }, () => {
     assert.deepEqual([...(await fetched(r, known)).changed], [[actorRef("newsnews"), { sha: theirs, doc: actorDoc("newsnews") }]]);
     assert.equal(uploads(), 2, "one listing and one fetch");
   });
+
 });
 
 // ---------------------------------------------------------------------------
@@ -948,6 +1322,103 @@ describe("transport output parsing", () => {
       ],
       "connection settings are kept; refspecs, mirror and fetch-only settings are not",
     );
+  });
+
+  test("parseRemoteSettings and isMirror: a remote's section as git prints it with --null", () => {
+    const printed = [
+      "remote.origin.url\ngit@github.com:team/repo.git",
+      "remote.origin.fetch\n+refs/heads/*:refs/remotes/origin/*",
+      "remote.origin.fetch\n+refs/huddle/*:refs/remotes/origin/huddle/*",
+      "remote.origin.pushurl\nline one\nline two", // a value may contain a newline; only the first one separates
+      "remote.origin.mirror", // written without a value, which git reads as true
+      "remote.originals.url\nnot ours",
+      "remote.Origin.url\nnot ours either: remote names are case sensitive",
+      "",
+    ].join("\0");
+    const parsed = parseRemoteSettings(printed, "origin");
+    assert.deepEqual(parsed, [
+      ["url", "git@github.com:team/repo.git"],
+      ["fetch", "+refs/heads/*:refs/remotes/origin/*"],
+      ["fetch", "+refs/huddle/*:refs/remotes/origin/huddle/*"],
+      ["pushurl", "line one\nline two"],
+      ["mirror", "true"],
+    ]);
+    assert.equal(isMirror(parsed), true);
+    assert.deepEqual(parseRemoteSettings("", "origin"), []);
+
+    for (const value of ["true", "TRUE", "yes", "on", "1", " true "]) assert.equal(isMirror([["mirror", value]]), true, value);
+    for (const value of ["false", "False", "no", "off", "0", ""]) assert.equal(isMirror([["mirror", value]]), false, JSON.stringify(value));
+    assert.equal(isMirror([["url", "true"]]), false);
+    assert.equal(isMirror([]), false);
+  });
+
+  test("alternatesEntry quotes a path only when git would misread it", () => {
+    assert.equal(alternatesEntry("/home/me/repo/.git/objects", ":"), "/home/me/repo/.git/objects");
+    assert.equal(alternatesEntry("/home/me/my repo/.git/objects", ":"), "/home/me/my repo/.git/objects", "a space needs nothing");
+    assert.equal(alternatesEntry("/home/me/a:b/.git/objects", ":"), '"/home/me/a:b/.git/objects"');
+    assert.equal(alternatesEntry('/home/me/a:"b"\\c/.git/objects', ":"), '"/home/me/a:\\"b\\"\\\\c/.git/objects"');
+    // On Windows the separator is ";" and every path has a colon and backslashes: leave those alone.
+    assert.equal(alternatesEntry("C:\\Users\\me\\repo\\.git\\objects", ";"), "C:\\Users\\me\\repo\\.git\\objects");
+    assert.equal(alternatesEntry("C:\\Users\\me\\a;b\\.git\\objects", ";"), '"C:\\\\Users\\\\me\\\\a;b\\\\.git\\\\objects"');
+    // An entry that starts with "#" is a comment to git, and one that starts with a quote is read as quoted.
+    assert.equal(alternatesEntry("#odd/.git/objects", ":"), '"#odd/.git/objects"');
+    assert.equal(alternatesEntry('"odd/.git/objects', ":"), '"\\"odd/.git/objects"');
+  });
+
+  test("pruneObjects deletes old files and nothing else", async (t) => {
+    const root = mkdtempSync(join(tmpdir(), "huddle-prune-"));
+    const outside = mkdtempSync(join(tmpdir(), "huddle-prune-outside-"));
+    const hour = 60 * 60_000;
+    const put = (base: string, rel: string, ageMs: number): void => {
+      const path = join(base, rel);
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, "x");
+      const then = new Date(Date.now() - ageMs);
+      utimesSync(path, then, then);
+    };
+    try {
+      put(root, "ab/old-object", 2 * hour);
+      put(root, "ab/new-object", 60_000);
+      put(root, "pack/pack-old.pack", 2 * hour);
+      put(root, "pack/pack-old.idx", 2 * hour);
+      put(root, "pack/pack-new.pack", 0);
+      put(root, "tmp_objdir-bulk-fsync-abc/cd/old-object", 2 * hour); // what an interrupted batched fsync leaves behind
+      put(root, "old-at-the-top", 2 * hour);
+      put(root, "a/b/c/d/old-but-too-deep", 2 * hour); // deeper than git ever writes: not ours to judge
+      put(root, "ef/exactly-at-the-limit", hour - 5_000);
+      put(outside, "old-file", 2 * hour);
+      put(outside, "dir/old-file", 2 * hour);
+      if (process.platform !== "win32") {
+        // Links are neither followed nor removed, so nothing outside the directory can be reached through one.
+        symlinkSync(join(outside, "old-file"), join(root, "ab", "link-to-file"));
+        symlinkSync(join(outside, "dir"), join(root, "link-to-dir"));
+      }
+      const links = process.platform === "win32" ? [] : ["ab/link-to-file", "link-to-dir"];
+
+      assert.equal(await pruneObjects(root, hour), 5);
+      assert.deepEqual(filesUnder(root), ["a/b/c/d/old-but-too-deep", "ab/new-object", "ef/exactly-at-the-limit", "pack/pack-new.pack", ...links].sort());
+      assert.ok(existsSync(join(root, "tmp_objdir-bulk-fsync-abc", "cd")), "directories are left in place");
+      assert.deepEqual(filesUnder(outside), ["dir/old-file", "old-file"], "nothing outside the directory was touched");
+
+      // Nothing left to do, and a directory that does not exist is not an error.
+      assert.equal(await pruneObjects(root, hour), 0);
+      assert.equal(await pruneObjects(join(root, "no-such-directory"), hour), 0);
+      // `now` is the reference point: an hour and a bit later, the rest has aged out too.
+      assert.equal(await pruneObjects(root, hour, Date.now() + hour + 60_000), 3);
+      assert.deepEqual(filesUnder(root), ["a/b/c/d/old-but-too-deep", ...links].sort());
+
+      // What it costs when there is nothing to delete, on a directory as full as an hour of a busy team makes it.
+      for (let n = 0; n < 256; n++) {
+        const fanOut = n.toString(16).padStart(2, "0");
+        for (let k = 0; k < 4; k++) put(root, `${fanOut}/object-${k}`, 0);
+      }
+      const started = performance.now();
+      assert.equal(await pruneObjects(root, hour), 0);
+      t.diagnostic(`pruneObjects over 256 directories and 1024 fresh files: ${Math.round(performance.now() - started)} ms`);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
   });
 
   test("classifyFailure tells a refused connection from refused credentials", () => {

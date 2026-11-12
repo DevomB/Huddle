@@ -12,7 +12,19 @@
 //     fetch refspecs cover refs/huddle/* (a mirror-style
 //     "+refs/*:refs/remotes/origin/*"): after a push git updates the tracking
 //     ref such a refspec maps to, and there is no flag to stop it (see push);
-//   - fetched text goes through parseDoc(text, ref) from docs.ts and nowhere else.
+//   - fetched text goes through parseDoc(text, ref) from docs.ts and nowhere else;
+//   - no objects in the user's object store. A document is three objects that
+//     no ref of the clone will ever point at. Left in .git/objects they are
+//     unreachable from the moment they exist, git keeps such objects for two
+//     weeks, and a team's heartbeats alone make a couple of thousand a day:
+//     within a week the user's own `git gc --auto` would start on every commit,
+//     be unable to remove them, and warn about it. So every call that reads or
+//     writes objects runs with <git-common-dir>/huddle/objects as its object
+//     directory and the clone's own as a read-only alternate (see Session.store
+//     and run). The user's git never sees huddle's objects, and huddle deletes
+//     them itself after an hour (see pruneObjects): the cache keeps parsed
+//     documents, so an object is needed only between being written and pushed,
+//     or between being fetched and read.
 //
 // How a failed push is classified (see settlePush):
 //   - timeout, or git never got as far as a per-ref status   -> "offline",
@@ -24,11 +36,15 @@
 // state of the ref does not lie.
 
 import { randomBytes } from "node:crypto";
+import type { Dirent } from "node:fs";
+import { lstat, mkdir, readdir, unlink } from "node:fs/promises";
+import { join } from "node:path";
 import { LIMITS, parseDoc, serializeDoc } from "./docs.ts";
 import { git } from "./git.ts";
 import type { GitResult } from "./git.ts";
 import { log } from "./log.ts";
 import { locateRepo } from "./paths.ts";
+import type { RepoPaths } from "./paths.ts";
 import { REF_PATTERN, parseRef } from "./types.ts";
 import type { Doc, Expect, FailReason, FetchedDoc, FetchResult, PublishResult, Ref, Sha, Transport } from "./types.ts";
 
@@ -71,6 +87,14 @@ const LOCAL_ENV = { GIT_NO_LAZY_FETCH: "1" };
 const PUSH_ARGS = [
   "-c",
   "push.useForceIfIncludes=false",
+  // An empty value clears the list. The user's push options (GitLab's
+  // merge_request.create, ci.skip) are meant for their branches; and a remote
+  // that does not support push options refuses the whole push when one is sent.
+  "-c",
+  "push.pushOption=",
+  // Negotiation is a second connection that looks for history in common. A document commit has no history.
+  "-c",
+  "push.negotiate=false",
   "push",
   "--porcelain",
   "--no-verify", // the user's pre-push hook is not ours to run
@@ -88,12 +112,22 @@ const FETCH_ARGS = [
   "--no-prune",
   "--no-recurse-submodules",
   "--refmap=", // ignore remote.<name>.fetch: no opportunistic tracking-ref updates
+  "--no-filter", // a partial clone would apply its filter here too, and a blobless one would leave doc.json behind
   "--quiet",
   "--stdin",
 ];
 
 /** How many `git cat-file blob` processes read fetched documents at once. */
 const READ_CONCURRENCY = 8;
+
+/**
+ * How long an object stays in huddle's object directory. Far longer than any
+ * call takes, so a publish running in another process never loses the commit
+ * it is about to push.
+ */
+export const OBJECT_MAX_AGE_MS = 60 * 60_000;
+/** Loose objects sit two levels down and packs one; the staging directory of a batched fsync adds a level. */
+const PRUNE_DEPTH = 4;
 
 type Fail = { ok: false; reason: FailReason };
 
@@ -106,8 +140,39 @@ interface Session {
   remote: string;
   timeoutMs: number | undefined;
   note(message: string, error?: unknown): Promise<void>;
-  /** remote.<name>.fetch, read once. */
-  fetchRefspecs(): Promise<string[]>;
+  /** The remote's section of the git config as [variable, value] pairs, variable names in lower case. Read once. */
+  remoteSettings(): Promise<[string, string][]>;
+  /** huddle's object directory, created if need be, and the environment that makes git use it. */
+  store(): Promise<ObjectStore>;
+}
+
+interface ObjectStore {
+  dir: string;
+  env: Record<string, string>;
+}
+
+interface RunOptions {
+  /** A call that talks to the remote: no prompts, and the timeout applies. */
+  network?: boolean;
+  input?: string;
+  env?: Record<string, string>;
+}
+
+/**
+ * Runs git with huddle's object directory in place of the clone's. Every call
+ * that reads or writes objects goes through here; that is what keeps them out
+ * of the user's object store.
+ */
+async function run(s: Session, args: string[], opts: RunOptions = {}): Promise<GitResult> {
+  const store = await s.store();
+  return git(args, {
+    cwd: s.cwd,
+    input: opts.input,
+    network: opts.network,
+    timeoutMs: opts.network ? s.timeoutMs : undefined,
+    // core/git.ts removes an inherited GIT_OBJECT_DIRECTORY and applies `env` after that.
+    env: { ...store.env, ...opts.env },
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -226,6 +291,27 @@ export function standInRemote(entries: [string, string][], name: string): string
   return kept.flatMap(([key, value]) => ["-c", `remote.${name}.${key}=${value}`]);
 }
 
+/**
+ * `git config --null --get-regexp '^remote\.<name>\.'` output as [variable,
+ * value] pairs. Each entry is "<key>\n<value>\0", or "<key>\0" for a variable
+ * written without a value, which git reads as true. The variable name comes
+ * back in lower case; the remote's name keeps its case.
+ */
+export function parseRemoteSettings(stdout: string, remote: string): [string, string][] {
+  const section = `remote.${remote}.`;
+  return stdout.split("\0").flatMap((entry): [string, string][] => {
+    if (!entry.startsWith(section)) return [];
+    const newline = entry.indexOf("\n");
+    if (newline < 0) return [[entry.slice(section.length).toLowerCase(), "true"]];
+    return [[entry.slice(section.length, newline).toLowerCase(), entry.slice(newline + 1)]];
+  });
+}
+
+/** Whether remote.<name>.mirror is on. Anything that is not plainly "off" counts: the stand-in works either way. */
+export function isMirror(entries: [string, string][]): boolean {
+  return entries.some(([key, value]) => key === "mirror" && !/^(false|no|off|0|)$/i.test(value.trim()));
+}
+
 // ---------------------------------------------------------------------------
 // Transport
 // ---------------------------------------------------------------------------
@@ -248,22 +334,26 @@ export function standInRemote(entries: [string, string][], name: string): string
  * git's stderr are written to the debug log.
  */
 export function createTransport(opts: TransportOptions): Transport {
-  let logTarget: Promise<{ logFile: string } | null> | undefined;
-  let refspecs: Promise<string[]> | undefined;
+  let repo: Promise<RepoPaths | null> | undefined;
+  let settings: Promise<[string, string][]> | undefined;
+  let store: Promise<ObjectStore> | undefined;
   const session: Session = {
     cwd: opts.cwd,
     remote: opts.remote,
     timeoutMs: opts.timeoutMs,
-    fetchRefspecs: () =>
-      (refspecs ??= git(["config", "--get-all", `remote.${opts.remote}.fetch`], { cwd: opts.cwd }).then((found) =>
-        // Exit 1 is "not set". Anything else unexpected is treated the same: push by name.
-        found.ok ? found.stdout.split("\n").filter((line) => line.trim() !== "") : [],
+    remoteSettings: () =>
+      (settings ??= git(["config", "--null", "--get-regexp", `^remote\\.${opts.remote.replace(/\./g, "\\.")}\\.`], { cwd: opts.cwd }).then(
+        // Exit 1 is "nothing set". Anything else unexpected is treated the same: push by name.
+        (listed) => (listed.ok ? parseRemoteSettings(listed.stdout, opts.remote) : []),
       )),
-    // The log lives in the state dir, which is only looked up when there is something to say.
+    store: () =>
+      (store ??= openStore((repo ??= locateRepo(opts.cwd))).catch((error: unknown) => {
+        store = undefined; // a later call may fare better
+        throw error;
+      })),
     note: async (message, error) => {
       try {
-        logTarget ??= locateRepo(opts.cwd);
-        log(await logTarget, "transport", message, error);
+        log(await (repo ??= locateRepo(opts.cwd)), "transport", message, error);
       } catch {
         // Logging never breaks a call.
       }
@@ -289,6 +379,79 @@ export function createTransport(opts: TransportOptions): Transport {
     fetchAll: (known: Map<Ref, Sha>): Promise<FetchResult> => guarded("fetchAll", () => fetchAll(session, known)),
     remove: (ref: Ref, expect: Sha): Promise<PublishResult> => guarded("remove", () => remove(session, ref, expect)),
   };
+}
+
+// ---------------------------------------------------------------------------
+// huddle's own object directory
+// ---------------------------------------------------------------------------
+
+async function openStore(repo: Promise<RepoPaths | null>): Promise<ObjectStore> {
+  const paths = await repo;
+  if (!paths) throw new Error("not inside a git worktree");
+  // Under the common dir, so every worktree of the clone shares it.
+  const dir = join(paths.stateDir, "objects");
+  await mkdir(dir, { recursive: true });
+  return {
+    dir,
+    env: {
+      GIT_OBJECT_DIRECTORY: dir,
+      // git still has to read the clone's own objects: fetch and push look at what the local refs point to.
+      GIT_ALTERNATE_OBJECT_DIRECTORIES: alternatesEntry(join(paths.commonDir, "objects")),
+    },
+  };
+}
+
+/**
+ * One entry of GIT_ALTERNATE_OBJECT_DIRECTORIES. Entries are separated by ":"
+ * (";" on Windows), and one that starts with "#" is a comment. A path that
+ * would be misread is written as a C-style quoted string, which git accepts
+ * for an entry starting with a double quote.
+ */
+export function alternatesEntry(path: string, separator: string = process.platform === "win32" ? ";" : ":"): string {
+  if (!path.includes(separator) && !/^["#]/.test(path)) return path;
+  return `"${path.replace(/[\\"]/g, "\\$&")}"`;
+}
+
+/**
+ * Deletes the files under `dir` that were last modified more than `maxAgeMs`
+ * before `now`, and returns how many. Only files: an emptied directory stays,
+ * so a git process about to write into it never finds it gone. Git refreshes
+ * the modification time of an object it is asked to write again, so what a
+ * running publish needs is always recent. Never throws; a file that cannot be
+ * examined or removed is left for the next round.
+ */
+export async function pruneObjects(dir: string, maxAgeMs: number, now: number = Date.now(), depth: number = PRUNE_DEPTH): Promise<number> {
+  let entries: Dirent[];
+  try {
+    entries = await readdir(dir, { withFileTypes: true });
+  } catch {
+    return 0;
+  }
+  // Directories side by side, the files of one directory in turn. Symbolic links are neither followed nor removed.
+  const below = entries.filter((entry) => entry.isDirectory() && depth > 1).map((entry) => pruneObjects(join(dir, entry.name), maxAgeMs, now, depth - 1));
+  let removed = 0;
+  for (const entry of entries) {
+    if (!entry.isFile()) continue;
+    const path = join(dir, entry.name);
+    try {
+      const info = await lstat(path);
+      if (!info.isFile() || now - info.mtimeMs <= maxAgeMs) continue;
+      await unlink(path);
+      removed++;
+    } catch {
+      // Gone already, or held open by another process.
+    }
+  }
+  for (const count of await Promise.all(below)) removed += count;
+  return removed;
+}
+
+async function prune(s: Session): Promise<void> {
+  try {
+    await pruneObjects((await s.store()).dir, OBJECT_MAX_AGE_MS);
+  } catch (error) {
+    await s.note("could not clean up huddle's object directory", error);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -337,26 +500,23 @@ async function remove(s: Session, ref: Ref, expect: Sha): Promise<PublishResult>
  * such a clone the push goes to a stand-in remote that exists only on this
  * command's line, with the real remote's URLs and connection settings and no
  * refspecs. Nothing is written to the user's config.
+ *
+ * The stand-in is also the way past `remote.<name>.mirror` (a remote added
+ * with --mirror=push): with that set git refuses any push that names a
+ * refspec, and the stand-in does not carry the setting over.
  */
 async function push(s: Session, ref: Ref, lease: string[], refspec: string): Promise<GitResult> {
+  const settings = await s.remoteSettings();
+  const fetchRefspecs = settings.filter(([key]) => key === "fetch").map(([, value]) => value);
   let target = s.remote;
   let standIn: string[] = [];
-  if (tracksRef(await s.fetchRefspecs(), ref)) {
-    const section = `remote.${s.remote}.`;
-    const listed = await git(["config", "--null", "--get-regexp", `^remote\\.${s.remote.replace(/\./g, "\\.")}\\.`], { cwd: s.cwd });
-    // --null prints "<key>\n<value>\0". The variable name comes back lowercased; the remote's name keeps its case.
-    const entries = listed.stdout.split("\0").flatMap((entry): [string, string][] => {
-      const newline = entry.indexOf("\n");
-      if (newline < 0 || !entry.startsWith(section)) return [];
-      return [[entry.slice(section.length, newline).toLowerCase(), entry.slice(newline + 1)]];
-    });
+  if (isMirror(settings) || tracksRef(fetchRefspecs, ref)) {
     target = `huddle-push-${randomBytes(6).toString("hex")}`; // cannot collide with a remote the user has
-    const config = standInRemote(entries, target);
+    const config = standInRemote(settings, target);
     if (!config) throw new Error(`remote "${s.remote}" has no URL to push ${ref} to`);
     standIn = config;
   }
-  const args = [...standIn, ...PUSH_ARGS, ...lease, target, refspec];
-  return git(args, { cwd: s.cwd, network: true, timeoutMs: s.timeoutMs });
+  return run(s, [...standIn, ...PUSH_ARGS, ...lease, target, refspec], { network: true });
 }
 
 /** Builds the parentless commit whose tree holds only doc.json. Writes objects, never refs. */
@@ -368,7 +528,7 @@ async function writeDocCommit(s: Session, text: string): Promise<Sha> {
 
 /** A local plumbing call that prints one object id. */
 async function plumb(s: Session, args: string[], input?: string, env?: Record<string, string>): Promise<Sha> {
-  const result = await git(args, { cwd: s.cwd, input, env: { ...LOCAL_ENV, ...env } });
+  const result = await run(s, args, { input, env: { ...LOCAL_ENV, ...env } });
   const sha = result.stdout.trim();
   if (!result.ok || !SHA_RE.test(sha)) {
     throw new Error(`git ${args[0]} failed (${result.code}): ${result.stderr.trim() || result.stdout.trim()}`);
@@ -424,7 +584,8 @@ function brief(result: GitResult): string {
 // ---------------------------------------------------------------------------
 
 async function fetchAll(s: Session, known: Map<Ref, Sha>): Promise<FetchResult> {
-  let listing = await listRemote(s);
+  // The cleanup of old objects costs no time this way: it runs while we wait for the remote.
+  let [listing] = await Promise.all([listRemote(s), prune(s)]);
   if (!listing.ok) return listing;
 
   const changed = new Map<Ref, FetchedDoc>();
@@ -436,18 +597,13 @@ async function fetchAll(s: Session, known: Map<Ref, Sha>): Promise<FetchResult> 
     const want = [...refs].filter(([ref, sha]) => (changed.get(ref)?.sha ?? known.get(ref)) !== sha);
     if (want.length === 0) break;
 
-    // Our own documents, and anything fetched before, are already in the object store.
-    let read = await readDocs(s, want);
+    // Our own recent documents, and anything fetched in the last hour, are still in the object directory.
+    let read = await readDocs(s, want, false);
     let missing = want.filter(([ref]) => !read.has(ref));
     if (missing.length > 0) {
-      const fetched = await git([...FETCH_ARGS, s.remote], {
-        cwd: s.cwd,
-        network: true,
-        timeoutMs: s.timeoutMs,
-        input: missing.map(([ref]) => `${ref}\n`).join(""),
-      });
+      const fetched = await run(s, [...FETCH_ARGS, s.remote], { network: true, input: missing.map(([ref]) => `${ref}\n`).join("") });
       if (fetched.ok) {
-        read = new Map([...read, ...(await readDocs(s, missing))]);
+        read = new Map([...read, ...(await readDocs(s, missing, true))]);
         missing = want.filter(([ref]) => !read.has(ref));
       } else if (fetched.timedOut || !/couldn't find remote ref/i.test(fetched.stderr)) {
         const reason = classifyFailure(fetched);
@@ -473,11 +629,7 @@ async function fetchAll(s: Session, known: Map<Ref, Sha>): Promise<FetchResult> 
 }
 
 async function listRemote(s: Session): Promise<{ ok: true; refs: Map<Ref, Sha> } | Fail> {
-  const listed = await git(["ls-remote", "--quiet", "--refs", s.remote, REF_PATTERN], {
-    cwd: s.cwd,
-    network: true,
-    timeoutMs: s.timeoutMs,
-  });
+  const listed = await run(s, ["ls-remote", "--quiet", "--refs", s.remote, REF_PATTERN], { network: true });
   if (!listed.ok) {
     const reason = classifyFailure(listed);
     await s.note(`ls-remote: ${reason}: ${brief(listed)}`);
@@ -488,11 +640,7 @@ async function listRemote(s: Session): Promise<{ ok: true; refs: Map<Ref, Sha> }
 
 /** What one ref points at on the remote right now; null when it does not exist. */
 async function remoteSha(s: Session, ref: Ref): Promise<{ ok: true; sha: Sha | null } | Fail> {
-  const listed = await git(["ls-remote", "--quiet", "--refs", s.remote, ref], {
-    cwd: s.cwd,
-    network: true,
-    timeoutMs: s.timeoutMs,
-  });
+  const listed = await run(s, ["ls-remote", "--quiet", "--refs", s.remote, ref], { network: true });
   if (!listed.ok) return fail(classifyFailure(listed));
   // ls-remote patterns match the tail of a ref name, so pick the exact one.
   return { ok: true, sha: parseLsRemote(listed.stdout).get(ref) ?? null };
@@ -512,19 +660,25 @@ function parseObjectInfo(line: string | undefined): ObjectInfo | null {
 }
 
 /**
- * Reads the documents for the listed commits that are present in the local
- * object store. A ref missing from the result has not been fetched yet. A ref
- * present with doc: null is there but is not a valid document: not a commit,
- * no doc.json, too large, or rejected by parseDoc.
+ * Reads the documents for the listed commits that are present in the object
+ * directory. A ref missing from the result has to be fetched. A ref present
+ * with doc: null is there but is not a valid document: not a commit, no
+ * doc.json, too large, or rejected by parseDoc.
+ *
+ * `fetched` says whether these commits were just fetched. Before a fetch, a
+ * commit that is here without a readable doc.json proves nothing: the cleanup
+ * removes a document's three objects one file at a time, so the commit can
+ * outlive its blob for a moment. Such a ref is left out and fetched again,
+ * which brings the rest back. After a fetch the same finding is the remote's
+ * doing, and the document is invalid.
  */
-async function readDocs(s: Session, entries: [Ref, Sha][]): Promise<Map<Ref, FetchedDoc>> {
+async function readDocs(s: Session, entries: [Ref, Sha][], fetched: boolean): Promise<Map<Ref, FetchedDoc>> {
   const out = new Map<Ref, FetchedDoc>();
   if (entries.length === 0) return out;
 
   // Sizes and types first, in one process and without printing any content,
   // so an oversized or hostile blob is never read at all.
-  const checked = await git(["cat-file", "--batch-check"], {
-    cwd: s.cwd,
+  const checked = await run(s, ["cat-file", "--batch-check"], {
     env: LOCAL_ENV,
     input: entries.map(([, sha]) => `${sha}\n${sha}:${DOC_FILE}\n`).join(""),
   });
@@ -534,8 +688,9 @@ async function readDocs(s: Session, entries: [Ref, Sha][]): Promise<Map<Ref, Fet
   const toRead: { ref: Ref; sha: Sha; oid: string }[] = [];
   entries.forEach(([ref, sha], index) => {
     const commit = parseObjectInfo(lines[index * 2]);
-    if (!commit) return; // not in the object store: needs a fetch
+    if (!commit) return; // not here: needs a fetch
     const blob = parseObjectInfo(lines[index * 2 + 1]);
+    if (commit.type === "commit" && !blob && !fetched) return; // possibly half cleaned up: fetch it again
     if (commit.type !== "commit" || !blob || blob.type !== "blob" || blob.size > LIMITS.docBytes) {
       out.set(ref, { sha, doc: null });
     } else {
@@ -550,7 +705,7 @@ async function readDocs(s: Session, entries: [Ref, Sha][]): Promise<Map<Ref, Fet
   let next = 0;
   const worker = async (): Promise<void> => {
     for (let item = toRead[next++]; item !== undefined; item = toRead[next++]) {
-      const blob = await git(["cat-file", "blob", item.oid], { cwd: s.cwd, env: LOCAL_ENV });
+      const blob = await run(s, ["cat-file", "blob", item.oid], { env: LOCAL_ENV });
       // A failed read is left out rather than recorded as invalid: it is our problem, not the document's.
       if (blob.ok) out.set(item.ref, { sha: item.sha, doc: parseDoc(blob.stdout, item.ref) });
     }
