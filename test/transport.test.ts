@@ -235,6 +235,11 @@ function age(dir: string, ms: number, only?: string[]): void {
   for (const file of only ?? filesUnder(dir)) utimesSync(join(dir, file), then, then);
 }
 
+/** A path as one word for the sh that git runs core.sshCommand, receivepack and uploadpack with. Harness paths hold a space. */
+function shq(path: string): string {
+  return `'${path.replace(/'/g, `'\\''`)}'`;
+}
+
 function script(path: string, body: string): string {
   writeFileSync(path, `#!/bin/sh\n${body}\n`);
   chmodSync(path, 0o755);
@@ -429,7 +434,7 @@ describe("transport exit test", () => {
     const pidFile = join(h.root, "fake-ssh.pid");
     const fakeSsh = script(join(h.root, "fake-ssh-hang.sh"), `echo $$ >> "${pidFile}"\nexec sleep 60`);
     sh(ivan.dir, ["remote", "add", "hang", "ssh://git@huddle.invalid/team/repo.git"]);
-    sh(ivan.dir, ["config", "core.sshCommand", fakeSsh]);
+    sh(ivan.dir, ["config", "core.sshCommand", shq(fakeSsh)]);
     const timeoutMs = 1200;
     const hang = transportFor(ivan.dir, { remote: "hang", timeoutMs });
     const calls: [string, () => Promise<unknown>][] = [
@@ -546,7 +551,7 @@ describe("transport exit test", () => {
     const nora = await h.clone("nora");
     const counter = join(h.root, "receive-pack-count");
     const wrapper = script(join(h.root, "receive-pack.sh"), `echo run >> "${counter}"\nexec git receive-pack "$@"`);
-    sh(nora.dir, ["config", "remote.origin.receivepack", wrapper]);
+    sh(nora.dir, ["config", "remote.origin.receivepack", shq(wrapper)]);
     const runs = (): number => (existsSync(counter) ? readFileSync(counter, "utf8").trim().split("\n").length : 0);
 
     // By name: the default refspec does not cover refs/huddle/*.
@@ -740,7 +745,7 @@ describe("transport against awkward remotes and clones", () => {
     const hank = await h.clone("hank");
     const fakeSsh = script(join(h.root, "fake-ssh-denied.sh"), 'echo "git@huddle.invalid: Permission denied (publickey)." >&2\nexit 255');
     sh(hank.dir, ["remote", "add", "locked", "ssh://git@huddle.invalid/team/repo.git"]);
-    sh(hank.dir, ["config", "core.sshCommand", fakeSsh]);
+    sh(hank.dir, ["config", "core.sshCommand", shq(fakeSsh)]);
     const locked = transportFor(hank.dir, { remote: "locked" });
     const denied = { ok: false, reason: "denied" };
     assert.deepEqual(await locked.fetchAll(new Map()), denied);
@@ -1106,7 +1111,7 @@ describe("fetchAll when the remote moves under it", { skip: posixOnly }, () => {
       join(h.root, "upload-pack.sh"),
       `n=$(( $(cat "${counter}" 2>/dev/null || echo 0) + 1 ))\necho $n > "${counter}"\n[ -x "${steps}/$n" ] && "${steps}/$n"\nexec git upload-pack "$@"`,
     );
-    sh(reader.dir, ["config", "remote.origin.uploadpack", wrapper]);
+    sh(reader.dir, ["config", "remote.origin.uploadpack", shq(wrapper)]);
   });
   after(() => h.cleanup());
 
