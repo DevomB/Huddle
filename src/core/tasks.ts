@@ -20,8 +20,8 @@ import { LIMITS, cleanText, newId, normalizeDoc } from "./docs.ts";
 import { UsageError } from "./io.ts";
 import { log } from "./log.ts";
 import { toActorDoc } from "./session.ts";
-import { readCache, readLocal, touchSession, withLock, writeCache } from "./store.ts";
-import { sync } from "./sync.ts";
+import { readCache, readLocal, touchSession, writeCache } from "./store.ts";
+import { sync, withSyncLock } from "./sync.ts";
 import type { SyncResult } from "./sync.ts";
 import { actorRef, taskRef } from "./types.ts";
 import type { FailReason, Owner, Sha, TaskDoc } from "./types.ts";
@@ -31,11 +31,19 @@ import type { ViewTask } from "./view.ts";
 /** Which session is acting; with ctx.identity it makes the Owner. */
 export type Who = Pick<Owner, "session" | "agent">;
 
+/**
+ * Why the sync before a change did not leave fresh state (see syncFailure):
+ * the remote could not be reached ("offline") or refused us ("denied"), another
+ * sync of this clone held the lock for the whole wait ("busy"), or the round
+ * ran and did not finish ("sync-failed").
+ */
+export type SyncFailure = "offline" | "denied" | "busy" | "sync-failed";
+
 export type TaskResult =
   | { ok: true; task: TaskDoc }
   | {
       ok: false;
-      reason: FailReason | "not-found" | "not-owner" | "already-claimed" | "already-done";
+      reason: FailReason | SyncFailure | "not-found" | "not-owner" | "already-claimed" | "already-done";
       /** The task as it stands now, when known. On a lost claim, task.owner is the winner. */
       task?: TaskDoc;
       /** With a claimed `task`: whether its owner's session is live. False means the task may be claimed. */
@@ -46,8 +54,6 @@ export type TaskResult =
 const ADD_ATTEMPTS = 3;
 /** How long to wait for a running sync before giving up on recording our own change in the cache. */
 const CACHE_LOCK_WAIT_MS = 5_000;
-/** Same takeover age as sync uses for its lock. */
-const CACHE_LOCK_STALE_MS = 60_000;
 
 function ownerOf(ctx: Ctx, who: Who): Owner {
   return { actor: ctx.identity.actor, user: ctx.identity.user, session: who.session, agent: who.agent };
@@ -75,14 +81,21 @@ function stored(task: ViewTask): TaskDoc {
 /**
  * Why a sync round did not leave the cache current and this clone's sessions
  * published, or null when it did. A change is only decided on a cache that was
- * just refreshed, so anything short of that counts as not having reached the
- * remote: a round that was skipped because another sync held the lock for the
- * whole wait, and a failure on our side. A refusal is passed on as one: a
- * remote that refuses this clone's own document will refuse a task too.
+ * just refreshed, so anything short of that stops it. The reason says whether
+ * the remote had anything to do with it:
+ *
+ * - "offline", "denied": the remote could not be reached, or refused us. A
+ *   remote that refuses this clone's own document will refuse a task too.
+ * - "busy": the round never ran, because another sync of this clone held the
+ *   lock for the whole wait. The remote was not asked.
+ * - "sync-failed": the round ran and did not finish. This clone's own document
+ *   lost its push to another writer (the remote was reached), or something
+ *   failed on our side. The log says which.
  */
-export function syncFailure(result: SyncResult): "offline" | "denied" | null {
-  if (result.error === "denied") return "denied";
-  if (result.error || !result.fetched) return "offline";
+export function syncFailure(result: SyncResult): SyncFailure | null {
+  if (result.error === "offline" || result.error === "denied") return result.error;
+  if (result.error) return "sync-failed";
+  if (!result.fetched) return "busy";
   return null;
 }
 
@@ -90,18 +103,20 @@ export function syncFailure(result: SyncResult): "offline" | "denied" | null {
  * Brings the cache up to date with the remote, and publishes this clone's
  * sessions if they changed. Null when the cache is now current.
  */
-async function refresh(ctx: Ctx): Promise<FailReason | null> {
+async function refresh(ctx: Ctx): Promise<SyncFailure | null> {
   const result = await sync(ctx, { force: true });
   const failed = syncFailure(result);
-  if (failed && !result.error) log(ctx.paths, "tasks", `no fresh state: the sync was skipped (${result.skipped ?? "unknown reason"})`);
+  if (failed === "busy") log(ctx.paths, "tasks", `no fresh state: the sync was skipped (${result.skipped ?? "unknown reason"})`);
+  else if (failed === "sync-failed") log(ctx.paths, "tasks", `no fresh state: the sync did not finish (${result.error ?? "unknown reason"})`);
   return failed;
 }
 
 /**
  * The task and the sha it is at, from a single read of the cache, with
- * liveness worked out as `session` of this clone sees it.
+ * liveness worked out as `session` of this clone sees it. Reads only local
+ * files; the callers sync first. Exported for its test.
  */
-async function lookup(ctx: Ctx, id: string, session: string): Promise<{ task: ViewTask; sha: Sha } | null> {
+export async function lookup(ctx: Ctx, id: string, session: string): Promise<{ task: ViewTask; sha: Sha } | null> {
   const [cache, local] = await Promise.all([readCache(ctx.paths), readLocal(ctx.paths)]);
   const sha = cache.refs[taskRef(id)]?.sha;
   // This clone's own sessions are judged by local state, as in currentView. Its
@@ -119,16 +134,11 @@ async function lookup(ctx: Ctx, id: string, session: string): Promise<{ task: Vi
 async function remember(ctx: Ctx, task: TaskDoc, sha: Sha): Promise<void> {
   try {
     // The cache belongs to sync; its lock keeps a running round from writing an older copy over this.
-    const held = await withLock(
-      ctx.paths,
-      "sync",
-      async () => {
-        const cache = await readCache(ctx.paths);
-        cache.refs[taskRef(task.id)] = { sha, doc: task };
-        await writeCache(ctx.paths, cache);
-      },
-      { waitMs: CACHE_LOCK_WAIT_MS, staleMs: CACHE_LOCK_STALE_MS },
-    );
+    const held = await withSyncLock(ctx.paths, CACHE_LOCK_WAIT_MS, async () => {
+      const cache = await readCache(ctx.paths);
+      cache.refs[taskRef(task.id)] = { sha, doc: task };
+      await writeCache(ctx.paths, cache);
+    });
     if (!held.acquired) log(ctx.paths, "tasks", `task ${task.id} changed on the remote; the cache will catch up on the next sync`);
   } catch (error) {
     // The change is on the remote, which is what counts. The next sync brings the cache along.
