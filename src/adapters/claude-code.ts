@@ -351,7 +351,16 @@ function installedVersion(): Promise<string | null> {
   });
 }
 
-/** Hooks with `args` (exec form) arrived in this release. An older one does not know the field and cannot run huddle's handlers. */
+/**
+ * Hooks with `args` (exec form) arrived in this release. An older one does not
+ * know the field and cannot run huddle's handlers.
+ *
+ * Source: Claude Code's CHANGELOG.md
+ * (https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md), read
+ * 2026-11-12, under 2.1.139: "Added hook `args: string[]` field (exec form)
+ * that spawns the command directly without a shell, so path placeholders never
+ * need quoting". The hooks reference describes `args` and names no version.
+ */
 const FIRST_WITH_ARGS = [2, 1, 139] as const;
 
 /** A note when the installed Claude Code is too old for the handlers, null when it is new enough or unknown. */

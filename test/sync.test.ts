@@ -586,6 +586,34 @@ test("outside a git repository every command fails cleanly with exit 1", async (
   assert.deepEqual({ code: background.code, stdout: background.stdout, stderr: background.stderr }, { code: 0, stdout: "", stderr: "" });
 });
 
+test("--help or -h after a command prints its summary and usage, exits 0, and does nothing else", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  const before = await alice.snapshot();
+  for (const command of ["sync", "status", "intent", "claim", "release", "check"]) {
+    for (const flag of ["--help", "-h"]) {
+      // Outside a repository too: help must not depend on where it is asked for.
+      for (const cwd of [".", ".."]) {
+        const r = await alice.huddle([command, flag], { cwd, now: at(0) });
+        assert.equal(r.code, 0, `${command} ${flag}: ${r.stderr}`);
+        assert.equal(r.stderr, "");
+        const lines = r.stdout.split("\n");
+        assert.ok(lines[0]!.length > 10 && !lines[0]!.startsWith("Usage"), `${command}: the first line is the command's summary`);
+        assert.equal(lines[1], "");
+        assert.ok(lines[2]!.startsWith(`Usage: huddle ${command}`), `${command}: ${lines[2]}`);
+      }
+    }
+  }
+  // After other arguments as well, and nothing was claimed or announced along the way.
+  assert.equal((await alice.huddle(["claim", "src/**", "--help"], { now: at(1) })).code, 0);
+  assert.equal((await ok(alice, ["claim"], at(2))).stdout, "(no claims)\n");
+  assert.deepEqual(await alice.snapshot(), before);
+  assert.equal(existsSync((await alice.paths()).localFile), false, "no session was created by asking for help");
+
+  // "--" ends the options: what follows is text, even if it looks like a flag.
+  assert.equal((await ok(alice, ["intent", "--", "--help"], at(3))).stdout, "intent: --help\n");
+});
+
 // ---------------------------------------------------------------------------
 // The publish rule, as a pure function.
 // ---------------------------------------------------------------------------

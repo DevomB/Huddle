@@ -60,6 +60,19 @@ export class UsageError extends CliError {
   }
 }
 
+/**
+ * Thrown by args.parse when the arguments ask for help (--help or -h). The
+ * dispatcher prints the command's summary and this usage line, and exits 0.
+ */
+export class HelpRequested extends Error {
+  readonly usage: string;
+  constructor(usage: string) {
+    super("help requested");
+    this.name = "HelpRequested";
+    this.usage = usage;
+  }
+}
+
 export class NotImplementedError extends Error {
   constructor(what: string) {
     super(`not implemented: ${what}`);
