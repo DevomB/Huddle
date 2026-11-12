@@ -1341,7 +1341,8 @@ async function withBundle(root: string): Promise<void> {
  * machine's files.
  */
 function aroundOf(home: string, env: NodeJS.ProcessEnv = {}): Surroundings {
-  return { env: { GEMINI_CLI_SYSTEM_SETTINGS_PATH: join(home, "machine", "settings.json"), ...env }, home };
+  // The platform is this machine's: the adapter takes the machine's files apart with that platform's path rules.
+  return { env: { GEMINI_CLI_SYSTEM_SETTINGS_PATH: join(home, "machine", "settings.json"), ...env }, home, platform: process.platform };
 }
 
 async function emptyDir(t: TestContext): Promise<string> {

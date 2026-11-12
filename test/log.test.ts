@@ -6,10 +6,10 @@ import { mkdtemp, readFile, rm, stat, writeFile, mkdir, utimes } from "node:fs/p
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { fileURLToPath } from "node:url";
 import { log, MAX_LOG_BYTES } from "../src/core/log.ts";
 
-const LOG_MODULE = fileURLToPath(new URL("../src/core/log.ts", import.meta.url));
+// As a URL: the workers below import it, and on Windows a path with a drive letter is not something `import` takes.
+const LOG_MODULE = new URL("../src/core/log.ts", import.meta.url).href;
 
 async function tempLog(t: { after(fn: () => Promise<void>): void }): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), "huddle-log-"));
