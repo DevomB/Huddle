@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
-import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { test } from "node:test";
 import type { TestContext } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { promisify } from "node:util";
 import { getAdapter } from "../src/adapters/index.ts";
 import { NOTES, PLUGIN, detectOpencode, opencode, patchedPaths, pluginSource } from "../src/adapters/opencode.ts";
 import { SILENT } from "../src/adapters/types.ts";
@@ -327,6 +328,54 @@ test("format: the text is passed on whole, with what JSON could trip over", () =
   assert.equal(opencode.format(eventFor("prompt"), { context: awkward }).stdout.includes("\n"), false, "one line");
 });
 
+test("format: a prompt in opencode 2's queue gets no context, a start there its environment all the same, and the context is reported as not shown", () => {
+  const queued = (name: string): HookEvent => {
+    const event = parse({ ...fixture(name), delivery: "queue" });
+    assert.ok(event, name);
+    return event;
+  };
+  assert.deepEqual(opencode.format(queued("start"), { context: BRIEFING, env: { HUDDLE_SESSION: SESSION } }), {
+    stdout: JSON.stringify({ env: { HUDDLE_SESSION: SESSION } }),
+    stderr: "",
+    exitCode: 0,
+    unshown: true,
+  });
+  assert.deepEqual(opencode.format(queued("prompt"), { context: BRIEFING }), { ...SILENT, unshown: true });
+  assert.deepEqual(opencode.format(queued("prompt"), {}), SILENT);
+  // Steered, or without a delivery (opencode 1): shown.
+  for (const delivery of ["steer", undefined]) {
+    const event = parse({ ...fixture("prompt"), delivery });
+    assert.ok(event);
+    assert.deepEqual(opencode.format(event, { context: BRIEFING }), { stdout: JSON.stringify({ context: BRIEFING }), stderr: "", exitCode: 0 }, String(delivery));
+  }
+});
+
+test("parse and format: a start with a source is the session forgetting; nobody waits for it, and its briefing is not shown", () => {
+  for (const source of ["compact", "revert"]) {
+    const event = parse({ ...fixture("start"), source });
+    assert.ok(event, source);
+    assert.deepEqual([event.type, event.source], ["session-start", source]);
+    assert.deepEqual(opencode.format(event, { context: BRIEFING, env: { HUDDLE_SESSION: SESSION } }), { ...SILENT, unshown: true }, source);
+    assert.deepEqual(opencode.format(event, { env: { HUDDLE_SESSION: SESSION } }), SILENT, source);
+  }
+  assert.equal(parse({ ...fixture("start"), source: "  " })?.source, undefined);
+  assert.equal(parse({ ...fixture("prompt"), source: "compact" })?.source, undefined, "a start's only");
+});
+
+test("parse and format: a tool call with brief is briefed and waited for, an edit's with its files; a subagent's is not", () => {
+  const shell = parse({ ...fixture("tool.shell"), brief: true });
+  assert.ok(shell);
+  assert.deepEqual([shell.type, shell.brief, shell.paths], ["post-edit", true, undefined]);
+  assert.deepEqual(opencode.format(shell, { context: BRIEFING }), { stdout: JSON.stringify({ context: BRIEFING }), stderr: "", exitCode: 0 });
+  const edit = parse({ ...fixture("tool.edit"), brief: true });
+  assert.deepEqual([edit?.type, edit?.brief, edit?.paths], ["post-edit", true, ["src/auth/jwt.ts"]]);
+  const sub = parse({ ...fixture("tool.shell.subagent"), brief: true });
+  assert.ok(sub);
+  assert.equal(sub.brief, undefined);
+  assert.deepEqual(opencode.format(sub, { context: BRIEFING }), { ...SILENT, unshown: true });
+  for (const brief of ["true", 1, null]) assert.equal(parse({ ...fixture("tool.shell"), brief })?.brief, undefined, JSON.stringify(brief));
+});
+
 // ---------------------------------------------------------------------------
 // With the engine: a session, replayed through `huddle hook opencode`
 // ---------------------------------------------------------------------------
@@ -439,6 +488,49 @@ test("with the engine: a first prompt without a start still gets the whole brief
   assert.deepEqual(io.stdout, [JSON.stringify({ context: text(FULL_HEAD, jwtLine(20), FULL_FOOT) })]);
 });
 
+test("with the engine: a start and a prompt in opencode 2's queue hand over the environment and nothing else, and the next tool call gets the whole briefing", async (t) => {
+  const { bob } = await aliceBuildsJwt(t);
+  record(t);
+  const run = async (name: string, seconds: number, over: Json = {}): Promise<Ran> => {
+    const io = ioFor(bob, { now: at(seconds), stdin: payloadIn(name, bob, over) });
+    const code = await runHook(["opencode"], io);
+    return { code, stdout: io.stdout, stderr: io.stderr };
+  };
+  const prints = (answer: Json): Ran => ({ code: 0, stdout: [JSON.stringify(answer)], stderr: [] });
+
+  assert.deepEqual(await run("start", 20, { delivery: "queue" }), prints({ env: { HUDDLE_SESSION: SESSION } }));
+  assert.deepEqual(await run("prompt", 21, { delivery: "queue" }), NOTHING);
+  assert.equal((await sessionOf(bob, SESSION))?.intent, toIntent(String(fixture("prompt").prompt)), "the prompt is the intent all the same");
+  assert.deepEqual(await seenKeys(bob, SESSION), [], "and nothing counts as said");
+
+  assert.deepEqual(await run("tool.shell", 24, { brief: true }), prints({ context: text(FULL_HEAD, jwtLine(24), FULL_FOOT) }));
+  // From then on it counts as said.
+  assert.deepEqual(await run("prompt", 26), NOTHING);
+  assert.deepEqual(await run("tool.shell", 27, { brief: true }), NOTHING);
+});
+
+test("with the engine: a start after a compaction forgets the briefing and the warnings at once, and the next edit with brief has both again", async (t) => {
+  const { bob } = await aliceBuildsJwt(t);
+  record(t);
+  const run = async (name: string, seconds: number, over: Json = {}): Promise<Ran> => {
+    const io = ioFor(bob, { now: at(seconds), stdin: payloadIn(name, bob, over) });
+    const code = await runHook(["opencode"], io);
+    return { code, stdout: io.stdout, stderr: io.stderr };
+  };
+  const prints = (answer: Json): Ran => ({ code: 0, stdout: [JSON.stringify(answer)], stderr: [] });
+
+  assert.deepEqual(await run("start", 20), prints({ context: text(FULL_HEAD, jwtLine(20), FULL_FOOT), env: { HUDDLE_SESSION: SESSION } }));
+  assert.deepEqual(await run("tool.edit", 24), prints({ context: jwtWarning(24) }));
+  assert.deepEqual(await run("tool.edit", 25), NOTHING);
+
+  // Not waited for: nothing printed, the environment included.
+  assert.deepEqual(await run("start", 26, { source: "compact" }), NOTHING);
+  assert.deepEqual(await seenKeys(bob, SESSION), []);
+  assert.deepEqual(await run("tool.edit", 28, { brief: true }), prints({ context: text(jwtWarning(28), text(FULL_HEAD, jwtLine(28), FULL_FOOT)) }));
+  assert.deepEqual(await run("tool.edit", 29), NOTHING);
+  assert.deepEqual(await run("prompt", 30), NOTHING);
+});
+
 test("with the engine: a hook that got no payload it knows prints nothing and exits 0", async (t) => {
   const { bob } = await team(t);
   for (const stdin of ["", "not json", "[]", JSON.stringify({ hook_event_name: "tool" }), payloadIn("start", bob, { hook_event_name: "compact" })]) {
@@ -472,25 +564,37 @@ async function loadPlugin(root: string): Promise<PluginModule> {
 /**
  * Stands in for .huddle/huddle.mjs. Writes down what it was started with and
  * sent, then answers from answers.json next to it: by "<event>:<tool>", else
- * by "<event>". An object is printed as JSON, a text as it is; "crash" exits
- * with 3 and "hang" never ends.
+ * by "<event>". An object is printed as JSON, after `sleep` milliseconds when
+ * it has that; a text is printed as it is. "crash" exits with 3, "hang" never
+ * ends, and "flood" prints a megabyte and then writes its pid to "flooded".
+ * With a file "exit-first" next to it, it exits before it reads anything.
  */
-const STAND_IN = `import { appendFileSync, readFileSync } from "node:fs";
+const STAND_IN = `import { appendFileSync, existsSync, readFileSync } from "node:fs";
 const here = new URL(".", import.meta.url);
+const at = Date.now();
+if (existsSync(new URL("exit-first", here))) process.exit(0);
 const payload = JSON.parse(readFileSync(0, "utf8"));
 const answers = JSON.parse(readFileSync(new URL("answers.json", here), "utf8"));
 const answer = answers[payload.hook_event_name + ":" + (payload.tool ?? "")] ?? answers[payload.hook_event_name];
-appendFileSync(new URL("sent.jsonl", here), JSON.stringify({ args: process.argv.slice(2), cwd: process.cwd(), pid: process.pid, payload }) + "\\n");
+appendFileSync(new URL("sent.jsonl", here), JSON.stringify({ args: process.argv.slice(2), cwd: process.cwd(), pid: process.pid, at, payload }) + "\\n");
 if (answer === "crash") process.exit(3);
 else if (answer === "hang") setInterval(() => {}, 1000);
-else if (typeof answer === "string") process.stdout.write(answer);
-else if (answer !== undefined) process.stdout.write(JSON.stringify(answer));
+else if (answer === "flood") {
+  process.stdout.write("x".repeat(1 << 20));
+  appendFileSync(new URL("flooded", here), process.pid + "\\n");
+} else if (typeof answer === "string") process.stdout.write(answer);
+else if (answer !== undefined) {
+  if (typeof answer.sleep === "number") Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, answer.sleep);
+  process.stdout.write(JSON.stringify(answer));
+}
 `;
 
 interface Sent {
   args: string[];
   cwd: string;
   pid: number;
+  /** When the command started, by Date.now(). */
+  at: number;
   payload: Json;
 }
 
@@ -527,6 +631,8 @@ async function scratch(t: TestContext, answers: Json = {}): Promise<Scratch> {
     }
     await rm(root, { recursive: true, force: true, maxRetries: 3 });
   });
+  // A checkout: the plugin runs the bundle of the checkout around the session's directory.
+  await mkdir(join(root, ".git"));
   await opencode.install({ repoRoot: root, bundle: BUNDLE });
   await mkdir(join(root, ".huddle"), { recursive: true });
   await writeFile(join(root, BUNDLE), STAND_IN);
@@ -566,11 +672,20 @@ interface Fake2 {
   synthetic: Json[];
   /** The sessions ctx.session.get was asked for. */
   looked: string[];
+  /** What ctx.event.subscribe was asked for. */
+  subscriptions: Array<{ types: unknown; signal: AbortSignal | undefined }>;
+  /** Hands an event to each subscription that takes its type, as opencode's event stream does. */
+  emit(event: Json): void;
 }
 
-/** `parents`: the sessions opencode knows, each with its parent's id or undefined. Any other session is not found. */
-function opencode2(directory: string, parents: Record<string, string | undefined>, over: { refuses?: string[]; synthetic?: () => Promise<void> } = {}): Fake2 {
-  const fake: Fake2 = { ctx: null, hooks: {}, synthetic: [], looked: [] };
+/**
+ * `parents`: the sessions opencode knows, each with its parent's id or
+ * undefined. Any other session is not found, and a session in `hangs` is
+ * looked up for ever.
+ */
+function opencode2(directory: string, parents: Record<string, string | undefined>, over: { refuses?: string[]; synthetic?: () => Promise<void>; hangs?: Set<string> } = {}): Fake2 {
+  const listeners: Array<(event: Json) => void> = [];
+  const fake: Fake2 = { ctx: null, hooks: {}, synthetic: [], looked: [], subscriptions: [], emit: (event) => listeners.forEach((listener) => listener(event)) };
   const hook = (domain: string) => async (name: string, callback: Hook) => {
     if (over.refuses?.includes(`${domain}.${name}`)) throw new Error(`Unknown hook: ${name}`);
     fake.hooks[`${domain}.${name}`] = callback;
@@ -582,6 +697,7 @@ function opencode2(directory: string, parents: Record<string, string | undefined
       hook: hook("session"),
       get: async (input: { sessionID: string }) => {
         fake.looked.push(input.sessionID);
+        if (over.hangs?.has(input.sessionID)) return new Promise(() => {});
         if (!Object.hasOwn(parents, input.sessionID)) throw new Error(`Session not found: ${input.sessionID}`);
         return { id: input.sessionID, parentID: parents[input.sessionID] };
       },
@@ -591,6 +707,32 @@ function opencode2(directory: string, parents: Record<string, string | undefined
       },
     },
     tool: { hook: hook("tool") },
+    // After packages/plugin/src/promise/adapter.ts: an AsyncIterable of the events of the types asked for, ended by the signal.
+    event: {
+      subscribe(options: { types?: string[]; signal?: AbortSignal } = {}): AsyncIterable<Json> {
+        fake.subscriptions.push({ types: options.types, signal: options.signal });
+        const queue: Json[] = [];
+        let wake: (() => void) | undefined;
+        listeners.push((event) => {
+          if (options.types !== undefined && !options.types.includes(String(event.type))) return;
+          queue.push(event);
+          wake?.();
+        });
+        return (async function* () {
+          while (options.signal?.aborted !== true) {
+            const next = queue.shift();
+            if (next !== undefined) {
+              yield next;
+              continue;
+            }
+            await new Promise<void>((resolve) => {
+              wake = resolve;
+              options.signal?.addEventListener("abort", () => resolve(), { once: true });
+            });
+          }
+        })();
+      },
+    },
   };
   return fake;
 }
@@ -682,7 +824,7 @@ test("plugin: it imports three of node's own modules and nothing else, and start
   }
   // One spawn, of node with the bundle and two fixed words, without a shell.
   assert.equal((source.match(/\bspawn\(/g) ?? []).length, 1);
-  assert.ok(source.includes('spawn("node", [BUNDLE, "hook", "opencode"], {'));
+  assert.ok(source.includes('spawn("node", [bundle, "hook", "opencode"], {'));
   assert.equal(source.includes("shell:"), false);
 });
 
@@ -751,9 +893,9 @@ test("plugin, opencode 2: the first prompt of a session starts it, and the model
   assert.deepEqual(v2.synthetic, [{ sessionID: SESSION, text: "BRIEFING\n\nNEWS", description: NOTE, delivery: "steer", resume: false }]);
 
   // A later prompt: the prompt alone, and what it brings.
-  await call(v2.hooks, "session.prompt", promptEvent(SESSION, "continue", "queue"));
+  await call(v2.hooks, "session.prompt", promptEvent(SESSION, "continue", "steer"));
   assert.deepEqual(s.payloads().slice(2), [{ hook_event_name: "prompt", session_id: SESSION, cwd: s.root, prompt: "continue" }]);
-  assert.deepEqual(v2.synthetic.slice(1), [{ sessionID: SESSION, text: "NEWS", description: NOTE, delivery: "queue", resume: false }]);
+  assert.deepEqual(v2.synthetic.slice(1), [{ sessionID: SESSION, text: "NEWS", description: NOTE, delivery: "steer", resume: false }]);
   assert.deepEqual(v2.looked, [SESSION], "opencode is asked once who a session is");
 });
 
@@ -796,25 +938,156 @@ test("plugin, opencode 2: only the briefing or only the news is handed over as i
   );
 });
 
-test("plugin, opencode 2: after a compaction the next prompt starts over, so the briefing comes again", async (t) => {
+test("plugin, opencode 2: at a compaction huddle forgets at once what it said, and the session's next tool call is briefed again", async (t) => {
   const s = await scratch(t, { start: { context: "BRIEFING" } });
   const v2 = opencode2(s.root, { [SESSION]: undefined, [CHILD]: SESSION });
   await s.plugin.setup(v2.ctx);
   await call(v2.hooks, "session.prompt", promptEvent(SESSION, "Fix the build"));
-  await call(v2.hooks, "session.prompt", promptEvent(SESSION, "continue"));
   // A subagent's context being compacted says nothing about the session's own.
   await call(v2.hooks, "session.compaction", { sessionID: CHILD, agent: "explore", system: [], messages: [], tools: {}, options: {} });
-  await call(v2.hooks, "session.prompt", promptEvent(SESSION, "continue"));
+  assert.equal(s.sent().length, 2);
+
+  // opencode waits for this hook before it compacts: the start that makes huddle forget is not waited for.
+  await s.answers({ start: "hang", "tool:shell": { context: "BRIEFED AGAIN" } });
+  const before = Date.now();
   await call(v2.hooks, "session.compaction", { sessionID: SESSION, agent: "build", system: [], messages: [], tools: {}, options: {} });
+  assert.ok(Date.now() - before < 1500, `the hook waited ${Date.now() - before} ms`);
+  assert.deepEqual((await s.arrived(3))[2], { hook_event_name: "start", session_id: SESSION, cwd: s.root, source: "compact" });
+
+  // Owed: the session's next tool call that is not a read is waited for, with brief, and carries what is due.
+  await call(v2.hooks, "tool.execute.after", toolEvent(SESSION, "read", { path: "src/a.ts" }));
+  await call(v2.hooks, "tool.execute.after", toolEvent(CHILD, "shell", { command: "ls" }));
+  assert.deepEqual((await s.arrived(4))[3], moved(fixture("tool.shell.subagent"), s.root), "not a subagent's: its context is not the session's");
+  const shell = toolEvent(SESSION, "shell", { command: "npm test" });
+  await call(v2.hooks, "tool.execute.after", shell);
+  assert.deepEqual((shell.result as Json).content, [
+    { type: "text", text: "shell done" },
+    { type: "text", text: "BRIEFED AGAIN" },
+  ]);
+  assert.deepEqual(s.payloads()[4], { hook_event_name: "tool", session_id: SESSION, cwd: s.root, tool: "shell", brief: true });
+  // Once.
+  const next = toolEvent(SESSION, "shell", { command: "npm test" });
+  await call(v2.hooks, "tool.execute.after", next);
+  assert.deepEqual((next.result as Json).content, [{ type: "text", text: "shell done" }]);
+  assert.deepEqual((await s.arrived(6))[5], moved(fixture("tool.shell"), s.root));
+
+  // The session is not started again at its next prompt: huddle has forgotten already.
   await call(v2.hooks, "session.prompt", promptEvent(SESSION, "continue"));
   assert.deepEqual(
     s.payloads().map((payload) => payload.hook_event_name),
-    ["start", "prompt", "prompt", "prompt", "start", "prompt"],
+    ["start", "prompt", "start", "tool", "tool", "tool", "prompt"],
   );
+});
+
+test("plugin, opencode 2: a revert that is committed makes huddle forget what it said, and the next edit is briefed again", async (t) => {
+  const s = await scratch(t, { start: { context: "BRIEFING" }, "tool:edit": { context: "BRIEFED AGAIN" } });
+  const v2 = opencode2(s.root, { [SESSION]: undefined, [CHILD]: SESSION });
+  const cleanup = await s.plugin.setup(v2.ctx);
+  assert.deepEqual(
+    v2.subscriptions.map((subscription) => subscription.types),
+    [["session.revert.committed"]],
+  );
+  await call(v2.hooks, "session.prompt", promptEvent(SESSION, "Fix the build"));
+
+  // After packages/schema/src/session-event.ts RevertEvent.Committed: { sessionID, to }.
+  v2.emit({ id: "evt_1", type: "session.revert.committed", data: { sessionID: CHILD, to: "msg_5d2a91c0f001Aa1Bb2Cc3Dd4Ee" } });
+  v2.emit({ id: "evt_2", type: "session.revert.committed", data: { sessionID: SESSION, to: "msg_5d2a91c0f001Aa1Bb2Cc3Dd4Ee" } });
+  assert.deepEqual((await s.arrived(3))[2], { hook_event_name: "start", session_id: SESSION, cwd: s.root, source: "revert" });
+
+  const edit = toolEvent(SESSION, "edit", { path: "src/auth/jwt.ts" });
+  await call(v2.hooks, "tool.execute.after", edit);
+  assert.deepEqual((edit.result as Json).content, [
+    { type: "text", text: "edit done" },
+    { type: "text", text: "BRIEFED AGAIN" },
+  ]);
+  assert.deepEqual(s.payloads()[3], { ...(moved(fixture("tool.edit"), s.root) as Json), input: { path: "src/auth/jwt.ts" }, brief: true });
+
+  // Unloading ends the subscription.
+  cleanup();
+  assert.equal(v2.subscriptions[0]?.signal?.aborted, true);
+  assert.deepEqual((await s.arrived(5))[4], moved(fixture("end"), s.root), "and ends the session");
+});
+
+test("plugin, opencode 2: a prompt that waits in the queue is handed nothing, and the session's next tool call carries what was due", async (t) => {
+  const s = await scratch(t, {
+    start: { context: "BRIEFING", env: { HUDDLE_SESSION: SESSION } },
+    prompt: { context: "NEWS" },
+    "tool:shell": { context: "DUE" },
+    "tool:edit": { context: "DUE WITH THE EDIT" },
+  });
+  const v2 = opencode2(s.root, { [SESSION]: undefined, [CHILD]: SESSION });
+  await s.plugin.setup(v2.ctx);
+
+  // Sent while a turn runs. A message in front of it would be answered in a model step of its own.
+  await call(v2.hooks, "session.prompt", promptEvent(SESSION, "Add rate limiting to the login endpoint", "queue"));
+  assert.equal(v2.synthetic.length, 0, "not even when the command answers with a context");
+  assert.deepEqual(s.payloads(), [
+    { hook_event_name: "start", session_id: SESSION, cwd: s.root, delivery: "queue" },
+    { hook_event_name: "prompt", session_id: SESSION, cwd: s.root, prompt: "Add rate limiting to the login endpoint", delivery: "queue" },
+  ]);
+
+  // A subagent's call does not carry it, and a read is nothing.
+  await call(v2.hooks, "tool.execute.after", toolEvent(SESSION, "grep", { pattern: "jwt" }));
+  await call(v2.hooks, "tool.execute.after", toolEvent(CHILD, "shell", { command: "ls" }));
+  await s.arrived(3);
+  const shell = toolEvent(SESSION, "shell", { command: "npm test" });
+  await call(v2.hooks, "tool.execute.after", shell);
+  assert.deepEqual((shell.result as Json).content, [
+    { type: "text", text: "shell done" },
+    { type: "text", text: "DUE" },
+  ]);
+  assert.deepEqual(s.payloads()[3], { hook_event_name: "tool", session_id: SESSION, cwd: s.root, tool: "shell", brief: true });
+
+  // Steered, a prompt is handed what it brings.
+  await call(v2.hooks, "session.prompt", promptEvent(SESSION, "continue", "steer"));
+  assert.deepEqual(
+    v2.synthetic.map((message) => [message.text, message.delivery]),
+    [["NEWS", "steer"]],
+  );
+  // Queued again, then an edit: the edit carries it.
+  await call(v2.hooks, "session.prompt", promptEvent(SESSION, "and the tests", "queue"));
+  const edit = toolEvent(SESSION, "edit", { path: "src/auth/jwt.ts" });
+  await call(v2.hooks, "tool.execute.after", edit);
+  assert.deepEqual(s.payloads()[6], { ...(moved(fixture("tool.edit"), s.root) as Json), input: { path: "src/auth/jwt.ts" }, brief: true });
+  assert.deepEqual((edit.result as Json).content, [
+    { type: "text", text: "edit done" },
+    { type: "text", text: "DUE WITH THE EDIT" },
+  ]);
+  assert.equal(v2.synthetic.length, 1);
+});
+
+test("plugin, opencode 2: two prompts at once in a session new here both wait for its start", async (t) => {
+  const s = await scratch(t, { start: { context: "BRIEFING", sleep: 700 }, prompt: { context: "NEWS" } });
+  const v2 = opencode2(s.root, { [SESSION]: undefined });
+  await s.plugin.setup(v2.ctx);
+  await Promise.all([call(v2.hooks, "session.prompt", promptEvent(SESSION, "one")), call(v2.hooks, "session.prompt", promptEvent(SESSION, "two"))]);
+  const sent = s.sent();
+  assert.deepEqual(
+    sent.map((entry) => entry.payload.hook_event_name),
+    ["start", "prompt", "prompt"],
+  );
+  for (const entry of sent.slice(1)) assert.ok(entry.at >= (sent[0]?.at ?? 0) + 700, `a prompt was sent ${entry.at - (sent[0]?.at ?? 0)} ms after the start began`);
+  assert.deepEqual(v2.synthetic.map((message) => message.text).sort(), ["BRIEFING\n\nNEWS", "NEWS"]);
+});
+
+test("plugin, opencode 2: a session lookup that never settles costs a hook 2 s, and is asked again at the next event", { timeout: 30_000 }, async (t) => {
+  const s = await scratch(t, { start: { context: "BRIEFING" } });
+  const hangs = new Set([SESSION]);
+  const v2 = opencode2(s.root, { [SESSION]: undefined }, { hangs });
+  await s.plugin.setup(v2.ctx);
+  const before = Date.now();
+  await call(v2.hooks, "session.prompt", promptEvent(SESSION, "Fix the build"));
+  const waited = Date.now() - before;
+  assert.ok(waited >= 1900 && waited < 3500, `the prompt hook waited ${waited} ms`);
+  assert.deepEqual([s.sent(), v2.synthetic], [[], []]);
+
+  hangs.delete(SESSION);
+  await call(v2.hooks, "session.prompt", promptEvent(SESSION, "Fix the build"));
   assert.deepEqual(
     v2.synthetic.map((message) => message.text),
-    ["BRIEFING", "BRIEFING"],
+    ["BRIEFING"],
   );
+  assert.deepEqual(v2.looked, [SESSION, SESSION]);
 });
 
 test("plugin, opencode 2: after an edit the warning is added to what the model reads as the edit's result, and nothing else of it changes", async (t) => {
@@ -1009,15 +1282,118 @@ test("plugin, opencode 2: the end of a turn is sent, and unloading the plugin en
     ends.sort((a, b) => String(a.session_id).localeCompare(String(b.session_id))),
     [moved(fixture("end"), s.root), { hook_event_name: "end", session_id: "ses_other", cwd: s.root }],
   );
-  // Once: a second unload has nothing left to end, and the next prompt starts the session again.
+  // Once: an instance that was unloaded does nothing more, and the next one starts the session again.
   cleanup();
   await call(v2.hooks, "session.prompt", promptEvent(SESSION, "continue"));
+  assert.equal(s.sent().length, 8);
+  const reloaded = opencode2(s.root, { [SESSION]: undefined });
+  await s.plugin.setup(reloaded.ctx);
+  await call(reloaded.hooks, "session.prompt", promptEvent(SESSION, "continue"));
   assert.deepEqual(
     s
       .payloads()
       .slice(8)
       .map((payload) => payload.hook_event_name),
     ["start", "prompt"],
+  );
+});
+
+/** Moves the bundle away while `work` runs: what the plugin remembers without starting a command for it. */
+async function withoutBundle(s: Scratch, work: () => Promise<void>): Promise<void> {
+  await rename(join(s.root, BUNDLE), join(s.root, `${BUNDLE}.away`));
+  try {
+    await work();
+  } finally {
+    await rename(join(s.root, `${BUNDLE}.away`), join(s.root, BUNDLE));
+  }
+}
+
+/** Date.now() `ms` later while `work` runs. */
+async function later<T>(ms: number, work: () => Promise<T>): Promise<T> {
+  const real = Date.now;
+  Date.now = () => real() + ms;
+  try {
+    return await work();
+  } finally {
+    Date.now = real;
+  }
+}
+
+const ids = (count: number): string[] => Array.from({ length: count }, (_, n) => `ses_${String(n).padStart(3, "0")}`);
+
+test("plugin, opencode 2: unloading ends at most four sessions, those heard from in the last 15 minutes", async (t) => {
+  const s = await scratch(t, {});
+  const sessions = ids(60);
+  const v2 = opencode2(s.root, Object.fromEntries(sessions.map((id) => [id, undefined])));
+  const cleanup = await s.plugin.setup(v2.ctx);
+  await withoutBundle(s, async () => {
+    for (const id of sessions) await call(v2.hooks, "session.prompt", promptEvent(id, "Fix the build"));
+  });
+  assert.equal(s.sent().length, 0);
+
+  // Twenty minutes on, two of the sixty are heard from again.
+  await later(20 * 60_000, async () => {
+    await call(v2.hooks, "session.experimental.idle", { sessionID: "ses_007", background: [] });
+    await call(v2.hooks, "tool.execute.after", toolEvent("ses_003", "shell", { command: "ls" }));
+    await s.arrived(2);
+    cleanup();
+  });
+  await s.arrived(4);
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+  assert.deepEqual(
+    s
+      .payloads()
+      .slice(2)
+      .map((payload) => [payload.hook_event_name, payload.session_id])
+      .sort(),
+    [
+      ["end", "ses_003"],
+      ["end", "ses_007"],
+    ],
+  );
+
+  // Sixty heard from just now: four, the ones heard from last.
+  const next = opencode2(s.root, Object.fromEntries(sessions.map((id) => [id, undefined])));
+  const unload = await s.plugin.setup(next.ctx);
+  await withoutBundle(s, async () => {
+    for (const id of sessions) await call(next.hooks, "session.prompt", promptEvent(id, "Fix the build"));
+  });
+  await call(next.hooks, "tool.execute.after", toolEvent("ses_010", "shell", { command: "ls" }));
+  await s.arrived(5);
+  unload();
+  await s.arrived(9);
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+  assert.deepEqual(
+    s
+      .payloads()
+      .slice(5)
+      .map((payload) => payload.session_id)
+      .sort(),
+    ["ses_010", "ses_057", "ses_058", "ses_059"],
+  );
+});
+
+test("plugin: it remembers 100 sessions, and one it forgot is looked up and started again", async (t) => {
+  const s = await scratch(t, {});
+  const sessions = ids(101);
+  const v2 = opencode2(s.root, Object.fromEntries(sessions.map((id) => [id, undefined])));
+  await s.plugin.setup(v2.ctx);
+  await withoutBundle(s, async () => {
+    for (const id of sessions) await call(v2.hooks, "session.prompt", promptEvent(id, "Fix the build"));
+  });
+  await call(v2.hooks, "session.prompt", promptEvent("ses_100", "continue"));
+  await call(v2.hooks, "session.prompt", promptEvent("ses_000", "continue"));
+  assert.deepEqual(
+    s.payloads().map((payload) => [payload.hook_event_name, payload.session_id]),
+    [
+      ["prompt", "ses_100"],
+      ["start", "ses_000"],
+      ["prompt", "ses_000"],
+    ],
+  );
+  assert.deepEqual(
+    [v2.looked.filter((id) => id === "ses_000").length, v2.looked.filter((id) => id === "ses_100").length],
+    [2, 1],
   );
 });
 
@@ -1329,8 +1705,8 @@ test("plugin, opencode 1: the agent's shell gets the session huddle named at the
   assert.equal(s.sent().length, 2, "no command is run for a shell");
 });
 
-test("plugin, opencode 1: a session going idle is the end of a turn, a compaction starts the briefing over, and dispose ends the sessions", async (t) => {
-  const s = await scratch(t, { start: { context: "BRIEFING" } });
+test("plugin, opencode 1: a session going idle is the end of a turn, a compaction makes huddle forget, and dispose ends the sessions", async (t) => {
+  const s = await scratch(t, { start: { context: "BRIEFING", env: { HUDDLE_SESSION: SESSION } }, "tool:edit": { context: "BRIEFED AGAIN" } });
   const v1 = opencode1(s.root, { [SESSION]: undefined, [CHILD]: SESSION });
   const hooks = await s.plugin.server(v1.input);
   const event = (type: string, properties: Json): Promise<void> => call(hooks, "event", { event: { id: "evt_1", type, properties } });
@@ -1338,6 +1714,11 @@ test("plugin, opencode 1: a session going idle is the end of a turn, a compactio
     const message = typedMessage(SESSION, "continue");
     await call(hooks, "chat.message", { sessionID: SESSION }, message);
     return message.parts.map((part) => part.text);
+  };
+  const shellEnv = async (): Promise<unknown> => {
+    const shell = { env: {} };
+    await call(hooks, "shell.env", { cwd: s.root, sessionID: SESSION, callID: "call_2" }, shell);
+    return shell.env;
   };
 
   assert.deepEqual(await prompt(), ["continue", "BRIEFING"]);
@@ -1356,18 +1737,54 @@ test("plugin, opencode 1: a session going idle is the end of a turn, a compactio
   await event("session.status", { sessionID: SESSION, status: { type: "idle" } });
   assert.deepEqual((await s.arrived(5))[4], moved(fixture("idle"), s.root));
 
+  // An automatic compaction goes on with the turn without a "chat.message": huddle forgets at once.
   await event("session.compacted", { sessionID: SESSION });
-  assert.deepEqual(await prompt(), ["continue", "BRIEFING"]);
-  assert.deepEqual(
-    s
-      .payloads()
-      .slice(5)
-      .map((payload) => payload.hook_event_name),
-    ["start", "prompt"],
-  );
+  assert.deepEqual((await s.arrived(6))[5], { hook_event_name: "start", session_id: SESSION, cwd: s.root, source: "compact" });
+  // The session's shells keep their environment.
+  assert.deepEqual(await shellEnv(), { HUDDLE_SESSION: SESSION });
+  // The next edit is briefed again, once.
+  const output = { title: "src/auth/jwt.ts", output: "Edit applied successfully.", metadata: {} };
+  await call(hooks, "tool.execute.after", { tool: "edit", sessionID: SESSION, callID: "call_1", args: { filePath: "src/auth/jwt.ts" } }, output);
+  assert.equal(output.output, "Edit applied successfully.\n\nBRIEFED AGAIN");
+  assert.deepEqual(s.payloads()[6], { hook_event_name: "tool", session_id: SESSION, cwd: s.root, tool: "edit", input: { filePath: "src/auth/jwt.ts" }, brief: true });
+  await call(hooks, "tool.execute.after", { tool: "edit", sessionID: SESSION, callID: "call_3", args: { filePath: "src/auth/jwt.ts" } }, { output: "" });
+  assert.equal(s.payloads()[7]?.brief, undefined);
+  // Not started again at the next prompt.
+  assert.deepEqual(await prompt(), ["continue"]);
+  assert.equal(s.payloads()[8]?.hook_event_name, "prompt");
 
+  // And dispose still ends the session.
   await call(hooks, "dispose");
-  assert.deepEqual((await s.arrived(8))[7], moved(fixture("end"), s.root));
+  assert.deepEqual((await s.arrived(10))[9], moved(fixture("end"), s.root));
+});
+
+test("plugin, opencode 1: when a revert took messages out of a session, its next prompt starts it over", async (t) => {
+  const s = await scratch(t, { start: { context: "BRIEFING", env: { HUDDLE_SESSION: SESSION } } });
+  const v1 = opencode1(s.root, { [SESSION]: undefined, [CHILD]: SESSION });
+  const hooks = await s.plugin.server(v1.input);
+  const prompt = async (): Promise<unknown[]> => {
+    const message = typedMessage(SESSION, "continue");
+    await call(hooks, "chat.message", { sessionID: SESSION }, message);
+    return message.parts.map((part) => part.text);
+  };
+  assert.deepEqual(await prompt(), ["continue", "BRIEFING"]);
+  assert.deepEqual(await prompt(), ["continue"]);
+
+  // opencode 1 takes them out at the start of the prompt that follows the revert (session/revert.ts cleanup), and
+  // hands each removal to the plugin from inside its publish, without waiting for it, before "chat.message".
+  void call(hooks, "event", { event: { id: "evt_1", type: "message.removed", properties: { sessionID: SESSION, messageID: "msg_2" } } });
+  void call(hooks, "event", { event: { id: "evt_2", type: "message.part.removed", properties: { sessionID: SESSION, messageID: "msg_1", partID: "prt_1" } } });
+  void call(hooks, "event", { event: { id: "evt_3", type: "message.removed", properties: { sessionID: CHILD, messageID: "msg_9" } } });
+  assert.deepEqual(await prompt(), ["continue", "BRIEFING"]);
+  assert.deepEqual(await prompt(), ["continue"]);
+  assert.deepEqual(
+    s.payloads().map((payload) => payload.hook_event_name),
+    ["start", "prompt", "prompt", "start", "prompt", "prompt"],
+  );
+  // The environment is the start's, as before.
+  const shell = { env: {} };
+  await call(hooks, "shell.env", { cwd: s.root, sessionID: SESSION, callID: "call_2" }, shell);
+  assert.deepEqual(shell.env, { HUDDLE_SESSION: SESSION });
 });
 
 test("plugin, opencode 1: a subagent's task is not the user's prompt", async (t) => {
@@ -1386,6 +1803,179 @@ test("plugin, opencode 1: a subagent's task is not the user's prompt", async (t)
 });
 
 // ---------------------------------------------------------------------------
+// The plugin's bounds: time, memory, processes
+// ---------------------------------------------------------------------------
+
+/** Whether a process is still there. Not on Windows. */
+function alive(pid: number | undefined): boolean {
+  if (pid === undefined) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+test("plugin: a command that hangs is killed, waited for or not, and after three that ran out of time in a row the plugin rests for a minute", { skip: process.platform === "win32", timeout: 60_000 }, async (t) => {
+  const s = await scratch(t, { "tool:edit": "hang", "tool:shell": "hang" });
+  const v2 = opencode2(s.root, { [SESSION]: undefined });
+  await s.plugin.setup(v2.ctx);
+
+  // Not waited for: the hook is back at once.
+  const shellAt = Date.now();
+  await call(v2.hooks, "tool.execute.after", toolEvent(SESSION, "shell", { command: "npm test" }));
+  assert.ok(Date.now() - shellAt < 1500);
+  await s.arrived(1);
+  const shell = s.sent()[0];
+
+  // Waited for: each edit's command is killed when its 3 s are over, and the edit's result is as it was.
+  for (let n = 1; n <= 3; n++) {
+    const before = Date.now();
+    const edit = toolEvent(SESSION, "edit", { path: "src/a.ts" });
+    await call(v2.hooks, "tool.execute.after", edit);
+    const waited = Date.now() - before;
+    assert.ok(waited >= 2900 && waited < 4500, `edit ${n} waited ${waited} ms`);
+    assert.deepEqual((edit.result as Json).content, [{ type: "text", text: "edit done" }]);
+    const pid = s.sent()[n]?.pid;
+    await until(`edit ${n}'s command being killed`, async () => !alive(pid), 3000);
+    if (n === 1) assert.equal(alive(shell?.pid), true, "the command nobody waits for is let be for longer");
+  }
+
+  // Three in a row: every hook comes back at once and starts nothing.
+  const before = Date.now();
+  await call(v2.hooks, "tool.execute.after", toolEvent(SESSION, "edit", { path: "src/a.ts" }));
+  await call(v2.hooks, "session.prompt", promptEvent(SESSION, "continue"));
+  await call(v2.hooks, "session.experimental.idle", { sessionID: SESSION, background: [] });
+  await call(v2.hooks, "tool.execute.after", toolEvent(SESSION, "shell", { command: "ls" }));
+  assert.ok(Date.now() - before < 500, `they took ${Date.now() - before} ms`);
+  assert.equal(s.sent().length, 4);
+
+  // The command nobody waited for is killed after 10 s.
+  await until("the shell's command being killed", async () => !alive(shell?.pid), 6000);
+  assert.ok(Date.now() - (shell?.at ?? 0) >= 9500, `killed ${Date.now() - (shell?.at ?? 0)} ms after it started`);
+
+  // A minute on, the plugin acts again.
+  await s.answers({});
+  await later(61_000, () => call(v2.hooks, "tool.execute.after", toolEvent(SESSION, "edit", { path: "src/a.ts" })));
+  assert.equal(s.sent().length, 5);
+});
+
+test("plugin: a command nobody waits for keeps opencode's process from exiting no longer than it takes to start it", { skip: process.platform === "win32", timeout: 30_000 }, async (t) => {
+  const s = await scratch(t, { "tool:shell": "hang" });
+  // A process that loads the plugin as opencode 2 does, has one shell call end, and has nothing else to do.
+  const script = join(s.root, "opencode-stand-in.mjs");
+  await writeFile(
+    script,
+    [
+      `import plugin from ${JSON.stringify(pathToFileURL(join(s.root, PLUGIN)).href)};`,
+      "const hooks = {};",
+      'const hook = (domain) => async (name, callback) => void (hooks[domain + "." + name] = callback);',
+      `await plugin.setup({ location: { directory: ${JSON.stringify(s.root)} }, session: { hook: hook("session"), get: async () => ({}), synthetic: async () => {} }, tool: { hook: hook("tool") } });`,
+      'await hooks["tool.execute.after"]({ tool: "shell", sessionID: "ses_1", status: "completed", input: {}, result: { content: [] } });',
+      "",
+    ].join("\n"),
+  );
+  const started = Date.now();
+  await promisify(execFile)(process.execPath, [script]);
+  const took = Date.now() - started;
+  assert.ok(took < 5000, `the process took ${took} ms to exit`);
+  await s.arrived(1);
+  assert.equal(alive(s.sent()[0]?.pid), true, "and the command goes on by itself");
+});
+
+test("plugin: what a command nobody waits for prints goes nowhere, so one that prints much is not held up", { skip: process.platform === "win32" }, async (t) => {
+  const s = await scratch(t, { "tool:shell": "flood" });
+  const v2 = opencode2(s.root, { [SESSION]: undefined });
+  await s.plugin.setup(v2.ctx);
+  await call(v2.hooks, "tool.execute.after", toolEvent(SESSION, "shell", { command: "npm test" }));
+  await until("the command having printed a megabyte", async () => existsSync(join(s.root, ".huddle", "flooded")), 5000);
+});
+
+test("plugin: a command that ends before it reads its stdin is no error in opencode's process", async (t) => {
+  const s = await scratch(t, {});
+  await writeFile(join(s.root, ".huddle", "exit-first"), "");
+  const v2 = opencode2(s.root, { [SESSION]: undefined });
+  await s.plugin.setup(v2.ctx);
+  // A patch of more than a pipe holds: writing it fails once the command is gone.
+  const patchText = ["*** Begin Patch", "*** Update File: src/a.ts", ...Array.from({ length: 400_000 }, () => "+line"), "*** End Patch", ""].join("\n");
+  const event = toolEvent(SESSION, "patch", { patchText });
+  await call(v2.hooks, "tool.execute.after", event);
+  assert.deepEqual((event.result as Json).content, [{ type: "text", text: "patch done" }]);
+  // An error of the stream comes when it comes: time for it to show up as an uncaught one.
+  await new Promise((resolve) => setTimeout(resolve, 500));
+});
+
+test("plugin, opencode 1: a hook whose output cannot be changed still comes back, and without an error", async (t) => {
+  const s = await scratch(t, { start: { context: "BRIEFING", env: { HUDDLE_SESSION: SESSION } }, tool: { context: "WARNING" } });
+  const hooks = await s.plugin.server(opencode1(s.root, { [SESSION]: undefined }).input);
+  const message = typedMessage(SESSION, "Fix the build");
+  const parts = Object.freeze([...message.parts]);
+  await call(hooks, "chat.message", { sessionID: SESSION }, { ...message, parts });
+  assert.equal(parts.length, 1);
+  const output = Object.freeze({ title: "", output: "Edit applied successfully.", metadata: {} });
+  await call(hooks, "tool.execute.after", { tool: "edit", sessionID: SESSION, callID: "call_1", args: { filePath: "a.ts" } }, output);
+  assert.equal(output.output, "Edit applied successfully.");
+  const env = Object.freeze({});
+  await call(hooks, "shell.env", { cwd: s.root, sessionID: SESSION, callID: "call_2" }, { env });
+  assert.deepEqual(env, {});
+});
+
+test("plugin: in a worktree inside another checkout, the worktree's own bundle runs, and once, whichever plugin file opencode loaded", async (t) => {
+  const s = await scratch(t, { start: { context: "OUTER" } });
+  const inner = join(s.root, ".worktrees", "feature");
+  await mkdir(join(inner, ".huddle"), { recursive: true });
+  // A linked worktree has a .git file.
+  await writeFile(join(inner, ".git"), `gitdir: ${join(s.root, ".git", "worktrees", "feature")}\n`);
+  await opencode.install({ repoRoot: inner, bundle: BUNDLE });
+  await writeFile(join(inner, BUNDLE), STAND_IN);
+  await writeFile(join(inner, ".huddle", "answers.json"), JSON.stringify({ start: { context: "INNER" } }));
+  const innerSent = (): Json[] =>
+    existsSync(join(inner, ".huddle", "sent.jsonl"))
+      ? readFileSync(join(inner, ".huddle", "sent.jsonl"), "utf8")
+          .split("\n")
+          .filter((line) => line !== "")
+          .map((line) => (JSON.parse(line) as Sent).payload)
+      : [];
+  const innerPlugin = await loadPlugin(inner);
+  const directory = join(inner, "src");
+  await mkdir(directory);
+
+  // opencode 2 keeps the outer checkout's plugin, the first with its id: the worktree's bundle runs all the same.
+  const v2 = opencode2(directory, { [SESSION]: undefined });
+  const cleanup = await s.plugin.setup(v2.ctx);
+  await call(v2.hooks, "session.prompt", promptEvent(SESSION, "Fix the build"));
+  assert.deepEqual(
+    v2.synthetic.map((message) => message.text),
+    ["INNER"],
+  );
+  cleanup();
+  await until("the session being ended", async () => innerSent().length === 3);
+
+  // opencode 1 keeps both, in one process: one of them acts.
+  const outer1 = await s.plugin.server(opencode1(directory, { [SESSION]: undefined }).input);
+  const inner1 = await innerPlugin.server(opencode1(directory, { [SESSION]: undefined }).input);
+  const message = typedMessage(SESSION, "Fix the build");
+  await call(outer1, "chat.message", { sessionID: SESSION }, message);
+  await call(inner1, "chat.message", { sessionID: SESSION }, message);
+  assert.deepEqual(
+    message.parts.map((part) => part.text),
+    ["Fix the build", "INNER"],
+  );
+  assert.deepEqual(
+    innerSent().map((payload) => [payload.hook_event_name, payload.cwd]),
+    [
+      ["start", directory],
+      ["prompt", directory],
+      ["end", directory],
+      ["start", directory],
+      ["prompt", directory],
+    ],
+  );
+  assert.deepEqual(s.sent(), [], "the outer checkout's bundle was never run");
+});
+
+// ---------------------------------------------------------------------------
 // The fixtures are what the plugin sends
 // ---------------------------------------------------------------------------
 
@@ -1395,7 +1985,8 @@ test("fixtures: each one is a payload the plugin sends, to the letter", async (t
   const patch1 = String(((moved(fixture("tool.apply-patch.v1"), s.root) as Json).input as Json).patchText);
   const v2 = opencode2(s.root, { [SESSION]: undefined, [CHILD]: SESSION });
   const cleanup = await s.plugin.setup(v2.ctx);
-  const hooks = await s.plugin.server(opencode1(s.root, { [SESSION]: undefined }).input);
+  // One process runs one major. opencode 1 comes after opencode 2 has unloaded the plugin.
+  let hooks: Record<string, Hook> = {};
   const after1 = (tool: string, args: Json): Promise<void> => call(hooks, "tool.execute.after", { tool, sessionID: SESSION, callID: "call_1", args }, { title: "", output: "", metadata: {} });
 
   // Each recipe is waited for, or its payload is waited for, before the next: the order below is the order sent.
@@ -1409,15 +2000,16 @@ test("fixtures: each one is a payload the plugin sends, to the letter", async (t
   await step(["tool.edit"], () => call(v2.hooks, "tool.execute.after", toolEvent(SESSION, "edit", { path: "src/auth/jwt.ts", oldString: "false", newString: "true", replaceAll: false })));
   await step(["tool.write"], () => call(v2.hooks, "tool.execute.after", toolEvent(SESSION, "write", { path: join(s.root, "src/auth/limits.ts"), content: "export const LIMIT = 5;\n" })));
   await step(["tool.patch"], () => call(v2.hooks, "tool.execute.after", toolEvent(SESSION, "patch", { patchText: patch2 })));
-  await step(["tool.edit.v1"], () => after1("edit", { filePath: join(s.root, "src/auth/jwt.ts"), oldString: "false", newString: "true" }));
-  await step(["tool.write.v1"], () => after1("write", { filePath: "src/auth/limits.ts", content: "export const LIMIT = 5;\n" }));
-  await step(["tool.apply-patch.v1"], () => after1("apply_patch", { patchText: patch1 }));
   await step(["tool.edit.subagent"], () => call(v2.hooks, "tool.execute.after", toolEvent(CHILD, "edit", { path: "src/auth/jwt.ts", oldString: "a", newString: "b" })));
   await step(["tool.shell.subagent"], () => call(v2.hooks, "tool.execute.after", toolEvent(CHILD, "shell", { command: "rg jwt.verify" })));
   await step(["tool.shell"], () => call(v2.hooks, "tool.execute.after", toolEvent(SESSION, "shell", { command: "npm test" })));
   await step(["tool.mcp"], () => call(v2.hooks, "tool.execute.after", toolEvent(SESSION, "tracker_create_issue", { title: "Rate limits" })));
   await step(["idle"], () => call(v2.hooks, "session.experimental.idle", { sessionID: SESSION, background: [] }));
   await step(["end"], () => cleanup());
+  hooks = await s.plugin.server(opencode1(s.root, { [SESSION]: undefined }).input);
+  await step(["tool.edit.v1"], () => after1("edit", { filePath: join(s.root, "src/auth/jwt.ts"), oldString: "false", newString: "true" }));
+  await step(["tool.write.v1"], () => after1("write", { filePath: "src/auth/limits.ts", content: "export const LIMIT = 5;\n" }));
+  await step(["tool.apply-patch.v1"], () => after1("apply_patch", { patchText: patch1 }));
 
   assert.deepEqual([...made].sort(), fixtureNames(), "every fixture has a recipe");
   const sent = s.payloads();
@@ -1431,7 +2023,7 @@ test("fixtures: each one is a payload the plugin sends, to the letter", async (t
 // ---------------------------------------------------------------------------
 
 const WHEN =
-  "On opencode the agent gets the briefing with the first prompt of a session and news from teammates with each later prompt. It hears of an overlap with a teammate right after its edit, with the edit's result, not before it: a plugin that runs before an edit can change the call or refuse it, but cannot tell the model anything and let the edit go ahead.";
+  "On opencode the agent gets the briefing with the first prompt of a session and news from teammates with each later prompt; a prompt that opencode 2 queues while the agent works gets them with the agent's next tool call instead. It hears of an overlap with a teammate right after its edit, with the edit's result, not before it: a plugin that runs before an edit can change the call or refuse it, but cannot tell the model anything and let the edit go ahead.";
 
 /** A clone with the plugin installed and the real bundle where the plugin looks for it, as after `huddle init`. */
 async function realBundle(clone: Clone): Promise<PluginModule> {
@@ -1610,15 +2202,32 @@ test("install: a user's own plugins and settings survive, untouched", async (t) 
   assert.deepEqual(await tree(root), { ...theirs, [PLUGIN]: pluginSource(BUNDLE) });
 });
 
+test("install: an empty huddle.js, or huddle's own with a byte order mark in front, is replaced", async (t) => {
+  for (const content of ["", "\n\n", "﻿", "﻿" + pluginSource(BUNDLE)]) {
+    const root = await emptyRepo(t);
+    await mkdir(join(root, ".opencode/plugins"), { recursive: true });
+    await writeFile(join(root, PLUGIN), content);
+    const empty = content.trim() === "";
+    assert.deepEqual(
+      await opencode.check(root),
+      empty
+        ? { installed: false, detail: ".opencode/plugins/huddle.js is empty. Run huddle init.", notes: [] }
+        : { installed: false, broken: true, detail: ".opencode/plugins/huddle.js is not what this version installs. Run huddle init.", notes: [] },
+      JSON.stringify(content.slice(0, 10)),
+    );
+    assert.deepEqual((await opencode.install({ repoRoot: root, bundle: BUNDLE })).changed, [PLUGIN]);
+    assert.equal(await readFile(join(root, PLUGIN), "utf8"), pluginSource(BUNDLE));
+  }
+});
+
 test("install: a huddle.js that huddle did not write is refused and left exactly as it was", async (t) => {
   const others = [
     'export default { id: "huddle", setup() {} }\n',
-    "",
     "// huddle\n",
     // The marker has to be the file's first line, whole.
     `\n${pluginSource(BUNDLE)}`,
     `// Generated by huddle\n${pluginSource(BUNDLE).split("\n").slice(1).join("\n")}`,
-    "\ufeff" + pluginSource(BUNDLE),
+    "\ufeff\n" + pluginSource(BUNDLE),
   ];
   for (const content of others) {
     const root = await emptyRepo(t);
@@ -1921,5 +2530,5 @@ test("the adapter is registered under the name used in `huddle hook opencode`", 
   assert.equal(getAdapter("opencode"), opencode);
   assert.equal(opencode.name, "opencode");
   assert.equal(opencode.title, "opencode");
-  assert.ok(pluginSource(BUNDLE).includes('[BUNDLE, "hook", "opencode"]'));
+  assert.ok(pluginSource(BUNDLE).includes('[bundle, "hook", "opencode"]'));
 });

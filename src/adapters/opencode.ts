@@ -16,17 +16,20 @@
 //   github.com/anomalyco/opencode at v2.2.7 (fedc6f2) and v1.19.5 (810c0eb):
 //     v2  packages/core/src/plugin/{module,source-directory,hooks}.ts,
 //         packages/plugin/src/promise/{adapter,session,tool,shell}.ts,
-//         packages/core/src/{tool.ts,session/prompt.ts,session/runner/llm.ts}
+//         packages/core/src/{tool.ts,codemode/tool.ts,session/prompt.ts,
+//         session/session.ts,session/inbox.ts,session/revert.ts,session/runner/llm.ts}
 //     v1  packages/opencode/src/plugin/{index,shared}.ts, packages/plugin/src/index.ts,
-//         packages/opencode/src/session/{prompt,tools,status}.ts
+//         packages/opencode/src/session/{prompt,tools,status,revert,compaction,session}.ts,
+//         packages/opencode/src/event-v2-bridge.ts, packages/core/src/event.ts
 //
 // Two majors, one file. `opencode.ai/install` and npm's opencode-ai@latest
 // still give opencode 1 (1.19.5); opencode 2 has its own installer and its own
 // plugin API. The docs' recipe for a plugin that serves both is one default
 // export { id, setup, server }: opencode 2 calls setup(ctx), opencode 1 calls
-// server(input) and takes the hooks it returns. opencode 1 reads that form
-// from 1.18.29 on; an older one logs "Plugin export is not a function" and
-// leaves the plugin out.
+// server(input) and takes the hooks it returns. opencode 1's docs date that
+// form to 1.18.29 (migrate-v1.mdx); its plugin loader is the same in 1.18.28,
+// and which release first took it was not checked. One that does not logs
+// "Plugin export is not a function" and leaves the plugin out.
 //
 // Trust. Neither major asks before it loads a project's plugins. Both load
 // every .js and .ts file in .opencode/plugins/ of the session's directory and
@@ -37,13 +40,19 @@
 // What the plugin sends (hook_event_name), and what becomes of it here:
 //
 //   start    session-start   the first prompt of a session this plugin instance
-//                            has not seen, and the first one after a compaction.
-//                            opencode has no hook for a session's start.
+//                            has not seen, and the first one after opencode 1
+//                            took messages out of it (a revert). opencode has no
+//                            hook for a session's start.
+//                            Not waited for, with source "compact" or "revert":
+//                            the session's context was compacted (v2 the
+//                            "compaction" hook, v1 the session.compacted event),
+//                            or opencode 2 committed a revert (the
+//                            session.revert.committed event). See "Forgetting".
 //   prompt   prompt          v2 session.hook("prompt"), v1 "chat.message"
 //   tool     post-edit       after edit, write, patch (v2) or apply_patch (v1),
 //                            with the files the call named; see "Edits".
 //                            Without files after any other tool that does more
-//                            than read: a sign of life.
+//                            than read: a sign of life. With brief: see "Owed".
 //            pre-edit        a subagent's edit, with its files; see "Subagents"
 //   idle     turn-end        v2 session.hook("experimental.idle"), v1 the
 //                            session.status event with status idle
@@ -51,23 +60,67 @@
 //                            v2 when its server stops or reloads the plugin
 //
 // How the model gets what huddle says. With a prompt: opencode 2 is handed a
-// synthetic message (ctx.session.synthetic with resume: false, so that it is
-// read with the prompt and does not start a turn of its own), opencode 1 gets
-// one more text part, marked synthetic, on the user's own message. After an
-// edit: the text is appended to the tool's result.
+// synthetic message (ctx.session.synthetic) with the prompt's own delivery,
+// "steer", and resume: false, so that it does not wake the session before the
+// prompt is in. Pending steers are published together, so the model reads it
+// in the same step as the prompt. opencode 1 gets one more text part, marked
+// synthetic, on the user's own message. After an edit: the text is appended to
+// the tool's result.
 //
-// Edits. A plugin that runs before a tool call can replace the call's input or
-// reject the call and nothing else, in both majors. huddle never blocks, so no
-// hook before a tool call is registered at all, and on opencode THE AGENT
-// HEARS OF AN OVERLAP RIGHT AFTER ITS EDIT, WITH THE EDIT'S RESULT, NOT BEFORE
-// IT. That is the engine's post-edit with the files of the edit: it gives the
-// warning the session has not had yet for those files, once, and it asks for
-// the sync that publishes the edit.
+// Owed. On opencode 2 a prompt sent while a turn runs can wait in the queue
+// (delivery "queue"). Such a prompt gets nothing with it: opencode publishes
+// the first queued row on its own (core session/inbox.ts, promote), and a
+// message of huddle's in front of the prompt would get a model step to itself
+// (session/runner/llm.ts). Its start and prompt still run, the prompt's text
+// still becomes the intent, and what the engine had to say is reported
+// unshown. The session's next tool call that is not a read is then waited for
+// with brief: true, and the engine puts what is due into that call's result.
+// The same follows a compaction and a revert.
+//
+// Forgetting. A compaction takes what huddle told the session out of its
+// context, and so does a revert, with the messages after its point. The engine
+// forgets it all at a session-start (core: removeSeen), so the plugin sends one
+// that is not waited for and whose briefing is reported unshown, and the
+// session is owed a briefing. On opencode 1 a revert is different: its messages
+// are taken out at the start of the next prompt, right before "chat.message",
+// and the plugin hears of it (message.removed, from inside the publish, before
+// the prompt goes on: core/src/event.ts notify). That prompt is then a start.
+// The environment for the session's shells and the list of sessions to end
+// are kept through all of this.
+//
+// Edits. A plugin that runs before a tool call can change the call (its input;
+// on opencode 2 even which tool runs) or reject it, in both majors, but it
+// cannot tell the model anything and let the call go ahead. huddle never
+// blocks, so no hook before a tool call is registered at all, and on opencode
+// THE AGENT HEARS OF AN OVERLAP RIGHT AFTER ITS EDIT, WITH THE EDIT'S RESULT,
+// NOT BEFORE IT. That is the engine's post-edit with the files of the edit: it
+// gives the warning the session has not had yet for those files, once, and it
+// asks for the sync that publishes the edit. Tool calls made inside a Code Mode
+// program (opencode 2's "execute") reach the same hook under the tool's
+// registry id, which is the plain name for opencode's own tools
+// (codemode/tool.ts inventoryTools, tool.ts effectiveName).
 //
 // Waiting. opencode waits for its hooks inline. The plugin therefore waits
-// only where an answer can come back (start, prompt, the edit tools) and lets
-// every other process go without reading it. What the engine says on such an
-// event has no reader, and format() reports it as unshown.
+// only where an answer can come back (start, prompt, the edit tools, a tool
+// call that is owed a briefing) and lets every other process go without
+// reading it. What the engine says on such an event has no reader, and
+// format() reports it as unshown.
+//
+// Bounds. A command that is waited for is killed when its wait is over (8 s
+// for a start, 3 s otherwise); one that is not is killed after 10 s. Asking
+// opencode for a session's parent may take 2 s. After three of these in a row
+// ran out of time, the plugin does nothing for a minute. It remembers at most
+// 100 sessions, and when it is unloaded it ends at most four: those heard from
+// in the last 15 minutes (huddle's default ttlMinutes), the latest first.
+// huddle stops counting the others as live by itself.
+//
+// Nested checkouts. Both majors load .opencode/plugins/ from the session's
+// directory and from every directory above it, and opencode 1 does not keep
+// two plugins with one id apart: in a worktree inside another checkout it
+// would run huddle twice for each event. The instance set up last for a
+// directory acts and any other one does nothing (a map on globalThis), and the
+// bundle is the one of the checkout around the session's directory (the
+// nearest directory with a .git), not the one next to the plugin file.
 //
 // Subagents. A subagent runs in a child session with an id of its own and a
 // parentID. The engine expects subagents under their parent's id, so the
@@ -91,9 +144,9 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { CliError } from "../core/io.ts";
 import { asRecord, asText, bundlePath, exists, onPath, placeOf, reason, writeWhole } from "./json-hooks.ts";
-import type { Check, Installed, Json } from "./json-hooks.ts";
+import type { Json } from "./json-hooks.ts";
 import { SILENT } from "./types.ts";
-import type { Adapter, HookEvent, HookEventType, HookInput, HookOutcome, HookOutput, InstallOptions } from "./types.ts";
+import type { Adapter, CheckResult, HookEvent, HookEventType, HookInput, HookOutcome, HookOutput, InstallOptions, InstallResult } from "./types.ts";
 
 const NAME = "opencode";
 
@@ -138,7 +191,8 @@ export function pluginSource(bundle: string): string {
 // To turn huddle off for opencode, delete this file.
 //
 // opencode loads this file by itself, in every session in this repository. What it does there:
-// when a prompt is sent, after a tool call, when a turn ends and when opencode closes, it runs
+// when a prompt is sent, after a tool call, when a turn ends, when a session's context is
+// compacted or reverted, and when opencode closes, it runs
 //
 //     node ${bundle} hook opencode
 //
@@ -151,11 +205,9 @@ export function pluginSource(bundle: string): string {
 // later) calls server().
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const BUNDLE_PATH = ${JSON.stringify(bundle)};
-// This file is <repository>/.opencode/plugins/huddle.js.
-const BUNDLE = fileURLToPath(new URL("../../" + BUNDLE_PATH, import.meta.url));
 
 // The tools that write files. Their hook is waited for: a warning goes into their result.
 const EDITS = [${list(EDIT_TOOLS)}];
@@ -165,46 +217,96 @@ const READS = [${list(READ_ONLY_TOOLS)}];
 // these are for a process that hangs.
 const START_MS = 8000;
 const ANSWER_MS = 3000;
+// A command whose answer nobody waits for is killed after this long all the same.
+const LET_GO_MS = 10000;
+// How long asking opencode which session is at the top may take.
+const LOOKUP_MS = 2000;
+// After this many commands or lookups in a row that ran out of time, the plugin does nothing
+// for PAUSE_MS: a command or an opencode that hangs then costs a wait only now and then.
+const LATE_IN_A_ROW = 3;
+const PAUSE_MS = 60000;
+// How many sessions are remembered. Those not heard from for longest are forgotten first.
+const KEEP = 100;
+// When opencode closes or unloads this file: the sessions heard from within LIVE_MS are ended,
+// the latest first and END_AT_MOST of them. huddle stops counting the others by itself.
+const LIVE_MS = 15 * 60000;
+const END_AT_MOST = 4;
 // What the user sees in the transcript where the model was told something (opencode 2).
 const NOTE = "huddle: what teammates' agents are working on";
 
-// Runs the command with the payload on stdin. With a time to wait, resolves to what it
-// printed, as an object; without one, lets the process go. Never rejects and never throws.
-function send(payload, wait) {
+// opencode 1 loads this file from the session's directory and from each directory above it
+// that has one, in one process, and keeps them all. Of the instances for one directory the one
+// set up last acts, and the others do nothing.
+const ACTING = (globalThis[Symbol.for("huddle.opencode.acting")] ??= new Map());
+
+// The bundle of the checkout the session is in: the nearest directory with a .git, from the
+// session's directory up. In a worktree inside another checkout this file may be the outer
+// checkout's, and so would be a bundle found next to it. Without a .git, the one next to it.
+function bundleFor(directory) {
+  try {
+    let at = pathToFileURL(directory);
+    if (!at.pathname.endsWith("/")) at = new URL(at.href + "/");
+    for (let up = 0; up < 100; up++) {
+      if (existsSync(new URL(".git", at))) return fileURLToPath(new URL(BUNDLE_PATH, at));
+      const above = new URL("../", at);
+      if (above.href === at.href) break;
+      at = above;
+    }
+  } catch {}
+  // This file is <repository>/.opencode/plugins/huddle.js.
+  return fileURLToPath(new URL("../../" + BUNDLE_PATH, import.meta.url));
+}
+
+// Runs the command with the payload on stdin. Resolves to what it printed, as an object ({}
+// when it printed nothing usable), or to null when there is no answer: no bundle, no node, the
+// wait ran out, or nobody waits (wait is 0). A command nobody waits for is let go at once and
+// killed after LET_GO_MS. late(true) hears of each command that ran out of time, late(false)
+// of each that ended in it. Never rejects and never throws.
+function send(bundle, payload, wait, late) {
   return new Promise((resolve) => {
     try {
-      if (!existsSync(BUNDLE)) return resolve({});
-      const child = spawn("node", [BUNDLE, "hook", "opencode"], {
+      if (!existsSync(bundle)) return resolve(null);
+      const child = spawn("node", [bundle, "hook", "opencode"], {
         cwd: payload.cwd,
         stdio: ["pipe", wait ? "pipe" : "ignore", "ignore"],
         detached: !wait,
         windowsHide: true,
       });
-      let printed = "";
-      const timer = wait
-        ? setTimeout(() => {
-            try {
-              child.kill();
-            } catch {}
-            resolve({});
-          }, wait)
-        : undefined;
+      let over = false;
+      const timer = setTimeout(() => {
+        over = true;
+        try {
+          child.kill();
+        } catch {}
+        late(true);
+        resolve(null);
+      }, wait || LET_GO_MS);
       child.on("error", () => {
         clearTimeout(timer);
-        resolve({});
+        resolve(null);
       });
+      // A command that ends before it has read its stdin must not become an error in opencode.
       child.stdin?.on("error", () => {});
       child.stdin?.end(JSON.stringify(payload));
       if (!wait) {
+        // Neither the process nor its timer keeps opencode from exiting.
         child.unref();
-        return resolve({});
+        timer.unref?.();
+        child.on("exit", () => {
+          clearTimeout(timer);
+          if (!over) late(false);
+        });
+        return resolve(null);
       }
+      let printed = "";
       child.stdout?.setEncoding("utf8");
       child.stdout?.on("data", (chunk) => {
         printed += chunk;
       });
       child.on("close", () => {
         clearTimeout(timer);
+        if (over) return;
+        late(false);
         let answer;
         try {
           answer = JSON.parse(printed);
@@ -212,12 +314,12 @@ function send(payload, wait) {
         resolve(typeof answer === "object" && answer !== null ? answer : {});
       });
     } catch {
-      resolve({});
+      resolve(null);
     }
   });
 }
 
-const contextOf = (answer) => (typeof answer.context === "string" ? answer.context.trim() : "");
+const contextOf = (answer) => (answer !== null && typeof answer.context === "string" ? answer.context.trim() : "");
 
 // A hook that throws is not harmless in opencode. None of these does.
 const quiet = (hook) => async (...args) => {
@@ -226,18 +328,63 @@ const quiet = (hook) => async (...args) => {
   } catch {}
 };
 
-// What one opencode instance has seen in one directory. parentOf asks opencode for a
-// session's parent.
+// Puts key last in a Map or a Set, which keep their order, and drops the first ones beyond KEEP.
+function remember(store, key, value) {
+  store.delete(key);
+  if (store instanceof Map) store.set(key, value);
+  else store.add(key);
+  while (store.size > KEEP) store.delete(store.keys().next().value);
+}
+
+// What one plugin instance knows, for the sessions in one directory. parentOf asks opencode
+// for a session's parent.
 function huddle(cwd, parentOf) {
-  // session id -> who that is: the session at the top, and whether this one is a subagent's
+  const me = {};
+  ACTING.set(cwd, me);
+  const bundle = bundleFor(cwd);
+  // session id -> who that is, as a promise: the session at the top, and whether this one is a subagent's
   const known = new Map();
-  // the top sessions that were started here -> the environment huddle wants their shells to have
+  // the top sessions started here -> { env: what their shells get, ready: their start, at: when last heard from }
   const started = new Map();
+  // top sessions owed what a prompt could not carry: their next tool call carries it
+  const owed = new Set();
+  // sessions whose messages opencode 1 took out (a revert): their next prompt starts them over
+  const cut = new Set();
+  let lateInARow = 0;
+  let pausedUntil = 0;
+
+  const late = (ranOut) => {
+    if (!ranOut) {
+      lateInARow = 0;
+      return;
+    }
+    lateInARow += 1;
+    if (lateInARow >= LATE_IN_A_ROW) {
+      lateInARow = 0;
+      pausedUntil = Date.now() + PAUSE_MS;
+    }
+  };
+  const acting = () => ACTING.get(cwd) === me;
+  // Another instance acts for this directory, or this one is pausing.
+  const off = () => !acting() || Date.now() < pausedUntil;
+  const run = (body, wait) => send(bundle, body, wait, late);
 
   function who(sessionID) {
     if (typeof sessionID !== "string" || sessionID === "") return Promise.resolve(null);
-    if (!known.has(sessionID)) {
-      const found = (async () => {
+    const had = known.get(sessionID);
+    if (had !== undefined) {
+      remember(known, sessionID, had);
+      return had;
+    }
+    if (off()) return Promise.resolve(null);
+    const found = new Promise((resolve) => {
+      let over = false;
+      const timer = setTimeout(() => {
+        over = true;
+        late(true);
+        resolve(null);
+      }, LOOKUP_MS);
+      (async () => {
         let id = sessionID;
         for (let up = 0; up < 10; up++) {
           const parent = await parentOf(id);
@@ -245,15 +392,32 @@ function huddle(cwd, parentOf) {
           id = parent;
         }
         return { id, sub: id !== sessionID };
-      })().catch(() => {
-        // Not known this time; asked again at the session's next event.
-        known.delete(sessionID);
-        return null;
-      });
-      known.set(sessionID, found);
-    }
-    return known.get(sessionID);
+      })().then(
+        (session) => {
+          clearTimeout(timer);
+          if (!over) late(false);
+          resolve(session);
+        },
+        () => {
+          clearTimeout(timer);
+          resolve(null);
+        },
+      );
+    });
+    remember(known, sessionID, found);
+    // Not known this time (opencode could not say, or not in time): asked again at the session's next event.
+    void found.then((session) => {
+      if (session === null && known.get(sessionID) === found) known.delete(sessionID);
+    });
+    return found;
   }
+
+  const heard = (session) => {
+    const entry = started.get(session.id);
+    if (entry === undefined) return;
+    entry.at = Date.now();
+    remember(started, session.id, entry);
+  };
 
   const payload = (event, session, more) => ({
     hook_event_name: event,
@@ -264,57 +428,117 @@ function huddle(cwd, parentOf) {
   });
 
   return {
-    // A prompt was sent. Resolves to what the model should read with it, or "".
-    async prompt(sessionID, prompt) {
+    // A prompt was sent. Resolves to what the model should read with it, or "". delivery is
+    // opencode 2's. A prompt that is not steered waits in the queue, and a message of huddle's
+    // in front of it would get a model step to itself: it gets nothing. huddle is told so, and
+    // the session's next tool call carries what was due.
+    async prompt(sessionID, prompt, delivery) {
+      if (off()) return "";
       const session = await who(sessionID);
       if (session === null || session.sub) return "";
+      const queued = typeof delivery === "string" && delivery !== "steer";
+      const more = queued ? { delivery } : {};
       const said = [];
-      if (!started.has(session.id)) {
-        started.set(session.id, {});
-        const answer = await send(payload("start", session), START_MS);
-        if (typeof answer.env === "object" && answer.env !== null) started.set(session.id, answer.env);
-        said.push(contextOf(answer));
+      const again = cut.delete(session.id);
+      const entry = started.get(session.id);
+      if (entry === undefined || again) {
+        const fresh = { env: entry?.env ?? {}, ready: null, at: Date.now() };
+        fresh.ready = run(payload("start", session, more), START_MS).then((answer) => {
+          if (answer !== null && typeof answer.env === "object" && answer.env !== null) fresh.env = answer.env;
+          return contextOf(answer);
+        });
+        remember(started, session.id, fresh);
+        said.push(await fresh.ready);
+      } else {
+        heard(session);
+        // A start that is still under way comes first: two prompts at once in a session new here.
+        await entry.ready;
       }
-      said.push(contextOf(await send(payload("prompt", session, { prompt }), ANSWER_MS)));
+      const answer = await run(payload("prompt", session, { prompt, ...more }), ANSWER_MS);
+      said.push(contextOf(answer));
+      if (queued) {
+        remember(owed, session.id);
+        return "";
+      }
+      if (answer !== null) owed.delete(session.id);
       return said.filter((text) => text !== "").join("\n\n");
     },
 
     // A tool call ended. Resolves to what the model should read with its result, or "".
     async tool(sessionID, tool, input) {
-      if (READS.includes(tool)) return "";
+      if (READS.includes(tool) || off()) return "";
       const session = await who(sessionID);
       if (session === null) return "";
-      if (!EDITS.includes(tool)) {
-        void send(payload("tool", session, { tool }), 0);
+      heard(session);
+      // What a prompt could not carry comes with the session's next tool call that is not a read.
+      const brief = !session.sub && owed.has(session.id) ? { brief: true } : {};
+      let answer;
+      if (EDITS.includes(tool)) {
+        // What names the files: a path, or a whole patch, whose headers name them. What an edit
+        // or a write puts into a file is not sent.
+        const { path, filePath, patchText } = typeof input === "object" && input !== null ? input : {};
+        answer = await run(payload("tool", session, { tool, input: { path, filePath, patchText }, ...brief }), ANSWER_MS);
+      } else if (brief.brief) {
+        answer = await run(payload("tool", session, { tool, ...brief }), ANSWER_MS);
+      } else {
+        void run(payload("tool", session, { tool }), 0);
         return "";
       }
-      // Only what names the files: not what was written into them.
-      const { path, filePath, patchText } = typeof input === "object" && input !== null ? input : {};
-      return contextOf(await send(payload("tool", session, { tool, input: { path, filePath, patchText } }), ANSWER_MS));
+      if (brief.brief && answer !== null) owed.delete(session.id);
+      return contextOf(answer);
     },
 
     // The session has nothing more to do for now.
     async idle(sessionID) {
+      if (off()) return;
       const session = await who(sessionID);
-      if (session !== null && !session.sub) void send(payload("idle", session), 0);
+      if (session === null || session.sub) return;
+      heard(session);
+      void run(payload("idle", session), 0);
     },
 
-    // The session's context was compacted: what it was told is gone, so its next prompt starts over.
-    async compacted(sessionID) {
+    // What huddle told the session is gone from its context: it was compacted (why is
+    // "compact"), or opencode 2 committed a revert ("revert"). huddle forgets it now, and the
+    // session's next tool call or prompt is briefed again.
+    async forget(sessionID, why) {
+      if (off()) return;
       const session = await who(sessionID);
-      if (session !== null && !session.sub) started.delete(session.id);
+      if (session === null || session.sub) return;
+      heard(session);
+      remember(owed, session.id);
+      void run(payload("start", session, { source: why }), 0);
     },
 
-    // The environment for a shell of this session.
+    // opencode 1 took messages out of the session (a revert). Its next prompt starts it over.
+    // Called before anything is awaited: the prompt follows at once.
+    removed(sessionID) {
+      if (typeof sessionID === "string" && sessionID !== "") remember(cut, sessionID);
+    },
+
+    // The environment for a shell of this session. Also while pausing: it starts nothing.
     async env(sessionID) {
+      if (!acting()) return {};
       const session = await who(sessionID);
-      return (session !== null && started.get(session.id)) || {};
+      if (session === null) return {};
+      heard(session);
+      return started.get(session.id)?.env ?? {};
     },
 
     // opencode is closing, or unloading this plugin.
     close() {
-      for (const id of started.keys()) void send(payload("end", { id, sub: false }), 0);
+      const now = Date.now();
+      const live = [...started]
+        .filter(([, entry]) => now - entry.at < LIVE_MS)
+        .map(([id]) => id)
+        .reverse()
+        .slice(0, END_AT_MOST);
+      const ending = !off();
+      if (acting()) ACTING.delete(cwd);
       started.clear();
+      known.clear();
+      owed.clear();
+      cut.clear();
+      if (ending) for (const id of live) void run(payload("end", { id, sub: false }), 0);
     },
   };
 }
@@ -334,9 +558,10 @@ async function setup(ctx) {
     ctx.session.hook(
       "prompt",
       quiet(async (event) => {
-        const context = await state.prompt(event.sessionID, event.prompt?.text);
+        const context = await state.prompt(event.sessionID, event.prompt?.text, event.delivery);
         if (context === "") return;
-        // resume: false, or the message would start a turn of its own before the prompt is in.
+        // Only a steered prompt gets one. resume: false, or the message would wake the session
+        // before the prompt is in; steers that are pending are read in one step.
         await ctx.session.synthetic({ sessionID: event.sessionID, text: context, description: NOTE, delivery: event.delivery, resume: false });
       }),
     ),
@@ -364,9 +589,24 @@ async function setup(ctx) {
   );
 
   await register(() => ctx.session.hook("experimental.idle", quiet((event) => state.idle(event.sessionID))));
-  await register(() => ctx.session.hook("compaction", quiet((event) => state.compacted(event.sessionID))));
+  // Runs before the compaction's request to the model. huddle does not touch the event.
+  await register(() => ctx.session.hook("compaction", quiet((event) => state.forget(event.sessionID, "compact"))));
+
+  // A staged revert is committed when the next prompt comes in, after the prompt hook: the
+  // messages after its point are gone, with what huddle said in them.
+  const stop = new AbortController();
+  void (async () => {
+    try {
+      for await (const event of ctx.event.subscribe({ types: ["session.revert.committed"], signal: stop.signal })) {
+        await state.forget(event?.data?.sessionID, "revert");
+      }
+    } catch {}
+  })();
 
   return () => {
+    try {
+      stop.abort();
+    } catch {}
     try {
       state.close();
     } catch {}
@@ -413,8 +653,11 @@ async function server(input) {
 
     event: quiet(async ({ event }) => {
       const sessionID = event?.properties?.sessionID;
+      // A revert's messages are taken out at the start of the next prompt, before "chat.message".
+      if (event?.type === "message.removed" || event?.type === "message.part.removed") state.removed(sessionID);
       if (event?.type === "session.status" && event.properties?.status?.type === "idle") await state.idle(sessionID);
-      if (event?.type === "session.compacted") await state.compacted(sessionID);
+      // An automatic compaction goes on with the turn, and no "chat.message" comes before its next edit.
+      if (event?.type === "session.compacted") await state.forget(sessionID, "compact");
     }),
 
     dispose: quiet(async () => state.close()),
@@ -463,15 +706,29 @@ function parsePayload(input: HookInput): HookEvent | null {
 
   const tool = nativeEvent === "tool" ? asText(payload.tool) : "";
   const editing = EDIT_TOOLS.includes(tool);
+  const subagent = payload.subagent === true;
+  // A tool call that is owed what a prompt could not carry ("Owed" above). Not a subagent's.
+  const brief = nativeEvent === "tool" && payload.brief === true && !subagent;
+  // A start the plugin does not wait for: the session forgets, after a compaction or a revert.
+  const source = nativeEvent === "start" ? asText(payload.source).trim() : "";
+  // opencode 2's delivery of the prompt. Only a steered one is shown anything.
+  const delivery = asText(payload.delivery);
   const event: HookEvent = {
     type,
     agent: NAME,
     sessionId,
     cwd: asText(payload.cwd) || input.cwd,
-    // answered: the plugin waits for what is printed on this event and hands it to the model.
-    native: { event: nativeEvent, answered: nativeEvent === "start" || nativeEvent === "prompt" || editing },
+    native: {
+      event: nativeEvent,
+      // The plugin waits for what is printed on this event.
+      answered: (nativeEvent === "start" && source === "") || nativeEvent === "prompt" || editing || brief,
+      // And hands a context in it to the model.
+      shown: delivery === "" || delivery === "steer",
+    },
   };
-  if (payload.subagent === true) event.subagent = true;
+  if (subagent) event.subagent = true;
+  if (source !== "") event.source = source;
+  if (brief) event.brief = true;
 
   if (nativeEvent === "prompt") {
     const prompt = asText(payload.prompt).trim();
@@ -515,20 +772,23 @@ function envOf(env: unknown): Record<string, string> | null {
 
 /**
  * What the plugin reads: one JSON object, { context?, env? }. Printed only on
- * the events whose answer the plugin waits for; a context on any other event
- * has no reader, and is reported as unshown so that the engine brings it up
- * again.
+ * the events whose answer the plugin waits for, and the context only where
+ * the model gets it: not with a prompt that waits in opencode 2's queue. A
+ * context that has no reader is reported as unshown, so that the engine
+ * brings it up again; the environment of a start is printed all the same.
  */
 function format(event: HookEvent, outcome: HookOutcome): HookOutput {
   if (event.type === "turn-end" || event.type === "session-end") return SILENT;
+  const native = asRecord(event.native);
+  const answered = native?.answered === true;
+  const shown = answered && native?.shown !== false;
   const context = typeof outcome.context === "string" && outcome.context.trim() !== "" ? outcome.context : "";
-  if (asRecord(event.native)?.answered !== true) return context === "" ? SILENT : { ...SILENT, unshown: true };
-  const env = envOf(outcome.env);
-  if (context === "" && env === null) return SILENT;
+  const env = answered ? envOf(outcome.env) : null;
   const answer: Json = {};
-  if (context !== "") answer.context = context;
+  if (shown && context !== "") answer.context = context;
   if (env !== null) answer.env = env;
-  return { stdout: JSON.stringify(answer), stderr: "", exitCode: 0 };
+  const printed: HookOutput = Object.keys(answer).length > 0 ? { stdout: JSON.stringify(answer), stderr: "", exitCode: 0 } : SILENT;
+  return context !== "" && !shown ? { ...printed, unshown: true } : printed;
 }
 
 // ---------------------------------------------------------------------------
@@ -541,7 +801,7 @@ const NODE_NOTE =
   "The plugin starts node: node 20 or later has to be on the PATH that opencode sees. Without it the plugin does nothing and says nothing. It needs opencode 1.18.29 or later, or opencode 2.";
 
 const WHEN_NOTE =
-  "On opencode the agent gets the briefing with the first prompt of a session and news from teammates with each later prompt. It hears of an overlap with a teammate right after its edit, with the edit's result, not before it: a plugin that runs before an edit can change the call or refuse it, but cannot tell the model anything and let the edit go ahead.";
+  "On opencode the agent gets the briefing with the first prompt of a session and news from teammates with each later prompt; a prompt that opencode 2 queues while the agent works gets them with the agent's next tool call instead. It hears of an overlap with a teammate right after its edit, with the edit's result, not before it: a plugin that runs before an edit can change the call or refuse it, but cannot tell the model anything and let the edit go ahead.";
 
 export const NOTES: readonly string[] = Object.freeze([TRUST_NOTE, NODE_NOTE, WHEN_NOTE]);
 
@@ -557,7 +817,11 @@ async function readText(path: string): Promise<string | null> {
 /** A checkout may hold the file with CRLF line ends (git's autocrlf); that is the same file. */
 const unix = (text: string): string => text.replace(/\r\n/g, "\n");
 
-const isOurs = (text: string): boolean => text.startsWith(MARKER);
+/** A byte order mark in front does not make it someone else's file: an editor may have put it there. */
+const isOurs = (text: string): boolean => text.replace(/^\uFEFF/, "").startsWith(MARKER);
+
+/** Nothing in it, or only blank lines: nobody's code. */
+const isEmpty = (text: string): boolean => text.trim() === "";
 
 // With the m flag "$" stands before a carriage return as well, so a copy with CRLF line ends is read the same way.
 const BUNDLE_LINE = /^const BUNDLE_PATH = ("[^"\\\r\n]*");$/m;
@@ -579,10 +843,13 @@ function bundleOf(text: string): string | null {
  * store the link and not the file, and whatever else uses that directory
  * would load it.
  *
+ * A huddle.js that is empty, or one of huddle's with a byte order mark in
+ * front, is replaced like any other one of huddle's.
+ *
  * `files` names the plugin on every run, changed or not: it is the file the
  * team commits, and init keeps saying so until it is.
  */
-async function install(opts: InstallOptions): Promise<Installed> {
+async function install(opts: InstallOptions): Promise<InstallResult> {
   const wanted = pluginSource(bundlePath(opts.bundle));
   let target: string;
   let before: string | null;
@@ -594,7 +861,7 @@ async function install(opts: InstallOptions): Promise<Installed> {
     throw new CliError(`${PLUGIN} could not be read (${reason(error)}), so huddle left it alone.`);
   }
   if (before !== null && unix(before) === wanted) return { changed: [], notes: [...NOTES], files: [PLUGIN] };
-  if (before !== null && !isOurs(before)) {
+  if (before !== null && !isEmpty(before) && !isOurs(before)) {
     throw new CliError(`${PLUGIN} is there and was not written by huddle. huddle will not overwrite it: move it away, then run huddle init again.`);
   }
   try {
@@ -612,8 +879,8 @@ async function install(opts: InstallOptions): Promise<Installed> {
  * about. A plugin that is missing, or somebody else's file in its place, is
  * huddle not installed, which doctor only mentions.
  */
-async function check(repoRoot: string): Promise<Check> {
-  const no = (detail: string, broken = false): Check => (broken ? { installed: false, broken: true, detail, notes: [] } : { installed: false, detail, notes: [] });
+async function check(repoRoot: string): Promise<CheckResult> {
+  const no = (detail: string, broken = false): CheckResult => (broken ? { installed: false, broken: true, detail, notes: [] } : { installed: false, detail, notes: [] });
   let text: string | null;
   try {
     // Where init would write. A link that leads nowhere or out of the checkout is init's reason to refuse, and doctor's to say so.
@@ -623,6 +890,7 @@ async function check(repoRoot: string): Promise<Check> {
     return no(`${PLUGIN} cannot be read (${reason(error)}).`);
   }
   if (text === null) return no(`${PLUGIN} not found. Run huddle init.`);
+  if (isEmpty(text)) return no(`${PLUGIN} is empty. Run huddle init.`);
   if (!isOurs(text)) return no(`${PLUGIN} is there and was not written by huddle. Move it away, then run huddle init.`);
   const bundle = bundleOf(text);
   if (bundle === null || unix(text) !== pluginSource(bundle)) return no(`${PLUGIN} is not what this version installs. Run huddle init.`, true);
