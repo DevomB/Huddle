@@ -4,12 +4,13 @@
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { openContext } from "../src/core/context.ts";
 import type { Ctx } from "../src/core/context.ts";
 import type { Io } from "../src/core/io.ts";
+import { touchSession } from "../src/core/store.ts";
 import { addTask, claimTask, dropTask, finishTask, syncFailure } from "../src/core/tasks.ts";
 import { actorRef, taskRef } from "../src/core/types.ts";
 import type { TaskDoc, Transport } from "../src/core/types.ts";
@@ -340,26 +341,45 @@ describe("huddle task", () => {
     assert.deepEqual([back.code, back.stdout.trim()], [3, `[${id}] Migrate the database is held by bob / manual, not by this session`]);
   });
 
-  test("a task held by another live session of the same clone is never taken over", async () => {
-    // This clone's published document can trail its local state by a heartbeat (3 minutes).
-    // Inside that gap the remote copy of a session can look expired while the session is at work.
-    const twin = await h.clone("twin");
-    const alpha = (minutes: number) => ({ now: at(minutes), session: "alpha" });
-    const beta = (minutes: number) => ({ now: at(minutes), session: "beta" });
+  /**
+   * A clone with two sessions, where what is published for "beta" trails what
+   * the clone knows: beta holds the task, the clone's document was last
+   * published by "alpha" when beta had been quiet for 13 minutes, and beta has
+   * been active since. This is the state between a hook recording a session's
+   * activity and the sync that publishes it.
+   */
+  async function trailingTwin(name: string): Promise<{ twin: Clone; id: string }> {
+    const twin = await h.clone(name);
     const id = await addVia(twin, "Shared desk", at(500));
-    assert.equal((await twin.huddle(["task", "claim", id], beta(500))).code, 0);
+    assert.equal((await twin.huddle(["task", "claim", id], { now: at(500), session: "beta" })).code, 0);
     // 13 minutes on, alpha's activity publishes the clone's document; beta's last sign of life in it is 13 minutes old.
-    assert.equal((await twin.huddle(["intent", "something else"], alpha(513))).code, 0);
-    assert.equal((await twin.huddle(["sync"], alpha(513))).code, 0);
-    // A minute later beta is active again. Nothing changed in content and no heartbeat is due, so nothing is published.
-    assert.equal((await twin.huddle(["task", "claim", id], beta(514))).code, 0);
+    assert.equal((await twin.huddle(["intent", "something else"], { now: at(513), session: "alpha" })).code, 0);
+    assert.equal((await twin.huddle(["sync"], { now: at(513), session: "alpha" })).code, 0);
+    // A minute later beta is at work again: recorded in this clone, not yet synced.
+    const paths = await twin.paths();
+    await touchSession(paths, { id: "beta", worktree: paths.worktree, agent: "manual", seenAt: at(514) });
     const actor = readFileSync(join(twin.dir, ".git", "huddle", "actor"), "utf8").trim();
     const published = JSON.parse(remoteGit(h, ["cat-file", "blob", `${actorRef(actor)}:doc.json`])) as { sessions: { id: string; seenAt: string }[] };
     assert.equal(published.sessions.find((session) => session.id === "beta")?.seenAt, at(500), "setup: the remote copy of beta should still be the old one");
+    return { twin, id };
+  }
 
+  test("a task held by another live session of the same clone is never taken over", async () => {
+    const { twin, id } = await trailingTwin("twin");
     // 15.5 minutes after beta's published sign of life, 1.5 after its real one.
-    const attempt = await twin.huddle(["task", "claim", id], alpha(515.5));
+    const attempt = await twin.huddle(["task", "claim", id], { now: at(515.5), session: "alpha" });
     assert.deepEqual([attempt.code, attempt.stdout.trim()], [3, `[${id}] Shared desk is taken by twin / manual`]);
+    assert.equal(remoteTask(h, id).owner?.session, "beta");
+  });
+
+  test("nor when the cache was lost and the clone's own document comes back from the remote as teammates see it", async () => {
+    // With no cache, the sync has no record of what teammates hold for beta, so it
+    // publishes nothing inside the heartbeat interval and fetches its own document
+    // back with beta's old sign of life in it. Only this clone's local state says beta is at work.
+    const { twin, id } = await trailingTwin("twin-without-cache");
+    rmSync((await twin.paths()).cacheFile);
+    const attempt = await twin.huddle(["task", "claim", id], { now: at(515.5), session: "alpha" });
+    assert.deepEqual([attempt.code, attempt.stdout.trim()], [3, `[${id}] Shared desk is taken by twin-without-cache / manual`]);
     assert.equal(remoteTask(h, id).owner?.session, "beta");
   });
 
