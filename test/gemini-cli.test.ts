@@ -1120,7 +1120,10 @@ const MARK = String.fromCodePoint(0xfeff);
 const MARK_NOTE =
   ".gemini/settings.json starts with a byte order mark. Gemini CLI cannot parse a settings file that has one and reports an error in its configuration: save the file without the mark.";
 
-test("install and check: a settings file with a byte order mark in front keeps it, and both say that Gemini CLI cannot parse it", async (t) => {
+const MARK_CHECK =
+  ".gemini/settings.json starts with a byte order mark. Gemini CLI cannot parse a settings file that has one and reports an error in its configuration, so huddle's hooks in it do not run. Save the file without the mark.";
+
+test("install and check: a settings file with a byte order mark in front keeps it, init says that Gemini CLI cannot parse it, and for doctor the hooks are broken", async (t) => {
   // Some editors on Windows write one. Gemini CLI hands it to JSON.parse, which does not take it.
   assert.throws(() => JSON.parse(`${MARK}{}`), SyntaxError);
   const around = aroundOf(await emptyDir(t));
@@ -1136,25 +1139,28 @@ test("install and check: a settings file with a byte order mark in front keeps i
   assert.equal(first.notes.length, 3);
   assert.equal(first.notes[0], MARK_NOTE, "first: Gemini CLI does not get past it");
 
-  const checked = await checkGeminiCli(root, around);
-  assert.equal(checked.installed, true);
-  assert.deepEqual(checked.notes, first.notes, "init and doctor say the same");
+  // The hooks are all in the file, and Gemini CLI cannot read the file: they do not run, which is what broken means.
+  assert.deepEqual(await checkGeminiCli(root, around), { installed: false, broken: true, detail: MARK_CHECK, notes: [] });
   // Installing again changes nothing and says it again.
   const second = await geminiCli.install({ repoRoot: root, bundle: BUNDLE });
   assert.deepEqual(second, { changed: [], notes: first.notes, files: [".gemini/settings.json"] });
 
-  // It comes before the note about hooks being off: that one does not matter until the file can be read.
+  // It comes before anything about hooks being off: that does not matter until the file can be read.
   await writeFile(file, `${MARK}${JSON.stringify({ ...installed(), hooksConfig: { enabled: false } })}`);
-  const off = (await checkGeminiCli(root, around)).notes;
-  assert.equal(off.length, 4);
-  assert.equal(off[0], MARK_NOTE);
-  assert.match(off[1] ?? "", /turned off/);
+  assert.deepEqual(await checkGeminiCli(root, around), { installed: false, broken: true, detail: MARK_CHECK, notes: [] });
+  // Hooks that are broken for a reason of their own keep that reason: the bundle they run is gone.
+  await rm(join(root, ".huddle"), { recursive: true });
+  assert.match((await checkGeminiCli(root, around)).detail, /which is not in this checkout/);
+  await withBundle(root);
+  // A file with the mark and none of huddle's hooks is huddle not installed, and nothing is broken.
+  await writeFile(file, `${MARK}{}`);
+  assert.deepEqual(await checkGeminiCli(root, around), { installed: false, detail: "no huddle hooks in .gemini/settings.json. Run huddle init.", notes: [] });
+  await writeFile(file, written);
 
   // Without the mark nothing is said about one. One further in, inside a string, is none.
   for (const unmarked of [written.slice(1), JSON.stringify({ ...installed(), ui: { title: `${MARK}acme` } })]) {
     await writeFile(file, unmarked);
-    assert.equal((await checkGeminiCli(root, around)).installed, true);
-    assert.equal((await checkGeminiCli(root, around)).notes.includes(MARK_NOTE), false);
+    assert.deepEqual(await checkGeminiCli(root, around), { installed: true, detail: "6 hooks in .gemini/settings.json", notes: first.notes.slice(1), files: [".gemini/settings.json"] });
     assert.equal((await geminiCli.install({ repoRoot: root, bundle: BUNDLE })).notes.includes(MARK_NOTE), false);
   }
   // Nor when the file is not there, or cannot be read at all.

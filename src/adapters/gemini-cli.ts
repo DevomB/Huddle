@@ -412,11 +412,12 @@ const COMMENTS_CHECK = `${SETTINGS} has comments in it, and huddle cannot read i
  * v0.68.0 reads it as text, takes the comments out (strip-json-comments
  * 3.1.1, which leaves the mark where it is) and hands the rest to JSON.parse,
  * which rejects the mark; config/settings.ts reports that as an error in the
- * configuration. So the user is told, wherever the file is installed into or
- * checked.
+ * configuration, which is fatal there. So init says it in a note, and for
+ * doctor huddle's hooks in such a file are hooks that cannot run.
  */
 const MARK = String.fromCodePoint(0xfeff);
 const MARK_NOTE = `${SETTINGS} starts with a byte order mark. Gemini CLI cannot parse a settings file that has one and reports an error in its configuration: save the file without the mark.`;
+const MARK_CHECK = `${SETTINGS} starts with a byte order mark. Gemini CLI cannot parse a settings file that has one and reports an error in its configuration, so huddle's hooks in it do not run. Save the file without the mark.`;
 const COMMENTS_AND_MARK_INSTALL = `${SETTINGS} has comments in it. huddle cannot keep the comments when it writes its hooks into it and will not overwrite it: take the comments out, then run huddle init again. The file also starts with a byte order mark, which Gemini CLI cannot parse: save it without the mark.`;
 
 async function startsWithMark(repoRoot: string): Promise<boolean> {
@@ -513,6 +514,8 @@ export async function checkGeminiCli(repoRoot: string, around: Surroundings): Pr
     const unparsed = result.detail.includes("cannot be read as a JSON object");
     return unparsed && (await commentsAreInTheWay(repoRoot)) ? { installed: false, detail: COMMENTS_CHECK, notes: [] } : result;
   }
+  // The hooks are all there, in a file Gemini CLI cannot read: nothing below matters until that is fixed.
+  if (await startsWithMark(repoRoot)) return { installed: false, broken: true, detail: MARK_CHECK, notes: [] };
   const notes = [START_NOTE, LATE_NOTE];
   const also = twiceNote(SETTINGS_FILE, twice);
   if (also !== null) notes.push(also);
@@ -535,8 +538,6 @@ export async function checkGeminiCli(repoRoot: string, around: Surroundings): Pr
   if (decides?.says.enabled === false) {
     notes.unshift(`Hooks are turned off for Gemini CLI here: hooksConfig.enabled is false in ${decides.file}. huddle's hooks will not run until that is removed.`);
   }
-  // First of all: with the mark in front, Gemini CLI does not get as far as any of the above.
-  if (await startsWithMark(repoRoot)) notes.unshift(MARK_NOTE);
   return { ...result, notes };
 }
 
