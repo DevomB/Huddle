@@ -36,10 +36,15 @@ switch (mode) {
     await touchSession(paths, { id, worktree, agent: "worker", intent: `work of ${id}` });
     break;
   }
-  // bump <count>: append <count> unique entries to one shared session, one update each, printing each one
+  // bump <count | forever>: append unique entries to one shared session, one update each, printing each one.
+  // "forever" is for a worker the test is going to kill: it cannot be done before the signal arrives, however
+  // late that is. Left alone it gives up after a minute, with an exit code of its own.
   case "bump": {
-    const count = Number(rest[0]);
+    const forever = rest[0] === "forever";
+    const count = forever ? Number.POSITIVE_INFINITY : Number(rest[0]);
+    const giveUpAt = Date.now() + 60_000;
     for (let i = 0; i < count; i++) {
+      if (forever && Date.now() > giveUpAt) process.exit(4);
       await updateLocal(paths, (state) => {
         let shared = state.sessions.find((s) => s.id === "shared");
         if (!shared) {
