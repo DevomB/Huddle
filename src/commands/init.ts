@@ -166,9 +166,15 @@ export function isJsonObject(text: string): boolean {
   }
 }
 
-/** A word for a shell command line: as it is when every character is inert, in single quotes otherwise. */
-function shellWord(word: string): string {
-  return /^[A-Za-z0-9_@%+=:,./-]+$/.test(word) ? word : `'${word.replace(/'/g, `'\\''`)}'`;
+/** A word for a command line the user types: as it is when every character is inert, quoted otherwise. POSIX sh, or on Windows PowerShell and CMD. */
+export function shellWord(word: string, platform: NodeJS.Platform = process.platform): string {
+  if (platform !== "win32") return /^[A-Za-z0-9_@%+=:,./-]+$/.test(word) ? word : `'${word.replace(/'/g, `'\\''`)}'`;
+  // Windows: one spelling for PowerShell and CMD alike. Bare when nothing in it is special to either (a comma
+  // makes a PowerShell array, % a CMD variable); else double quotes, which both take; else PowerShell's
+  // single quotes, the documented Windows shell, for a word that holds what double quotes would expand.
+  if (/^[A-Za-z0-9_+=:./-]+$/.test(word)) return word;
+  if (!/["$`%]/.test(word)) return `"${word}"`;
+  return `'${word.replace(/'/g, "''")}'`;
 }
 
 /** A path that can be committed from this worktree: relative, inside it, and not in the git directory. */
@@ -386,7 +392,8 @@ export async function run(args: string[], io: Io): Promise<number> {
   for (const note of notes) io.out(`Note: ${note}`);
 
   const { uncommitted: toCommit, hidden } = await unshared(repoRoot, [...teamFiles]);
-  const here = relative(io.cwd, repoRoot);
+  // Forward slashes on every platform: git, node, PowerShell and CMD all take them, and no quoting is needed for them.
+  const here = relative(io.cwd, repoRoot).split(sep).join("/");
   const gitHere = here === "" ? "git" : `git -C ${shellWord(here)}`;
   if (hidden.length > 0) {
     // Said on every run while it is so: git itself never mentions a file it ignores.
@@ -400,7 +407,7 @@ export async function run(args: string[], io: Io): Promise<number> {
   if (toCommit.length > 0) {
     io.out("");
     io.out("Next: commit and push these files so your teammates get huddle with their next pull:");
-    io.out(`  ${gitHere} add ${toCommit.map(shellWord).join(" ")}`);
+    io.out(`  ${gitHere} add ${toCommit.map((file) => shellWord(file)).join(" ")}`);
     io.out(`  ${gitHere} commit -m "Set up huddle" && ${gitHere} push`);
     // From where the user is, like the git lines above: typed in a subdirectory, .huddle/huddle.mjs is not there.
     io.out(`Then check the setup with: node ${shellWord(relative(io.cwd, resolve(repoRoot, BUNDLE)).split(sep).join("/"))} doctor`);

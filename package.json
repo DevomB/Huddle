@@ -4,6 +4,14 @@
   "description": "Coding agents on different laptops coordinating through the git remote they already share.",
   "private": true,
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DevomB/huddle.git"
+  },
+  "bugs": {
+    "url": "https://github.com/DevomB/huddle/issues"
+  },
+  "homepage": "https://github.com/DevomB/huddle#readme",
   "type": "module",
   "bin": {
     "huddle": "dist/huddle.mjs",
@@ -17,9 +25,12 @@
   },
   "scripts": {
     "build": "node scripts/build.mjs",
+    "prepack": "npm run build",
     "typecheck": "tsc --noEmit",
     "pretest": "npm run build",
-    "test": "node --test \"test/**/*.test.ts\""
+    "test": "node --test \"test/**/*.test.ts\"",
+    "smoke:pack": "node scripts/mvp-delivery-pack.mjs",
+    "demo": "node scripts/demo-mvp.mjs"
   },
   "devDependencies": {
     "@types/node": "^20.19.43",

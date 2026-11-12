@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { lstat, mkdir, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { AGENTS_MD_BEGIN, AGENTS_MD_END, AgentsMdError, agentsMdBlock, checkAgentsMd, installAgentsMd } from "../src/adapters/agents-md.ts";
 import { bundleVersion, compareVersions, run as init } from "../src/commands/init.ts";
@@ -252,7 +252,8 @@ test("init vendors the running bundle, writes the config with every default, and
   assert.equal(r.code, 0, r.stderr);
 
   assert.equal(await clone.read(".huddle/huddle.mjs"), await readFile(BUNDLE, "utf8"), "the vendored bundle is not the running bundle");
-  assert.ok(((await stat(join(clone.dir, ".huddle", "huddle.mjs"))).mode & 0o111) !== 0, "the vendored bundle is not executable");
+  // Windows has no execute bit: there the hooks run it with node, as everywhere (the replay tests below run it).
+  if (process.platform !== "win32") assert.ok(((await stat(join(clone.dir, ".huddle", "huddle.mjs"))).mode & 0o111) !== 0, "the vendored bundle is not executable");
   assert.deepEqual(JSON.parse(await clone.read(".huddle/config.json")), { ...DEFAULT_CONFIG });
   // Never converted by git, and not hidden from review as a generated file would be.
   assert.match(await clone.read(".huddle/.gitattributes"), /^huddle\.mjs -text linguist-vendored$/m);
@@ -352,7 +353,8 @@ async function claudeCodeHook(clone: Clone, event: string, payload: string): Pro
   const handler = await committedHandler(clone, ".claude/settings.json", event);
   assert.equal(handler.command, "node", "the committed handler needs nothing but node");
   const args = (handler.args ?? []).map((arg) => arg.replaceAll("${CLAUDE_PROJECT_DIR}", clone.dir));
-  assert.equal(args[0], join(clone.dir, ".huddle", "huddle.mjs"), "and runs the copy vendored in the clone");
+  // Claude Code substitutes the project directory as text, so on Windows the path mixes separators; node takes it.
+  assert.equal(resolve(args[0] ?? ""), join(clone.dir, ".huddle", "huddle.mjs"), "and runs the copy vendored in the clone");
   const ran = await runHandler(BUNDLE_NODE, args, clone.dir, payload);
   const context = ran.stdout === "" ? "" : (JSON.parse(ran.stdout) as { hookSpecificOutput: { additionalContext: string } }).hookSpecificOutput.additionalContext;
   return { code: ran.code, context, stderr: ran.stderr };
