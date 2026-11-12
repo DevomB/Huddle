@@ -67,6 +67,9 @@ export const TEST_ENV: Readonly<Record<string, string>> = Object.freeze({
   GIT_CONFIG_NOSYSTEM: "1",
   HOME: join(isolation, "home"),
   XDG_CONFIG_HOME: join(isolation, "home", ".config"),
+  // No detached background syncs: they would outlive the test and write into a
+  // directory that is being removed. A test of the background path sets this to "".
+  HUDDLE_NO_BACKGROUND: "1",
 });
 
 /** Variables from the developer's shell that would leak into tests. */
