@@ -162,3 +162,24 @@ describe("the conflict mark (pure)", () => {
     }
   });
 });
+
+describe("A05 for decisions: what the transport knows about a failed push is passed on", () => {
+  let h: Harness;
+  let alice: Clone;
+
+  before(async () => {
+    h = await createHarness();
+    alice = await h.clone("alice");
+  });
+  after(() => h.cleanup());
+
+  test("offline with nothing sent is not reported as possibly recorded; offline after sending is", async () => {
+    for (const sent of [false, undefined] as const) {
+      const ctx = await context(alice, at(sent === false ? 10 : 20));
+      ctx.transport.publish = async () => (sent === false ? { ok: false, reason: "offline", sent: false } : { ok: false, reason: "offline" });
+      const result = await addDecision(ctx, `Offline ${String(sent)}`);
+      assert.equal(result.ok, false);
+      assert.deepEqual(result.ok ? null : [result.reason, result.sent], ["offline", sent !== false], JSON.stringify(result));
+    }
+  });
+});

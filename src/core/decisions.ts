@@ -243,7 +243,8 @@ export async function addDecision(ctx: Ctx, text: string, opts: { supersedes?: s
       }
       await writeCache(paths, cache);
       log(paths, "decide", `publish failed: ${published.reason} (attempt ${attempt} of ${ATTEMPTS})`);
-      if (published.reason !== "lost-race") return { ok: false, reason: published.reason, sent: true };
+      // `sent: false` from the transport: nothing left this machine, so the decision was certainly not recorded.
+      if (published.reason !== "lost-race") return { ok: false, reason: published.reason, sent: published.sent !== false };
     }
     return { ok: false, reason: "lost-race", sent: true };
   });

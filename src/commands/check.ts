@@ -31,9 +31,13 @@ export async function run(args: string[], io: Io): Promise<number> {
   const ctx = await openContext(io);
 
   let targets: string[];
+  // False when git could not list this worktree's own files in flight: some paths were then not checked.
+  let listed = true;
   if (positionals.length === 0) {
     // Every file in flight: the published list stops at LIMITS.files, and a file past it can overlap too.
-    targets = (await workInFlight(ctx.paths.worktree, ctx.config)).all;
+    const work = await workInFlight(ctx.paths.worktree, ctx.config);
+    targets = work.all;
+    listed = work.complete;
   } else {
     targets = positionals.map((raw) => {
       const path = toRepoPath(ctx.paths, io.cwd, raw);
@@ -50,7 +54,8 @@ export async function run(args: string[], io: Io): Promise<number> {
   const team = await readTeam(ctx, me.id, refresh);
   const view = team.view;
   const found = targets.map((path) => ({ path, overlaps: overlaps(view, path) })).filter((entry) => entry.overlaps.length > 0);
-  const trusted = team.freshness.freshness === "fresh" && team.completeness.complete;
+  const warnings = listed ? team.warnings : ["this worktree's own files in flight could not be listed (git failed), so some of them may not have been checked", ...team.warnings];
+  const trusted = listed && team.freshness.freshness === "fresh" && team.completeness.complete;
   const verdict: Verdict = found.length > 0 ? "overlap" : trusted ? "clear" : "unknown";
 
   if (values.json) {
@@ -74,6 +79,7 @@ export async function run(args: string[], io: Io): Promise<number> {
           })),
           verdict,
           ...envelope(team),
+          warnings,
         },
         null,
         2,
@@ -84,8 +90,12 @@ export async function run(args: string[], io: Io): Promise<number> {
   } else {
     const what = `${targets.length} path${targets.length === 1 ? "" : "s"} against ${view.sessions.length} other session${view.sessions.length === 1 ? "" : "s"}`;
     if (verdict === "clear") io.out(`no overlap: checked ${what}`);
-    else io.out(`unknown: checked ${what}, but the team picture cannot be trusted: ${team.warnings.join("; ")}. Run "huddle check --refresh" (or "huddle sync") and check again`);
+    else if (!listed) {
+      const refresh = team.warnings.length > 0 ? ', and "huddle check --refresh" (or "huddle sync")' : "";
+      io.out(`unknown: checked ${what}, but ${warnings.join("; ")}. Run "git status" to see why${refresh}, then check again`);
+    }
+    else io.out(`unknown: checked ${what}, but the team picture cannot be trusted: ${warnings.join("; ")}. Run "huddle check --refresh" (or "huddle sync") and check again`);
   }
-  for (const warning of team.warnings) io.err(`huddle: ${warning}`);
+  for (const warning of warnings) io.err(`huddle: ${warning}`);
   return verdict === "overlap" ? EXIT.CONFLICT : verdict === "clear" ? EXIT.OK : EXIT.ERROR;
 }
