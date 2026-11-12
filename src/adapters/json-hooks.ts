@@ -114,10 +114,15 @@ function commandText(handler: Json): string {
   return words.filter((word): word is string => typeof word === "string").join(" ");
 }
 
-/** A handler of the user's that also runs huddle's hook, or names it. */
+/**
+ * A handler of the user's that also runs huddle's hook, or names it. Only one
+ * that runs a command: in every agent here that is `type` "command", or no
+ * type at all. A prompt or http handler runs nothing, whatever its text says.
+ */
 function alsoNamesHook(file: HookFile, value: unknown): boolean {
   const handler = asRecord(value);
-  return handler !== null && !file.isOurs(handler) && mentionsHook(file.agent).test(commandText(handler));
+  if (handler === null || (handler.type !== undefined && handler.type !== "command")) return false;
+  return !file.isOurs(handler) && mentionsHook(file.agent).test(commandText(handler));
 }
 
 // ---------------------------------------------------------------------------

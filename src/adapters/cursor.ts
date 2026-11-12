@@ -11,8 +11,9 @@
 //   Cursor event         huddle event                       registered with
 //   sessionStart         session-start                      timeout 10
 //   beforeSubmitPrompt   prompt                             timeout 5
-//   postToolUse          pre-edit when the tool edited a    timeout 5, matcher Write|Delete|Shell
-//                        file, else prompt without a text
+//   postToolUse          post-edit that also briefs, when   timeout 5, matcher Write|Delete|Shell
+//                        the tool edited a file; else
+//                        prompt without a text
 //   postToolUseFailure   prompt without a text              timeout 5, matcher Write|Delete|Shell
 //   afterFileEdit        post-edit                          timeout 5
 //   stop                 turn-end                           timeout 5
@@ -24,25 +25,27 @@
 //   sessionStart, postToolUse and postToolUseFailure, all through
 //   `additional_context`. beforeSubmitPrompt can let the prompt pass or block
 //   it and has no field that reaches the agent. So the prompt records the
-//   intent and nothing is shown, and what changed in the team comes after a
-//   tool call instead: a postToolUse that is no file edit, and every
-//   postToolUseFailure, is handed to the engine as a prompt without a text,
-//   which is a sign of life plus the briefing on whatever is new.
-// - As things stand that means: after a shell command, or after a tool call
-//   that failed. The postToolUse of an edit goes to the engine as a pre-edit
-//   (next point), and a pre-edit answers with overlap warnings only. A turn
-//   that edits and runs no shell command hears no news. The engine is getting
-//   an event that carries both; when it has it, the edit's postToolUse
-//   becomes that one.
+//   intent and nothing is shown, and everything the team has to say comes
+//   after a tool call instead:
+//   - the postToolUse of an edit is handed to the engine as a post-edit with
+//     `brief` set (adapters/types.ts): the overlap warning for the file and
+//     whatever is new in the team, in one answer;
+//   - any other postToolUse, and every postToolUseFailure, is handed over as
+//     a prompt without a text: a sign of life plus the news.
 // - Nothing can be said before an edit without stopping it. preToolUse's
 //   `agent_message` is "fed back to the agent when the action is denied", and
 //   preToolUse is one of the hooks where an answer Cursor cannot read blocks
 //   the action. huddle never blocks, so it registers no hook before a tool
-//   call at all, and the overlap warning comes right after the edit: the
-//   postToolUse of an edit is handed to the engine as the pre-edit it could
-//   not be. The engine starts no sync on a pre-edit, so afterFileEdit, which
-//   can say nothing to anyone, is registered as well and is the post-edit
-//   that gets the edit published.
+//   call at all, and the overlap warning comes right after the edit.
+// - afterFileEdit can say nothing to anyone and is registered all the same,
+//   as a second post-edit for the same edit. It is the one event the page
+//   ties to file edits whatever the tool behind them is called, and it names
+//   the file in a documented field. If Cursor's edit tool has a type the
+//   matcher below does not catch, this is what still gets the edit published.
+//   The engine takes two post-edits for one edit as one: what the first said
+//   is on record, and an answer that could not be shown uses up nothing.
+// - The matcher Write|Delete|Shell is not anchored, on purpose. The reason is
+//   at AFTER_TOOLS; do not "fix" it before it has been seen to work.
 // - Which file a tool edited is not documented for postToolUse: the page
 //   shows `tool_input` for Shell only. It is read as `file_path`, the name
 //   every documented Cursor payload uses for a file (afterFileEdit,
@@ -54,8 +57,8 @@
 //   enforce a blocking response", and huddle's session-start waits up to 4 s
 //   for a sync before it answers. So the briefing given there may never reach
 //   the agent. It is printed, and it is not recorded as shown (`unshown`): the
-//   first shell command brings the briefing again. Twice at worst, where the
-//   other choice was never at worst. sessionEnd is fire-and-forget too ("the
+//   first edit or shell command brings the briefing again. Twice at worst,
+//   where the other choice was never at worst. sessionEnd is fire-and-forget too ("the
 //   response is logged but not used"). For the other hooks the page does not
 //   say whether Cursor waits; huddle keeps them short either way, which is
 //   why postToolUse is registered for the tools that change things and not
@@ -120,8 +123,9 @@ const AFTER_TOOLS = "Write|Delete|Shell";
 const REGISTRATIONS: readonly Registration[] = [
   { event: "sessionStart", type: "session-start", timeout: 10 },
   { event: "beforeSubmitPrompt", type: "prompt", timeout: 5 },
-  { event: "postToolUse", type: "pre-edit", timeout: 5, matcher: AFTER_TOOLS },
-  // "Called when a tool fails, times out, or is denied." No edit happened, so it is never a pre-edit.
+  // A post-edit when the tool edited a file huddle can name; parse() makes anything else a prompt without a text.
+  { event: "postToolUse", type: "post-edit", timeout: 5, matcher: AFTER_TOOLS },
+  // "Called when a tool fails, times out, or is denied." No edit happened, so it is never an edit here.
   { event: "postToolUseFailure", type: "prompt", timeout: 5, matcher: AFTER_TOOLS },
   // No matcher: this event is "matched against the value Write" and nothing else.
   { event: "afterFileEdit", type: "post-edit", timeout: 5 },
@@ -209,11 +213,14 @@ function parsePayload(input: HookInput): HookEvent | null {
     // Only the user's prompt has a text. After a failed tool call there is none to take an intent from.
     const prompt = registration.event === "beforeSubmitPrompt" ? asText(payload.prompt).trim() : "";
     if (prompt !== "") event.prompt = prompt;
-  } else if (event.type === "pre-edit") {
+  } else if (registration.event === "postToolUse") {
     const paths = editedPaths(payload);
-    if (paths.length > 0) event.paths = paths;
-    else {
-      // Not an edit huddle can name: the session is alive, and may hear the news.
+    if (paths.length > 0) {
+      // An edit, and the one place after it where the agent can be told anything: the warning and the news together.
+      event.paths = paths;
+      event.brief = true;
+    } else {
+      // Not an edit huddle can name: the session is alive, and hears the news.
       event.type = "prompt";
       if (isFileTool(payload)) native.unnamed = { tool: asText(payload.tool_name), fields: fieldNames(payload) };
     }
@@ -334,7 +341,7 @@ const TRUST_NOTE = "Cursor runs a project's hooks only in a workspace that is tr
 const NODE_NOTE =
   "Every teammate needs Node 20 or later on the PATH that Cursor itself sees. An app started outside a shell may not see a node installed by nvm, fnm or volta. Whether the hooks run, and why not, is in Cursor's Hooks output channel.";
 const LATER_NOTE =
-  "Cursor lets a hook speak to its agent only after a tool call, and when a session starts, where it does not wait for the answer. huddle is called after edits, deletions and shell commands. So what changed in the team reaches the agent with its next shell command, or after a tool call that failed, not with the prompt and not after an edit. A warning about a file a teammate is working on comes right after the first edit of it, not before.";
+  "Cursor lets a hook speak to its agent only after a tool call, and when a session starts, where it does not wait for the answer. huddle is called after edits, deletions and shell commands, also when one of them failed. So what changed in the team reaches the agent after its next edit or shell command, not with the prompt. A warning about a file a teammate is working on comes right after the first edit of it, not before.";
 const LAST_WINS_NOTE =
   "If another hook answers the same Cursor event with an additional_context of its own, Cursor keeps only one of the answers, and it may not be huddle's.";
 const NOTES: readonly string[] = [TRUST_NOTE, NODE_NOTE, LATER_NOTE, LAST_WINS_NOTE];

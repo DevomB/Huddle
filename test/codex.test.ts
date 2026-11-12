@@ -529,8 +529,10 @@ test("install: hooks for another agent, or that merely look similar, are not hud
     { type: "mcp_tool", server: "huddle.mjs hook codex", tool: "x" },
   ];
   const { root, file } = await scratchRepo(t, { hooks: { Stop: [{ hooks: lookalikes }] } });
-  await codex.install({ repoRoot: root, bundle: BUNDLE });
+  const result = await codex.install({ repoRoot: root, bundle: BUNDLE });
   assert.deepEqual(((await readJson(file)).hooks as Record<string, Json[]>).Stop, [{ hooks: lookalikes }, { hooks: [handler(5)] }]);
+  // None of them runs huddle's hook for Codex: nothing can run twice, and nothing is said about it.
+  assert.equal(result.notes.length, 1, result.notes.join("\n"));
 });
 
 test("install: a command of the user's that runs huddle's hook among other things, or only names it, is the user's and stays", async (t) => {
@@ -797,6 +799,8 @@ test("check: reports what install left, and what is still missing", async (t) =>
   const ok = await checkCodex(root, around);
   assert.equal(ok.installed, true);
   assert.equal(ok.detail, "6 hooks in .codex/hooks.json");
+  // The file the team commits, for doctor to say when it is not committed yet.
+  assert.deepEqual((ok as { files?: string[] }).files, [".codex/hooks.json"]);
   // doctor has to explain the two manual steps.
   assert.equal(ok.notes.length, 1);
   assert.match(ok.notes[0] ?? "", /trust the project when Codex asks/);

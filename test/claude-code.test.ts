@@ -940,9 +940,11 @@ test("install: other tools' hooks that merely look similar are not huddle's", as
     { type: "http", url: "http://localhost/huddle.mjs hook claude-code" },
   ];
   const { root, file } = await scratchRepo(t, { hooks: { Stop: [{ hooks: lookalikes }] } });
-  await claudeCode.install({ repoRoot: root, bundle: BUNDLE });
+  const result = await claudeCode.install({ repoRoot: root, bundle: BUNDLE });
   const stop = ((await readJson(file)).hooks as Record<string, Json[]>).Stop;
   assert.deepEqual(stop, [{ hooks: lookalikes }, { hooks: [handler(5)] }]);
+  // None of them runs huddle's hook for Claude Code: nothing can run twice, and nothing is said about it.
+  assertStandingNotes(result.notes);
 });
 
 test("install: a settings file huddle cannot read safely is refused and left exactly as it was", async (t) => {
@@ -1076,6 +1078,8 @@ test("check: reports what install left, and what is still missing", async (t) =>
   const ok = await checkClaudeCode(root, around);
   assert.equal(ok.installed, true);
   assert.equal(ok.detail, "6 hooks in .claude/settings.json");
+  // The file the team commits, for doctor to say when it is not committed yet.
+  assert.deepEqual((ok as { files?: string[] }).files, [".claude/settings.json"]);
   assertCheckNotes(ok.notes);
 
   // The same answer through the adapter, when the repo itself settles it.

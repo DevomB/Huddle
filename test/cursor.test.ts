@@ -81,11 +81,11 @@ const EXPECTED: Record<string, Omit<HookEvent, "native"> | null> = {
   "before-submit-prompt": { type: "prompt", ...base, prompt: "Add rate limiting to the login endpoint" },
   // After a tool call that is no file edit: a sign of life, and the place where news can be told.
   "post-tool-use.shell": { type: "prompt", ...base, cwd: `${ROOT}/packages/api` },
-  // After a file edit: the overlap check, which Cursor leaves no place for before the edit.
-  "post-tool-use.write": { type: "pre-edit", ...base, paths: [`${ROOT}/src/auth/jwt.ts`] },
-  "post-tool-use.write.path": { type: "pre-edit", ...base, paths: ["src/auth/jwt.ts"] },
+  // After a file edit: the overlap check, which Cursor leaves no place for before the edit, and the news with it.
+  "post-tool-use.write": { type: "post-edit", ...base, paths: [`${ROOT}/src/auth/jwt.ts`], brief: true },
+  "post-tool-use.write.path": { type: "post-edit", ...base, paths: ["src/auth/jwt.ts"], brief: true },
   "post-tool-use.write.unnamed": { type: "prompt", ...base },
-  "post-tool-use.delete": { type: "pre-edit", ...base, paths: [`${ROOT}/src/auth/old.ts`] },
+  "post-tool-use.delete": { type: "post-edit", ...base, paths: [`${ROOT}/src/auth/old.ts`], brief: true },
   "post-tool-use.mcp": { type: "prompt", ...base },
   // After a tool call that failed, timed out or was denied: no edit happened, whatever the tool was.
   "post-tool-use-failure.shell": { type: "prompt", ...base, cwd: `${ROOT}/packages/api` },
@@ -106,9 +106,11 @@ test("fixtures: every payload has an expectation, and every normalized event has
     .sort();
   assert.deepEqual(present, Object.keys(EXPECTED).sort());
   const types = new Set(Object.values(EXPECTED).map((event) => event?.type));
-  for (const type of ["session-start", "prompt", "pre-edit", "post-edit", "turn-end", "session-end"]) {
+  for (const type of ["session-start", "prompt", "post-edit", "turn-end", "session-end"]) {
     assert.ok(types.has(type as HookEventType), `no fixture produces a ${type} event`);
   }
+  // Cursor has no hook before an edit that huddle could answer without holding the edit up.
+  assert.equal(types.has("pre-edit"), false);
 });
 
 /** What parse() notes for format() besides the event: the one edit here whose file it could not name. */
@@ -155,7 +157,12 @@ test("parse: the session is the conversation, under either of the names Cursor g
 
 test("parse: after a tool call, a file edit is one that Write or Delete made to a file the input names", () => {
   const write = fixture("post-tool-use.write");
-  const paths = (tool_name: unknown, tool_input: unknown): string[] | undefined => parse({ ...write, tool_name, tool_input })?.paths;
+  const paths = (tool_name: unknown, tool_input: unknown): string[] | undefined => {
+    const event = parse({ ...write, tool_name, tool_input });
+    // An edit is a post-edit, and the one that briefs: it is the only place after an edit where Cursor's agent can be told anything.
+    assert.deepEqual([event?.type, event?.brief], ["post-edit", true], JSON.stringify([tool_name, tool_input]));
+    return event?.paths;
+  };
   assert.deepEqual(paths("Write", { file_path: "/a/b.ts" }), ["/a/b.ts"]);
   assert.deepEqual(paths("Write", { path: "b.ts" }), ["b.ts"]);
   assert.deepEqual(paths("Write", { file_path: "first.ts", path: "second.ts" }), ["first.ts"]);
@@ -184,6 +191,7 @@ test("parse: after a tool call, a file edit is one that Write or Delete made to 
     const event = parse({ ...write, tool_name: tool, tool_input: input });
     assert.equal(event?.type, "prompt", JSON.stringify([tool, input]));
     assert.equal(event?.paths, undefined, JSON.stringify([tool, input]));
+    assert.equal(event !== null && "brief" in event, false, JSON.stringify([tool, input]));
     // A Write that names no file is noted, for the line on stderr. No other tool here was expected to name one.
     const native = event?.native as Json;
     assert.equal(native.event, "postToolUse");
@@ -257,6 +265,13 @@ test("parse: session-end passes on Cursor's own word for why, and after an edit 
   const edited = parse({ ...fixture("after-file-edit"), file_path: 7 });
   assert.equal(edited?.type, "post-edit");
   assert.equal(edited !== null && "paths" in edited, false);
+  // afterFileEdit cannot speak, so it asks for no briefing: only the edit's postToolUse does.
+  for (const payload of [fixture("after-file-edit"), { ...fixture("after-file-edit"), tool_name: "Write", tool_input: { file_path: "/a/b.ts" } }]) {
+    const after = parse(payload);
+    assert.equal(after?.type, "post-edit");
+    assert.equal(after !== null && "brief" in after, false);
+    assert.deepEqual(after?.paths, [`${ROOT}/src/auth/jwt.ts`]);
+  }
   // Nothing in Cursor's payloads marks a subagent, and a start says nothing about why.
   for (const name of Object.keys(EXPECTED)) {
     const event = parse(fixtureText(name));
@@ -299,7 +314,7 @@ test("parse: anything that is not a payload huddle knows is null, and nothing th
 // ---------------------------------------------------------------------------
 
 test("format: after a tool call, failed or not, the context goes out as additional_context, and nothing else does", () => {
-  const speaking: HookEvent[] = [eventOf("pre-edit", "postToolUse"), eventOf("prompt", "postToolUse"), eventOf("prompt", "postToolUseFailure")];
+  const speaking: HookEvent[] = [eventOf("post-edit", "postToolUse"), eventOf("prompt", "postToolUse"), eventOf("prompt", "postToolUseFailure")];
   for (const event of speaking) {
     const output = format(event, { context: BRIEFING, env: { HUDDLE_SESSION: SESSION } });
     assert.deepEqual(JSON.parse(output.stdout), { additional_context: BRIEFING }, event.type);
@@ -489,8 +504,9 @@ test("install: an empty repo gets .cursor/hooks.json with one handler per event"
   assert.equal(result.notes.length, 4);
   assert.match(result.notes[0] ?? "", /only in a workspace that is trusted/);
   assert.match(result.notes[1] ?? "", /Node 20 or later on the PATH that Cursor itself sees/);
-  // When the agent hears what: with a shell command or after a failed tool call. Not with the prompt, and not after an edit.
-  assert.match(result.notes[2] ?? "", /reaches the agent with its next shell command, or after a tool call that failed, not with the prompt and not after an edit\./);
+  // When the agent hears what: after an edit or a shell command, also a failed one. Not with the prompt.
+  assert.match(result.notes[2] ?? "", /huddle is called after edits, deletions and shell commands, also when one of them failed\./);
+  assert.match(result.notes[2] ?? "", /reaches the agent after its next edit or shell command, not with the prompt\./);
   assert.match(result.notes[2] ?? "", /when a session starts, where it does not wait for the answer/);
   assert.match(result.notes[2] ?? "", /right after the first edit of it, not before/);
   assert.match(result.notes[3] ?? "", /another hook answers the same Cursor event .* Cursor keeps only one of the answers, and it may not be huddle's\./);
@@ -638,8 +654,10 @@ test("install: hooks for another agent, or that merely look similar, are not hud
     null,
   ];
   const { root, file } = await scratchRepo(t, { version: 1, hooks: { stop: lookalikes } });
-  await cursor.install({ repoRoot: root, bundle: BUNDLE });
+  const result = await cursor.install({ repoRoot: root, bundle: BUNDLE });
   assert.deepEqual(((await readJson(file)).hooks as Record<string, unknown[]>).stop, [...lookalikes, handler("stop", 5)]);
+  // None of them runs huddle's hook for Cursor, so there is nothing that could run twice and nothing to say about it.
+  assert.equal(result.notes.length, 4, result.notes.join("\n"));
 });
 
 test("install: a command of the user's that runs huddle's hook among other things, or only names it, is the user's and stays", async (t) => {
@@ -1145,6 +1163,8 @@ test("check: reports what install left, and what is still missing", async (t) =>
   const whole = await cursor.check(root);
   assert.equal(whole.installed, true);
   assert.equal(whole.detail, "7 hooks in .cursor/hooks.json");
+  // The file the team commits, for doctor to say when it is not committed yet.
+  assert.deepEqual((whole as { files?: string[] }).files, [".cursor/hooks.json"]);
   assert.equal("broken" in whole, false);
   assert.deepEqual(whole.notes, (await cursor.install({ repoRoot: root, bundle: BUNDLE })).notes, "doctor says what init said");
   assert.equal(whole.notes.length, 4);
@@ -1380,12 +1400,13 @@ async function cursorHook(clone: Clone, name: string, seconds: number, over: Jso
   return { code, stdout: io.stdout, stderr: io.stderr };
 }
 
-test("Cursor, through the engine: a briefing at the start, the intent from the prompt, the warning right after the edit, news with the next tool call, and never a word where Cursor would act on one", async (t) => {
+test("Cursor, through the engine: the intent from the prompt, the warning and the briefing right after the first edit, news after the next tool call, and never a word where Cursor would act on one", async (t) => {
   const { alice, bob } = await aliceBuildsAuth(t);
   const asked = record(t);
   await mkdir(join(bob.dir, "packages", "api"), { recursive: true }); // where the shell command of the fixture ran
   const run = (name: string, seconds: number, over: Json = {}): Promise<Ran> => cursorHook(bob, name, seconds, over);
   const write = { tool_input: { file_path: join(bob.dir, "src", "auth.ts") } };
+  const aliceNow = (intent: string, since: number, now: number): string => `- alice / claude-code on main (${ago(since, now)}): "${intent}". Files: src/auth.ts`;
 
   // sessionStart: the briefing, through the one field that reaches the agent. Cursor does not wait for it, so it may never arrive.
   assert.deepEqual(await run("session-start", 20), tells(text(FULL_HEAD, aliceLine(20), FULL_FOOT)));
@@ -1398,17 +1419,17 @@ test("Cursor, through the engine: a briefing at the start, the intent from the p
   // beforeSubmitPrompt: the start of the prompt is the intent, and nothing is printed, whatever there is to say.
   assert.deepEqual(await run("before-submit-prompt", 22), QUIET);
   assert.equal((await sessionOf(bob, SESSION))?.intent, "Add rate limiting to the login endpoint");
+  assert.deepEqual(await seenKeys(bob, SESSION), []);
 
-  // The agent writes a file alice has in flight. Cursor leaves no place for a warning before the edit; it comes right after.
+  // The agent writes a file alice has in flight. Cursor leaves no place for a warning before the edit; it comes right
+  // after, and in the same answer the briefing again, this time where Cursor waits for it, so this time it counts.
   await bob.write("src/auth.ts", "export const auth = false;\n");
-  assert.deepEqual(await run("post-tool-use.write", 24, write), tells(authWarning(24)));
-  // afterFileEdit can say nothing; it is what gets the edit published. And the same file again is not warned about twice.
+  assert.deepEqual(await run("post-tool-use.write", 24, write), tells(text(authWarning(24), FULL_HEAD, aliceLine(24), FULL_FOOT)));
+  assert.notDeepEqual(await seenKeys(bob, SESSION), []);
+  // afterFileEdit is a second post-edit for the same edit and can say nothing. And the same file again is not warned about twice.
   assert.deepEqual(await run("after-file-edit", 25, { file_path: join(bob.dir, "src", "auth.ts") }), QUIET);
   assert.deepEqual(await run("post-tool-use.write", 26, write), QUIET);
-  // The first shell command: the briefing again, this time where Cursor waits for it, so this time it counts.
-  assert.deepEqual(await run("post-tool-use.shell", 27), tells(text(FULL_HEAD, aliceLine(27), FULL_FOOT)));
-  assert.notDeepEqual(await seenKeys(bob, SESSION), []);
-  // The next one, with nothing new to hear of: a sign of life.
+  // A shell command with nothing new to hear of: a sign of life.
   assert.deepEqual(await run("post-tool-use.shell", 27), QUIET);
   assert.equal((await sessionOf(bob, SESSION))?.seenAt, at(27));
   // Events huddle does not register for are no events at all.
@@ -1422,24 +1443,43 @@ test("Cursor, through the engine: a briefing at the start, the intent from the p
   const before = await seenKeys(bob, SESSION);
   assert.deepEqual(await run("before-submit-prompt", 35, { prompt: "Now the tests" }), QUIET);
   assert.deepEqual(await seenKeys(bob, SESSION), before, "what could not be shown is not on record as shown");
-  // ...so it comes with the first tool call after it, once.
-  const news = text(DELTA_HEAD, `- alice / claude-code on main (${ago(30, 36)}): "Switch the JWT middleware to sessions". Files: src/auth.ts`, OVERLAP_HINT);
-  assert.deepEqual(await run("post-tool-use.shell", 36), tells(news));
+  // ...so it comes with the first tool call after it, once. Here that is an edit, of a file nobody else has: the news alone.
+  await bob.write("docs/notes.md", "# Notes\n");
+  const elsewhere = { tool_input: { file_path: join(bob.dir, "docs", "notes.md") } };
+  assert.deepEqual(await run("post-tool-use.write", 36, elsewhere), tells(text(DELTA_HEAD, aliceNow("Switch the JWT middleware to sessions", 30, 36), OVERLAP_HINT)));
+  assert.deepEqual(await run("after-file-edit", 36, { file_path: join(bob.dir, "docs", "notes.md") }), QUIET);
   assert.deepEqual(await run("post-tool-use.shell", 37), QUIET);
 
+  // Alice moves on again, and bob's next tool call fails. That is as good a place to hear of it.
+  await fire(alice, "prompt", 38, { prompt: "Back to JWT after all" });
+  await publish(alice, 39);
+  await publish(bob, 40);
+  assert.deepEqual(await run("post-tool-use-failure.shell", 41), tells(text(DELTA_HEAD, aliceNow("Back to JWT after all", 38, 41), OVERLAP_HINT)));
+  assert.deepEqual(await run("post-tool-use-failure.write", 42), QUIET);
+  assert.equal((await sessionOf(bob, SESSION))?.seenAt, at(42));
+
   // stop: a word there would start another turn. sessionEnd: the session is gone.
-  assert.deepEqual(await run("stop", 40), QUIET);
+  assert.deepEqual(await run("stop", 45), QUIET);
   assert.equal((await sessionsOf(bob)).length, 1);
   assert.deepEqual(await run("session-end", 50), QUIET);
   assert.deepEqual(await sessionsOf(bob), []);
 
   // What bob's clone asked of the network on the way. One sync waited for, at the start. Then, each left behind:
-  // the intent at once (22), the edit through afterFileEdit (25) and the two shell commands (27) left to the throttle,
-  // the next intent at once (35), two more shell commands left to the throttle (36, 37), and the ends of the turn
-  // (40) and of the session (50) at once. The two overlap checks (24, 26) ask for nothing.
+  // the intent at once (22); the first edit through its postToolUse and its afterFileEdit, the same file again and
+  // the shell command left to the throttle (24, 25, 26, 27); the next intent at once (35); the second edit, twice,
+  // and the shell command left to the throttle (36, 36, 37); so are the two failed tool calls (41, 42); and the ends
+  // of the turn (45) and of the session (50) at once.
   assert.equal(asked.waited.length, 1);
   const asks = asked.background.filter((one) => one.worktree === bob.dir);
-  assert.deepEqual(asks, [forced(bob), throttled(bob), throttled(bob), throttled(bob), forced(bob), throttled(bob), throttled(bob), forced(bob), forced(bob)]);
+  assert.deepEqual(asks, [
+    forced(bob),
+    ...[24, 25, 26, 27].map(() => throttled(bob)),
+    forced(bob),
+    ...[36, 36, 37].map(() => throttled(bob)),
+    ...[41, 42].map(() => throttled(bob)),
+    forced(bob),
+    forced(bob),
+  ]);
 });
 
 test("Cursor, through the engine: an edit whose file the payload does not name where huddle looks still counts, and brings the news instead of a warning", async (t) => {
