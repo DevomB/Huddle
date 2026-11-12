@@ -189,6 +189,31 @@ test("a session that wakes up just after another session of its clone published 
   assert.equal(await remoteRefs(h), before, "seenAt alone caused a push inside the heartbeat interval");
 });
 
+test("the same with the cache lost: what teammates hold is read from the fetch of that round", async (t) => {
+  const h = await createHarness(t);
+  const twin = await h.clone("twin");
+  const quiet = { HUDDLE_SESSION: "quiet" };
+  const busy = { HUDDLE_SESSION: "busy" };
+  const published = async (id: string) => (await actorDocs(h)).flatMap((doc) => doc.sessions).find((session) => session.id === id)?.seenAt;
+
+  await ok(twin, ["claim", "src/desk/**"], at(0), quiet);
+  await ok(twin, ["sync"], at(0), quiet);
+  await ok(twin, ["intent", "something else"], at(13 * MIN), busy);
+  await ok(twin, ["sync"], at(13 * MIN), busy);
+  assert.equal(await published("quiet"), at(0));
+
+  // Without cache.json this clone no longer knows what it published for each session.
+  await rm((await twin.paths()).cacheFile);
+  await ok(twin, ["sync"], at(14 * MIN), quiet);
+  assert.equal(await published("quiet"), at(14 * MIN), "its sign of life waited for another round");
+
+  // The same loss when nothing is owed: the fetch brings the copy back and nothing is pushed.
+  const before = await remoteRefs(h);
+  await rm((await twin.paths()).cacheFile);
+  await ok(twin, ["sync"], at(15 * MIN), quiet);
+  assert.equal(await remoteRefs(h), before, "a lost cache alone caused a push");
+});
+
 test("background syncs are throttled to one per syncIntervalSeconds; --force and manual syncs are not", async (t) => {
   const h = await createHarness(t);
   const alice = await h.clone("alice");

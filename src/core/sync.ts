@@ -15,7 +15,7 @@ import type { RepoPaths } from "./paths.ts";
 import { toActorDoc } from "./session.ts";
 import { readCache, readLocal, removeSeen, updateLocal, withLock, writeCache } from "./store.ts";
 import { actorRef } from "./types.ts";
-import type { ActorDoc, Config, Doc, FailReason, LocalState, PublishResult } from "./types.ts";
+import type { ActorDoc, CacheEntry, Config, Doc, FailReason, LocalState, PublishResult } from "./types.ts";
 
 export interface SyncOptions {
   /** Ignore syncIntervalSeconds, and wait for a sync that is already running instead of skipping. */
@@ -123,13 +123,8 @@ async function round(ctx: Ctx): Promise<SyncResult> {
     return transport.publish(ownRef, doc, "own");
   };
 
-  // What teammates hold for each of our sessions: the cached copy of our own
-  // ref, when it is the one we published last.
-  const held = cache.refs[ownRef];
-  const shown =
-    state.published && held && held.sha === state.published.sha && held.doc?.kind === "actor"
-      ? new Map(held.doc.sessions.map((session) => [session.id, session.seenAt] as const))
-      : null;
+  // What teammates hold for each of our sessions, as far as the cache knows.
+  const shown = shownSeenAt(cache.refs[ownRef], state.published);
   const publishDue = shouldPublish(state.published, doc, hash, now, config, shown);
   const [fetched, firstPublish] = await Promise.all([transport.fetchAll(known), publishDue ? publish() : Promise.resolve(null)]);
 
@@ -156,11 +151,17 @@ async function round(ctx: Ctx): Promise<SyncResult> {
     log(paths, "sync", `fetch failed: ${fetched.reason}`);
   }
 
-  // Our doc should be on the remote at the sha we last published. If it is not
-  // there (deleted, or overwritten by someone else), put it back.
   let published: PublishResult | null = firstPublish;
-  if (!published && fetched.ok && state.published && doc.sessions.length > 0 && cache.refs[ownRef]?.sha !== state.published.sha) {
-    published = await publish();
+  if (!published && fetched.ok && state.published && doc.sessions.length > 0) {
+    if (cache.refs[ownRef]?.sha !== state.published.sha) {
+      // Our doc should be on the remote at the sha we last published. It is not
+      // there (deleted, or overwritten by someone else): put it back.
+      published = await publish();
+    } else if (shown === null && shouldPublish(state.published, doc, hash, now, config, shownSeenAt(cache.refs[ownRef], state.published))) {
+      // The cache had no copy of our own doc (it was lost), so the rule could
+      // not see what teammates hold. The fetch has just brought that copy.
+      published = await publish();
+    }
   }
 
   if (published?.ok) {
@@ -253,6 +254,16 @@ async function inspectWorktree(worktree: string, config: Config): Promise<{ bran
   }
   const [branch, files] = await Promise.all([currentBranch(worktree), filesInFlight(worktree, config)]);
   return { branch, files };
+}
+
+/**
+ * For each of our sessions, the seenAt teammates hold: the one in `entry`,
+ * a copy of our own ref, when that copy is the document we published last.
+ * Null when it is not, or when there is no copy.
+ */
+function shownSeenAt(entry: CacheEntry | undefined, published: LocalState["published"]): Map<string, string> | null {
+  if (!published || !entry || entry.sha !== published.sha || entry.doc?.kind !== "actor") return null;
+  return new Map(entry.doc.sessions.map((session) => [session.id, session.seenAt] as const));
 }
 
 /**
