@@ -23,6 +23,7 @@ import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFile
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { gunzipSync } from "node:zlib";
 
 const WINDOWS = process.platform === "win32";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -138,8 +139,11 @@ try {
   const dirty = await run("git", ["status", "--porcelain", "--untracked-files=no"], { cwd: root });
   if (dirty.stdout.trim() !== "") console.log("note: tracked files have uncommitted changes; the copy has them");
   check("clean source copy has no build output", !existsSync(join(source, "dist")), `${copied} tracked files`);
+  // The copy has no .git, so the archive's entries are dated by this checkout's last commit, as a release from it would be.
+  const commitTime = (await run("git", ["log", "-1", "--format=%ct"], { cwd: root })).stdout.trim();
+  const buildEnv = { ...environment(), SOURCE_DATE_EPOCH: process.env.SOURCE_DATE_EPOCH || commitTime };
   const NPM = npmCli();
-  const npm = (argv) => run(process.execPath, [NPM, ...argv, "--no-audit", "--no-fund", "--loglevel=error"], { cwd: source });
+  const npm = (argv) => run(process.execPath, [NPM, ...argv, "--no-audit", "--no-fund", "--loglevel=error"], { cwd: source, env: buildEnv });
   const ci = await npm(["ci"]);
   check("npm ci (development tooling, maintainer side)", ci.code === 0, ci.code === 0 ? "" : ci.stderr.slice(-800));
   const release = await npm(["run", "release"]);
@@ -150,7 +154,9 @@ try {
   const archiveBytes = readFileSync(archive);
   const archiveSha = sha256(archiveBytes);
   check("the .sha256 file matches the archive", readFileSync(`${archive}.sha256`, "utf8").startsWith(`${archiveSha}  ${archiveName}`), archiveSha);
-  evidence.archive = { file: archiveName, bytes: archiveBytes.length, sha256: archiveSha };
+  // The tar inside is the same on every platform and Node build; the gzip layer can differ with the zlib Node was built with.
+  const tarSha = sha256(gunzipSync(archiveBytes));
+  evidence.archive = { file: archiveName, bytes: archiveBytes.length, sha256: archiveSha, tarSha256: tarSha, sourceDateEpoch: Number(buildEnv.SOURCE_DATE_EPOCH) || null, zlib: process.versions.zlib };
 
   // 2. Unpack with the system tar, where a user would put it.
   mkdirSync(unpackDir, { recursive: true });
@@ -239,7 +245,8 @@ try {
     check("two-clone demo from the unpacked artifact", d.code === 0, `exit ${d.code}`);
   }
 
-  console.log(`archive ${archiveName}  sha256 ${archiveSha}  ${archiveBytes.length} bytes`);
+  console.log(`archive ${archiveName}  sha256 ${archiveSha}  ${archiveBytes.length} bytes (zlib ${process.versions.zlib})`);
+  console.log(`tar inside  sha256 ${tarSha}`);
   console.log(`huddle.mjs  sha256 ${evidence.bundle.sha256}  ${evidence.bundle.bytes} bytes`);
   if (keep) {
     mkdirSync(keep, { recursive: true });
