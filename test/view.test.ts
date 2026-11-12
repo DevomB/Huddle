@@ -104,8 +104,11 @@ test("view: a session that is not live for its clock holds nothing: no overlap, 
   assert.deepEqual(view.sessions, []);
   assert.deepEqual(overlaps(view, "src/auth/jwt.ts"), []);
   assert.deepEqual(overlaps(view, "src/payments/stripe.ts"), []);
-  assert.equal(view.tasks[0]?.ownerLive, false, "its claimed task can be claimed again");
-  assert.equal(taskState(view.tasks[0] as (typeof view.tasks)[number]), "stale");
+  // A stamp that says nothing about when the owner was last active does not make its task free
+  // either (CONTRACT 4.3): the owner's presence is unknown, and the task cannot be claimed.
+  assert.equal(view.tasks[0]?.ownerLive, false);
+  assert.equal(view.tasks[0]?.ownerPresence, "unknown");
+  assert.equal(taskState(view.tasks[0] as (typeof view.tasks)[number]), "unclear");
 
   // The same session with a believable stamp does hold all three.
   const sane = buildView(withTask("2026-11-12T11:59:00.000Z"), ME, NOW);
@@ -264,7 +267,7 @@ test("view: tasks oldest first, with ownerLive only for a claim whose owner sess
       ["treadme2", "claimed", false, "stale"],
     ],
   );
-  assert.deepEqual(countTasks(view), { open: 1, taken: 3, stale: 1, done: 1 });
+  assert.deepEqual(countTasks(view), { open: 1, taken: 3, stale: 1, unclear: 0, done: 1 });
   assert.equal(view.tasks[2]?.title, "Fix the login redirect");
   assert.equal(view.tasks[2]?.owner?.user, "bob");
 });
@@ -442,6 +445,6 @@ test("view: building a view neither changes the cache nor depends on anything bu
 test("view: an empty cache gives an empty view; an invalid clock is an error", () => {
   const view = buildView({ fetchedAt: null, refs: {} }, ME, NOW);
   assert.deepEqual(view, { now: "2026-11-12T12:00:00.000Z", fetchedAt: null, self: ME, sessions: [], decisions: [], tasks: [] });
-  assert.deepEqual(countTasks(view), { open: 0, taken: 0, stale: 0, done: 0 });
+  assert.deepEqual(countTasks(view), { open: 0, taken: 0, stale: 0, unclear: 0, done: 0 });
   assert.throws(() => buildView({ fetchedAt: null, refs: {} }, ME, new Date("not a date")), TypeError);
 });

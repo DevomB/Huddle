@@ -24,9 +24,9 @@ import { readCache, readLocal, touchSession, writeCache } from "./store.ts";
 import { sync, withSyncLock } from "./sync.ts";
 import type { SyncResult } from "./sync.ts";
 import { actorRef, taskRef } from "./types.ts";
-import type { FailReason, Owner, Sha, TaskDoc } from "./types.ts";
+import type { FailReason, Owner, PublishResult, Sha, TaskDoc } from "./types.ts";
 import { buildView } from "./view.ts";
-import type { ViewTask } from "./view.ts";
+import type { OwnerPresence, ViewTask } from "./view.ts";
 
 /** Which session is acting; with ctx.identity it makes the Owner. */
 export type Who = Pick<Owner, "session" | "agent">;
@@ -40,14 +40,32 @@ export type Who = Pick<Owner, "session" | "agent">;
 export type SyncFailure = "offline" | "denied" | "busy" | "sync-failed";
 
 export type TaskResult =
-  | { ok: true; task: TaskDoc }
+  | {
+      ok: true;
+      task: TaskDoc;
+      /**
+       * The remote's answer to the push was lost, and the change was then found
+       * on the remote by reading it back. "existing": `task add --id` found the
+       * same task there already.
+       */
+      confirmed?: "read-back" | "existing";
+    }
   | {
       ok: false;
-      reason: FailReason | SyncFailure | "not-found" | "not-owner" | "already-claimed" | "already-done";
-      /** The task as it stands now, when known. On a lost claim, task.owner is the winner. */
+      /**
+       * "unknown": the push went out and its answer was lost (timeout, dropped
+       * connection), and reading the remote back did not settle whether the
+       * change was made. `task` is the document that was sent. Nothing else
+       * means the change may have been made: every other reason is a change
+       * that was not made.
+       */
+      reason: FailReason | SyncFailure | "not-found" | "not-owner" | "already-claimed" | "already-done" | "owner-unknown" | "unknown";
+      /** The task as it stands now, when known. On a lost claim, task.owner is the winner. With "unknown": the task as it was sent. */
       task?: TaskDoc;
-      /** With a claimed `task`: whether its owner's session is live. False means the task may be claimed. */
+      /** With a claimed `task`: whether its owner's session is live. */
       ownerLive?: boolean;
+      /** With a claimed `task`: where its owner stands. Only "expired" means the task may be claimed. "owner-unknown" is a refused takeover. */
+      ownerPresence?: OwnerPresence | null;
     };
 
 /** A random id colliding with an existing task is a one in 2^40 event; this many tries is plenty. */
@@ -64,7 +82,7 @@ function owns(task: TaskDoc, me: Owner): boolean {
 }
 
 /** A view task without its computed liveness: the document as it is stored. */
-function stored(task: ViewTask): TaskDoc {
+function stored(task: TaskDoc): TaskDoc {
   return {
     v: 0,
     kind: "task",
@@ -147,11 +165,42 @@ async function remember(ctx: Ctx, task: TaskDoc, sha: Sha): Promise<void> {
 }
 
 /**
+ * True when the transport knows nothing left this machine (CONTRACT 4.3,
+ * PublishResult `sent: false`): only then is "offline" proof that the change
+ * was not made.
+ */
+function notSent(result: PublishResult): boolean {
+  return !result.ok && result.sent === false;
+}
+
+/**
+ * The push of `sent` went out and no answer came back (git reports a timeout
+ * or a dropped connection as "offline"). The remote may have taken it. Read the
+ * remote back once: if the change is there, it was made; if someone else's
+ * change is there instead, ours was not (or was replaced at once, which comes
+ * to the same for the caller); anything else stays unknown. A push that is
+ * still in flight on the remote can land after this read, so "not there yet"
+ * is not proof that it never will be: that also stays unknown.
+ */
+async function reconcile(ctx: Ctx, who: Who, sent: TaskDoc, expect: Sha | "absent", made: (now: TaskDoc) => boolean): Promise<TaskResult> {
+  const unknown: TaskResult = { ok: false, reason: "unknown", task: sent };
+  log(ctx.paths, "tasks", `task ${sent.id}: no answer to the push; reading the remote back`);
+  if (await refresh(ctx)) return unknown;
+  const now = await lookup(ctx, sent.id, who.session);
+  if (!now) return unknown;
+  const task = stored(now.task);
+  if (made(task)) return { ok: true, task, confirmed: "read-back" };
+  if (now.sha === expect) return unknown; // unchanged so far; our push may still land
+  return { ok: false, reason: "lost-race", task, ownerLive: now.task.ownerLive, ownerPresence: now.task.ownerPresence };
+}
+
+/**
  * Replaces the task with `next` if it is still at `expect`. When it is not,
  * someone changed it first: nothing is overwritten and the result carries the
- * task as it is now.
+ * task as it is now. `made` says whether a task read back from the remote
+ * already shows the change, for a push whose answer was lost.
  */
-async function swap(ctx: Ctx, who: Who, next: TaskDoc, expect: Sha): Promise<TaskResult> {
+async function swap(ctx: Ctx, who: Who, next: TaskDoc, expect: Sha, made: (now: TaskDoc) => boolean): Promise<TaskResult> {
   const published = await ctx.transport.publish(taskRef(next.id), next, expect);
   if (published.ok) {
     // What was published is the normalized document; hand back the same thing.
@@ -159,11 +208,14 @@ async function swap(ctx: Ctx, who: Who, next: TaskDoc, expect: Sha): Promise<Tas
     await remember(ctx, task, published.sha);
     return { ok: true, task };
   }
+  if (published.reason === "offline" && !notSent(published)) return reconcile(ctx, who, next, expect, made);
   if (published.reason !== "lost-race") return { ok: false, reason: published.reason };
 
   await refresh(ctx); // if this fails, the task below is the best we know
   const now = await lookup(ctx, next.id, who.session);
-  return now ? { ok: false, reason: "lost-race", task: stored(now.task), ownerLive: now.task.ownerLive } : { ok: false, reason: "lost-race" };
+  return now
+    ? { ok: false, reason: "lost-race", task: stored(now.task), ownerLive: now.task.ownerLive, ownerPresence: now.task.ownerPresence }
+    : { ok: false, reason: "lost-race" };
 }
 
 /**
@@ -180,16 +232,34 @@ function settle(result: TaskResult, wanted: (now: TaskDoc) => boolean): TaskResu
   return result;
 }
 
-/** Creates an open task with a fresh id. Throws a UsageError when the title is empty. */
-export async function addTask(ctx: Ctx, title: string, who: Who): Promise<TaskResult> {
+/** The same creation: the same title by the same clone. A rerun of `task add --id` from another session of the clone counts. */
+function sameCreation(a: TaskDoc, b: TaskDoc): boolean {
+  return a.id === b.id && a.title === b.title && a.createdBy.actor === b.createdBy.actor;
+}
+
+/**
+ * Creates an open task. Throws a UsageError when the title is empty.
+ *
+ * With `id`, the task is created under that id or not at all: when the remote
+ * already holds the same task under it (a rerun after an unknown outcome), the
+ * result is that task, confirmed "existing"; when it holds a different task,
+ * the result is a lost race. Creation is a "must not exist yet" push, so two
+ * runs with one id can never make two tasks. Without `id`, a fresh one is
+ * drawn, and a collision draws another.
+ */
+export async function addTask(ctx: Ctx, title: string, who: Who, opts: { id?: string } = {}): Promise<TaskResult> {
   const clean = cleanText(title, LIMITS.taskTitle);
   if (!clean) throw new UsageError("a task needs a title");
+  // Reach the remote first, so that "could not reach it" can only mean that nothing was sent.
+  const failed = await refresh(ctx);
+  if (failed === "offline" || failed === "denied") return { ok: false, reason: failed };
+
   const at = ctx.now.toISOString();
   for (let attempt = 0; attempt < ADD_ATTEMPTS; attempt++) {
     const task: TaskDoc = {
       v: 0,
       kind: "task",
-      id: newId(),
+      id: opts.id ?? newId(),
       title: clean,
       status: "open",
       owner: null,
@@ -202,16 +272,27 @@ export async function addTask(ctx: Ctx, title: string, who: Who): Promise<TaskRe
       await remember(ctx, task, published.sha);
       return { ok: true, task };
     }
+    if (published.reason === "offline" && !notSent(published)) return reconcile(ctx, who, task, "absent", (now) => sameCreation(now, task));
     if (published.reason !== "lost-race") return { ok: false, reason: published.reason };
+    if (opts.id !== undefined) {
+      // The id is taken. By this very task, from an earlier run whose answer was lost?
+      await refresh(ctx);
+      const now = await lookup(ctx, task.id, who.session);
+      if (!now) return { ok: false, reason: "lost-race" };
+      const existing = stored(now.task);
+      return sameCreation(existing, task) ? { ok: true, task: existing, confirmed: "existing" } : { ok: false, reason: "lost-race", task: existing };
+    }
     // That id exists already. Try another.
   }
   return { ok: false, reason: "lost-race" };
 }
 
 /**
- * Open tasks can be claimed, and so can claimed tasks whose owner session is
- * no longer live. Claiming a task this session already holds succeeds and
- * changes nothing.
+ * Open tasks can be claimed, and so can claimed tasks whose owner session has
+ * expired (view.ts, OwnerPresence): activity-based reclamation, not an
+ * execution lock. An owner that cannot be seen either way is never taken as
+ * gone: that is "owner-unknown". Claiming a task this session already holds
+ * succeeds and changes nothing.
  */
 export async function claimTask(ctx: Ctx, id: string, who: Who): Promise<TaskResult> {
   const me = ownerOf(ctx, who);
@@ -226,11 +307,14 @@ export async function claimTask(ctx: Ctx, id: string, who: Who): Promise<TaskRes
   if (task.status === "done") return { ok: false, reason: "already-done", task };
   if (task.status === "claimed") {
     if (owns(task, me)) return { ok: true, task };
-    if (found.task.ownerLive) return { ok: false, reason: "already-claimed", task, ownerLive: true };
-    // Claimed, but by a session that is gone: it may be claimed again.
+    const presence = found.task.ownerPresence;
+    if (presence === "live") return { ok: false, reason: "already-claimed", task, ownerLive: true, ownerPresence: presence };
+    if (presence !== "expired") return { ok: false, reason: "owner-unknown", task, ownerLive: false, ownerPresence: "unknown" };
+    // Claimed, but by a session that has expired: it may be claimed again.
   }
-  const claimed = await swap(ctx, who, { ...task, status: "claimed", owner: me, updatedAt: ctx.now.toISOString() }, found.sha);
-  return settle(claimed, (now) => now.status === "claimed" && owns(now, me));
+  const mine = (now: TaskDoc): boolean => now.status === "claimed" && owns(now, me);
+  const claimed = await swap(ctx, who, { ...task, status: "claimed", owner: me, updatedAt: ctx.now.toISOString() }, found.sha, mine);
+  return settle(claimed, mine);
 }
 
 /**
@@ -247,8 +331,10 @@ export async function finishTask(ctx: Ctx, id: string, who: Who): Promise<TaskRe
   if (!found) return { ok: false, reason: "not-found" };
   const task = stored(found.task);
   if (task.status === "done") return { ok: false, reason: "already-done", task };
-  if (task.status === "claimed" && !owns(task, me)) return { ok: false, reason: "not-owner", task, ownerLive: found.task.ownerLive };
-  const finished = await swap(ctx, who, { ...task, status: "done", owner: me, updatedAt: ctx.now.toISOString() }, found.sha);
+  if (task.status === "claimed" && !owns(task, me)) {
+    return { ok: false, reason: "not-owner", task, ownerLive: found.task.ownerLive, ownerPresence: found.task.ownerPresence };
+  }
+  const finished = await swap(ctx, who, { ...task, status: "done", owner: me, updatedAt: ctx.now.toISOString() }, found.sha, (now) => now.status === "done" && owns(now, me));
   return settle(finished, () => false);
 }
 
@@ -263,7 +349,8 @@ export async function dropTask(ctx: Ctx, id: string, who: Who): Promise<TaskResu
   const task = stored(found.task);
   if (task.status === "done") return { ok: false, reason: "already-done", task };
   if (task.status === "open") return { ok: true, task };
-  if (!owns(task, me)) return { ok: false, reason: "not-owner", task, ownerLive: found.task.ownerLive };
-  const dropped = await swap(ctx, who, { ...task, status: "open", owner: null, updatedAt: ctx.now.toISOString() }, found.sha);
-  return settle(dropped, (now) => now.status === "open");
+  if (!owns(task, me)) return { ok: false, reason: "not-owner", task, ownerLive: found.task.ownerLive, ownerPresence: found.task.ownerPresence };
+  const reopened = (now: TaskDoc): boolean => now.status === "open";
+  const dropped = await swap(ctx, who, { ...task, status: "open", owner: null, updatedAt: ctx.now.toISOString() }, found.sha, reopened);
+  return settle(dropped, reopened);
 }

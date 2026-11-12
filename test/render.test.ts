@@ -441,8 +441,11 @@ test("delta: a changed intent, branch or claim also counts; file order does not"
 test("delta: a session that left is named, a session that arrived is listed", () => {
   const first = renderBriefing(teamView());
 
+  // bob's clone says his session is over: its document is readable and the session is not in it.
+  // (A deleted actor ref would leave his presence unknown, and his claim would stay taken.)
   const bobGone = teamViewWith((cache) => {
-    delete cache.refs["refs/huddle/actors/bobb2222"];
+    const doc = cache.refs["refs/huddle/actors/bobb2222"]?.doc;
+    if (doc?.kind === "actor") doc.sessions = [];
   });
   const afterBob = renderBriefing(bobGone, { since: first.seen });
   // bob's claim on "Fix the login redirect" went stale with him, so the task summary moved too.
