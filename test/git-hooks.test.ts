@@ -348,7 +348,7 @@ test("git install: a clone with no hooks gets four files that hold nothing but t
   const result = await install(alice);
   assert.deepEqual(result.changed, GIT_HOOKS.map((hook) => `.git/hooks/${hook}`));
   assert.equal(result.notes.length, 3);
-  assert.match(result.notes[0] ?? "", /each teammate runs huddle init once in their own clone/);
+  assert.match(result.notes[0] ?? "", /each teammate runs huddle init --agent git once in their own clone/);
   assert.equal(result.notes[1], "The git hooks run .huddle/huddle.mjs from whatever is checked out, also right after a checkout or a merge. Checking out a branch you do not trust runs its copy.");
   // Without node the hooks are silent by design, so this is the only place anyone hears of it.
   assert.equal(result.notes[2], NODE_NOTE);
@@ -675,14 +675,14 @@ test("git install: a hook manager that rewrites its files is pointed out", { ski
 test("git check: says what is missing, changed, switched off or pointing nowhere", { skip: !POSIX }, async (t) => {
   const b = await bench(t);
   const alice = await b.h.clone("alice");
-  assert.deepEqual(await checkGitHooks(alice.dir), { installed: false, detail: "no huddle git hooks in .git/hooks. Run huddle init.", notes: [] });
+  assert.deepEqual(await checkGitHooks(alice.dir), { installed: false, detail: "no huddle git hooks in .git/hooks. Run huddle init --agent git.", notes: [] });
 
   await install(alice);
   // Never installed is one thing; there and not able to work is `broken`, which doctor warns about.
   assert.deepEqual(await checkGitHooks(alice.dir), {
     installed: false,
     broken: true,
-    detail: "git hooks in .git/hooks run .huddle/huddle.mjs, which is not in this checkout. Run huddle init.",
+    detail: "git hooks in .git/hooks run .huddle/huddle.mjs, which is not in this checkout. Run huddle init --agent git.",
     notes: [],
   });
   await withRecorder(alice);
@@ -694,7 +694,7 @@ test("git check: says what is missing, changed, switched off or pointing nowhere
   assert.deepEqual(await checkGitHooks(alice.dir), {
     installed: false,
     broken: true,
-    detail: "huddle git hooks in .git/hooks are missing for post-merge and not what this version installs for pre-commit. Run huddle init.",
+    detail: "huddle git hooks in .git/hooks are missing for post-merge and not what this version installs for pre-commit. Run huddle init --agent git.",
     notes: [],
   });
   assert.deepEqual((await install(alice)).changed, [".git/hooks/pre-commit", ".git/hooks/post-merge"], "init repairs both");
@@ -731,7 +731,7 @@ test("git check: says what is missing, changed, switched off or pointing nowhere
   assert.deepEqual(await checkGitHooks(alice.dir), {
     installed: false,
     broken: true,
-    detail: "huddle git hooks in .git/hooks are not what this version installs for post-commit. Run huddle init.",
+    detail: "huddle git hooks in .git/hooks are not what this version installs for post-commit. Run huddle init --agent git.",
     notes: [],
   });
   assert.deepEqual((await install(alice)).changed, [".git/hooks/post-commit"], "init makes them one");
@@ -747,7 +747,7 @@ test("git install: moving the bundle updates the one block in each hook", { skip
   assert.deepEqual(moved.changed, GIT_HOOKS.map((hook) => `.git/hooks/${hook}`));
   assert.equal(await readFile(hookFile(alice, "pre-commit"), "utf8"), USER_HOOK.replace("#!/bin/sh\n", `#!/bin/sh\n${hookBlock("pre-commit", "tools/huddle.mjs", false)}`));
   assert.equal(await readFile(hookFile(alice, "post-commit"), "utf8"), `#!/bin/sh\n${hookBlock("post-commit", "tools/huddle.mjs", true)}`);
-  assert.equal((await checkGitHooks(alice.dir)).detail, "git hooks in .git/hooks run tools/huddle.mjs, which is not in this checkout. Run huddle init.");
+  assert.equal((await checkGitHooks(alice.dir)).detail, "git hooks in .git/hooks run tools/huddle.mjs, which is not in this checkout. Run huddle init --agent git.");
 });
 
 // ---------------------------------------------------------------------------
@@ -910,7 +910,7 @@ test("git install: a linked worktree shares the clone's hooks, and each worktree
   // The main checkout is on a branch without the bundle: its commits go through, and huddle stays out.
   ok(await commitFile(b, alice, "in main.txt"));
   assert.equal(b.records().length, 2);
-  assert.equal((await checkGitHooks(alice.dir)).detail, "git hooks in .git/hooks run .huddle/huddle.mjs, which is not in this checkout. Run huddle init.");
+  assert.equal((await checkGitHooks(alice.dir)).detail, "git hooks in .git/hooks run .huddle/huddle.mjs, which is not in this checkout. Run huddle init --agent git.");
 });
 
 // ---------------------------------------------------------------------------
