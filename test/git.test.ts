@@ -7,7 +7,7 @@ import { delimiter, join, resolve } from "node:path";
 import { test } from "node:test";
 import type { TestContext } from "node:test";
 import { STOP_GRACE_MS, endRunningGits, git, GitError, gitEnv, gitOut, hardenSshCommand } from "../src/core/git.ts";
-import { createHarness } from "./harness.ts";
+import { createHarness, posixOnly } from "./harness.ts";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -121,7 +121,7 @@ test("git status through the wrapper does not rewrite the index", async (t) => {
   assert.notEqual(await hash(), before, "control: a plain git status should have refreshed the index");
 });
 
-test("a call that outlives its timeout is killed along with its children", async (t) => {
+test("a call that outlives its timeout is killed along with its children", posixOnly("sh, sleep and $! (an MSYS pid on Windows); the Node test below covers Windows"), async (t) => {
   const h = await createHarness(t);
   const clone = await h.clone("alice");
   const pidFile = join(h.root, "child.pid");
@@ -140,6 +140,40 @@ test("a call that outlives its timeout is killed along with its children", async
   assert.ok(pid > 0);
   for (let i = 0; i < 20 && alive(pid); i++) await sleep(50);
   assert.equal(alive(pid), false, "the grandchild survived the timeout");
+});
+
+test("a call that outlives its timeout is killed along with its children: Node grandchild, every platform", async (t) => {
+  const h = await createHarness(t);
+  const clone = await h.clone("alice");
+  const pidFile = join(h.root, "grandchild.pid");
+  // git runs the alias, which runs node, which starts another node that would sleep for 30 s: a grandchild of git,
+  // like ssh or a credential helper. On Windows git.exe is itself a launcher, so this is one level deeper still.
+  const hang = join(h.root, "hang.mjs");
+  await writeFile(
+    hang,
+    [
+      'import { spawn } from "node:child_process";',
+      'import { writeFileSync } from "node:fs";',
+      'const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { stdio: "ignore" });',
+      `writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));`,
+      "setTimeout(() => {}, 30000);",
+      "",
+    ].join("\n"),
+  );
+  // Git for Windows runs a "!" alias with its own sh too, which takes forward slashes; each path is one quoted word.
+  const word = (path: string) => `'${path.replace(/\\/g, "/").replace(/'/g, `'\\''`)}'`;
+  const started = Date.now();
+  const r = await git(["-c", `alias.hang=!${word(process.execPath)} ${word(hang)}`, "hang"], { cwd: clone.dir, timeoutMs: 3000 });
+  const elapsed = Date.now() - started;
+  assert.equal(r.timedOut, true, r.stderr);
+  assert.equal(r.ok, false);
+  assert.ok(elapsed < 8000, `returned after ${elapsed} ms`);
+
+  const pid = Number((await readFile(pidFile, "utf8")).trim());
+  assert.ok(pid > 0);
+  for (let i = 0; i < 60 && alive(pid); i++) await sleep(50);
+  assert.equal(alive(pid), false, "the grandchild survived the timeout");
+  // And the clone can be removed: on Windows a survivor would hold its directory open (EBUSY).
 });
 
 // ---------------------------------------------------------------------------
@@ -194,7 +228,7 @@ async function standIn(dir: string, trap: string, ...body: string[]) {
 
 const POSIX = process.platform !== "win32";
 
-test("a git that does not stop on SIGTERM is killed STOP_GRACE_MS after it", { skip: !POSIX }, async (t) => {
+test("a git that does not stop on SIGTERM is killed STOP_GRACE_MS after it", posixOnly("signals to a process group (process.kill(-pid)), which Windows does not have"), async (t) => {
   const h = await createHarness(t);
   const sent = groupSignals(t);
   // A git that is stuck where a signal cannot reach it is the same thing as one that ignores SIGTERM. So is its child.
@@ -228,7 +262,7 @@ test("a git that does not stop on SIGTERM is killed STOP_GRACE_MS after it", { s
   assert.ok(waited >= STOP_GRACE_MS - 1, `SIGKILL came ${Math.round(waited)} ms after SIGTERM`);
 });
 
-test("a git that stops on SIGTERM gets the time to, and no SIGKILL: not before it is done, and not after it is gone", { skip: !POSIX }, async (t) => {
+test("a git that stops on SIGTERM gets the time to, and no SIGKILL: not before it is done, and not after it is gone", posixOnly("signals to a process group (process.kill(-pid)), which Windows does not have"), async (t) => {
   const h = await createHarness(t);
   const sent = groupSignals(t);
   // Like git removing its lock files: it takes a moment, and then it exits by itself. Its child goes with the group.
@@ -257,7 +291,7 @@ test("a git that stops on SIGTERM gets the time to, and no SIGKILL: not before i
   );
 });
 
-test("endRunningGits ends the calls that are still running the way a timeout does, and leaves the ones that are done alone", { skip: !POSIX }, async (t) => {
+test("endRunningGits ends the calls that are still running the way a timeout does, and leaves the ones that are done alone", posixOnly("signals to a process group (process.kill(-pid)), which Windows does not have"), async (t) => {
   const h = await createHarness(t);
   const sent = groupSignals(t);
 

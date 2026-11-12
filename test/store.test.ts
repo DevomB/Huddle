@@ -302,7 +302,7 @@ describe("local.json", () => {
     assert.deepEqual(await leftovers(paths), []);
   });
 
-  test("an update that changes nothing does not rewrite the file", { skip: process.platform === "win32" }, async () => {
+  test("an update that changes nothing does not rewrite the file", { skip: process.platform === "win32" ? "POSIX-only: inode numbers, which Windows stat() does not keep across a rename" : false }, async () => {
     const paths = await makePaths();
     await touchSession(paths, { id: "s1", worktree: paths.worktree });
     const inode = (await stat(paths.localFile)).ino;

@@ -415,6 +415,36 @@ describe("transport exit test", () => {
     assert.equal(remoteRef(h, taskRef("expectnone")), null);
   });
 
+  test("a remote that never answers: offline at the timeout, and the stand-in for ssh does not survive (Node, every platform)", async () => {
+    const olga = await h.clone("olga");
+    const pidFile = join(h.root, "node-ssh.pid");
+    const fakeSsh = join(h.root, "node-ssh-hang.mjs");
+    writeFileSync(
+      fakeSsh,
+      `import { appendFileSync } from "node:fs";\nappendFileSync(${JSON.stringify(pidFile)}, process.pid + "\\n");\nsetTimeout(() => {}, 60000);\n`,
+    );
+    // Git for Windows runs core.sshCommand with its own sh, which takes forward slashes; each path is one quoted word.
+    const word = (path: string) => `'${path.replace(/\\/g, "/").replace(/'/g, `'\\''`)}'`;
+    sh(olga.dir, ["remote", "add", "hang", "ssh://git@huddle.invalid/team/repo.git"]);
+    sh(olga.dir, ["config", "core.sshCommand", `${word(process.execPath)} ${word(fakeSsh)}`]);
+    const timeoutMs = 2500;
+    const hang = transportFor(olga.dir, { remote: "hang", timeoutMs });
+    for (const [name, call] of [
+      ["publish own", () => hang.publish(actorRef("oooooooo"), actorDoc("oooooooo"), "own")],
+      ["fetchAll", () => hang.fetchAll(new Map())],
+    ] as const) {
+      const started = Date.now();
+      assert.deepEqual(await call(), { ok: false, reason: "offline" }, name);
+      const took = Date.now() - started;
+      assert.ok(took >= timeoutMs - 100 && took < timeoutMs + 8000, `${name} took ${took} ms`);
+    }
+    const pids = readFileSync(pidFile, "utf8").split("\n").filter(Boolean).map(Number);
+    assert.equal(pids.length, 2, "ssh was started once per call");
+    const deadline = Date.now() + 5000;
+    while (pids.some(alive) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.deepEqual(pids.filter(alive), [], "a stand-in for ssh outlived its call");
+  });
+
   test("an unreachable remote returns offline within the timeout", { skip: posixOnly }, async (t) => {
     assert.equal(NETWORK_TIMEOUT_MS, 10_000, "plan.md §3: every network call has a 10 s timeout");
     const eve = await h.clone("eve");
