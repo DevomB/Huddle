@@ -635,7 +635,8 @@ describe("transport against awkward remotes and clones", () => {
     const a = transportFor(alice.dir);
     const refsBefore = remoteRefs(h);
     const main = remoteRef(h, "refs/heads/main")!;
-    const denied = { ok: false, reason: "denied" };
+    // Refused before anything is sent, and the result says so (sent: false): a caller may report "nothing changed".
+    const denied = { ok: false, reason: "denied", sent: false };
     // Never outside refs/huddle/, whatever the caller passes.
     assert.deepEqual(await a.publish("refs/heads/main", actorDoc("aaaaaaaa"), "own"), denied);
     assert.deepEqual(await a.remove("refs/heads/main", main), denied);
@@ -653,11 +654,12 @@ describe("transport against awkward remotes and clones", () => {
     const offline = { ok: false, reason: "offline" };
     const optionRemote = transportFor(alice.dir, { remote: "--upload-pack=touch /tmp/huddle-pwned" });
     assert.deepEqual(await optionRemote.fetchAll(new Map()), offline);
-    assert.deepEqual(await optionRemote.publish(actorRef("aaaaaaaa"), actorDoc("aaaaaaaa"), "own"), offline);
+    assert.deepEqual(await optionRemote.publish(actorRef("aaaaaaaa"), actorDoc("aaaaaaaa"), "own"), { ...offline, sent: false });
     const notARepo = join(h.root, "not-a-repo");
     mkdirSync(notARepo, { recursive: true });
     const nowhere = createTransport({ cwd: notARepo, remote: "origin" });
-    assert.deepEqual(await nowhere.publish(actorRef("aaaaaaaa"), actorDoc("aaaaaaaa"), "own"), offline);
+    // The document commit cannot even be built there: nothing was sent.
+    assert.deepEqual(await nowhere.publish(actorRef("aaaaaaaa"), actorDoc("aaaaaaaa"), "own"), { ...offline, sent: false });
     assert.deepEqual(await nowhere.fetchAll(new Map()), offline);
     assert.deepEqual(await nowhere.remove(actorRef("aaaaaaaa"), main), offline);
     assert.equal(remoteRefs(h), refsBefore, "the remote is untouched");
