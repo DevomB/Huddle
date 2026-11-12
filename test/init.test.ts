@@ -196,7 +196,12 @@ test("init never overwrites an existing config; flags change only the keys they 
   await clone.write(".huddle/config.json", "{ broken");
   const broken = await clone.huddle(["init", "--remote", "origin"]);
   assert.equal(broken.code, 1);
-  assert.match(broken.stderr, /not valid JSON/);
+  assert.match(broken.stderr, /config\.json is not a JSON object/);
+  assert.equal(await clone.read(".huddle/config.json"), "{ broken", "a config init cannot read is left as it is");
+
+  await clone.write(".huddle/config.json", "[1, 2]");
+  assert.equal((await clone.huddle(["init", "--no-capture-intent"])).code, 1);
+  assert.equal(await clone.read(".huddle/config.json"), "[1, 2]");
 });
 
 test("init --no-capture-intent on a fresh repo writes captureIntent false", async (t) => {

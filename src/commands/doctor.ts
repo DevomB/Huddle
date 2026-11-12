@@ -35,9 +35,13 @@ interface Check {
 
 const check = (name: string, level: Level, detail: string, notes: string[] = []): Check => ({ name, level, detail, notes });
 
-/** A remote URL with any embedded credentials removed: doctor output gets pasted into issues. */
-export function redactUrl(url: string): string {
-  return url.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/@\s]+@/i, "$1***@");
+/**
+ * Text with the credentials taken out of any URL in it (`https://user:token@host/…`).
+ * Doctor output gets pasted into issues and chat, and both a remote URL and
+ * git's own error messages can carry a token.
+ */
+export function redactUrl(text: string): string {
+  return text.replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^/@\s'"]+@/gi, "$1***@");
 }
 
 function formatAge(ms: number): string {
@@ -48,9 +52,18 @@ function formatAge(ms: number): string {
   return `${Math.floor(seconds / 86400)}d ago`;
 }
 
-function lastLine(text: string): string {
-  const lines = text.trim().split("\n").filter(Boolean);
-  return (lines[lines.length - 1] ?? "").trim();
+/**
+ * What git said went wrong, on one line. After a failed ssh connection git
+ * ends with a two-line hint about access rights that says nothing about the
+ * cause; the cause is in the lines before it (ssh's own message, "fatal: ...").
+ */
+function gitReason(stderr: string): string {
+  const lines = stderr
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "" && !/^Please make sure you have the correct access rights$|^and the repository exists\.$/.test(line));
+  const text = redactUrl(lines.join(" / "));
+  return text.length > 300 ? `${text.slice(0, 300)}...` : text;
 }
 
 async function readText(file: string): Promise<string | null> {
@@ -120,7 +133,7 @@ async function remote(ctx: Ctx): Promise<Check[]> {
   const listed = await git(["ls-remote", c.remote, REF_PATTERN], { cwd: paths.worktree, network: true });
   const took = `${((Date.now() - started) / 1000).toFixed(1)} s`;
   if (!listed.ok) {
-    const why = listed.timedOut ? `no answer within ${took}` : lastLine(listed.stderr) || `git ls-remote exited ${listed.code}`;
+    const why = listed.timedOut ? `no answer within ${took}` : gitReason(listed.stderr) || `git ls-remote exited ${listed.code}`;
     return [
       check("remote", "fail", `cannot reach remote "${c.remote}" (${shown}): ${why}`, [
         "huddle never prompts for credentials. Make sure `git ls-remote " + c.remote + "` works without asking for a password (ssh agent, or a credential helper for HTTPS).",
@@ -130,28 +143,60 @@ async function remote(ctx: Ctx): Promise<Check[]> {
   const refs = listed.stdout.split("\n").filter(Boolean).length;
   const checks = [check("remote", "ok", `remote "${c.remote}" (${shown}) answered in ${took}; ${refs} huddle ref${refs === 1 ? "" : "s"} on it`)];
 
-  // Push access is tested by really pushing this clone's own document, which is
-  // the only way to know: rulesets and push rules are enforced server-side.
-  const local = await readLocal(paths);
-  const doc = toActorDoc(ctx.identity, local.sessions, ctx.now, c.ttlMinutes);
-  const ref = actorRef(ctx.identity.actor);
-  const pushed = await ctx.transport.publish(ref, doc, "own");
-  if (pushed.ok) {
-    // A clone with nothing to announce that never published leaves no trace behind.
-    if (doc.sessions.length === 0 && local.published === null) await ctx.transport.remove(ref, pushed.sha);
-    checks.push(check("push", "ok", "can push to refs/huddle/* on this remote"));
-  } else if (pushed.reason === "offline") {
-    checks.push(check("push", "fail", "the remote stopped answering during the push test", ["try again; if it keeps happening the remote is slow or flaky"]));
-  } else {
+  // huddle lists and fetches from the remote's URL and pushes to its push URL.
+  const pushUrl = await git(["remote", "get-url", "--push", c.remote], { cwd: paths.worktree });
+  if (pushUrl.ok && pushUrl.stdout.trim() !== url.stdout.trim()) {
     checks.push(
-      check("push", "fail", `the remote refused a push to refs/huddle/* (${pushed.reason})`, [
-        "huddle stores its state in refs under refs/huddle/ on this remote, so everyone on the team needs to be able to push there.",
-        "Usual causes: read-only access to the repo; a fork instead of the shared repo; a ruleset or push rule that restricts which ref names may be created (GitHub organization rulesets, GitLab push rules, Bitbucket branch restrictions).",
-        `Check by hand with: git push ${c.remote} HEAD:refs/huddle/probe && git push ${c.remote} :refs/huddle/probe`,
+      check("remote", "info", `pushes go to a different URL: ${redactUrl(pushUrl.stdout.trim())}`, [
+        "that is fine when both URLs are the same repository (ssh for push, https for fetch). If they are different repositories, teammates will never see what this clone publishes.",
       ]),
     );
   }
+
+  checks.push(await pushAccess(ctx));
   return checks;
+}
+
+/**
+ * Push access is tested by really pushing this clone's own document, which is
+ * the only way to know: rulesets and push rules are enforced on the server.
+ * Two pushes, because creating a ref and replacing one are separate
+ * permissions and huddle needs both: every update of a document is a forced,
+ * non-fast-forward push.
+ */
+async function pushAccess(ctx: Ctx): Promise<Check> {
+  const { paths, config: c, transport } = ctx;
+  const local = await readLocal(paths);
+  const doc = toActorDoc(ctx.identity, local.sessions, ctx.now, c.ttlMinutes);
+  const ref = actorRef(ctx.identity.actor);
+  const byHand = `Check by hand with: git push ${c.remote} HEAD:refs/huddle/probe && git push ${c.remote} :refs/huddle/probe`;
+
+  const first = await transport.publish(ref, { ...doc, updatedAt: new Date(ctx.now.getTime() - 1).toISOString() }, "own");
+  if (!first.ok && first.reason === "offline") {
+    return check("push", "fail", "the remote stopped answering during the push test", ["try again; if it keeps happening the remote is slow or flaky", `details are in ${paths.logFile}`]);
+  }
+  if (!first.ok) {
+    return check("push", "fail", `the remote refused a push to refs/huddle/* (${first.reason})`, [
+      "huddle stores its state in refs under refs/huddle/ on this remote, so everyone on the team needs to be able to push there.",
+      "Usual causes: read-only access to the repo; a fork instead of the shared repo; a ruleset or push rule that restricts which ref names may be created (GitHub organization rulesets, GitLab push rules, Bitbucket branch restrictions).",
+      byHand,
+      `git's own message is in ${paths.logFile}`,
+    ]);
+  }
+
+  const second = await transport.publish(ref, doc, "own");
+  // A clone with nothing to announce that never published leaves no trace behind.
+  const leaveNoTrace = doc.sessions.length === 0 && local.published === null;
+  if (leaveNoTrace) await transport.remove(ref, second.ok ? second.sha : first.sha);
+  if (second.ok) return check("push", "ok", "can create and replace refs under refs/huddle/ on this remote");
+  if (second.reason === "offline") {
+    return check("push", "fail", "the remote stopped answering during the push test", ["try again; if it keeps happening the remote is slow or flaky", `details are in ${paths.logFile}`]);
+  }
+  return check("push", "fail", `the remote accepts new refs under refs/huddle/ but refuses to replace them (${second.reason})`, [
+    "huddle replaces a document by force-pushing its ref, so the remote must allow non-fast-forward updates under refs/huddle/.",
+    "Usual causes: a server-side hook that rejects forced updates for every ref instead of only for branches; a per-ref permission that allows creating but not force-pushing (Gerrit's Force Push). git's own receive.denyNonFastForwards is not the cause: it only covers refs/heads/.",
+    `git's own message is in ${paths.logFile}`,
+  ]);
 }
 
 async function hooks(ctx: Ctx): Promise<Check[]> {
@@ -193,7 +238,7 @@ async function state(ctx: Ctx): Promise<Check[]> {
   const log = await readText(ctx.paths.logFile);
   const failures = (log ?? "").split("\n").filter((line) => /fail|error|denied|offline/i.test(line));
   const recent = failures[failures.length - 1];
-  checks.push(check("log", "info", ctx.paths.logFile, recent ? [`last problem logged: ${recent.slice(0, 300)}`] : []));
+  checks.push(check("log", "info", ctx.paths.logFile, recent ? [`last problem logged: ${redactUrl(recent).slice(0, 300)}`] : []));
   return checks;
 }
 

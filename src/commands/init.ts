@@ -79,10 +79,32 @@ export async function run(args: string[], io: Io): Promise<number> {
   );
   if (positionals.length > 0) throw new UsageError(`unexpected argument "${positionals[0]}"\nUsage: ${USAGE}`);
 
+  // Everything that can be refused is checked before the first file is written.
+  const requested: Record<string, unknown> = {};
+  if (values.remote !== undefined) {
+    if (mergeConfig({ remote: values.remote }).remote !== values.remote) {
+      throw new UsageError(`"${values.remote}" is not a remote name. Use the name of a configured git remote, such as origin.`);
+    }
+    requested.remote = values.remote;
+  }
+  if (values["no-capture-intent"]) requested.captureIntent = false;
+  const chosen = chooseAdapters(values.agent ?? [], values.all === true);
+
   const paths = await requireRepo(io.cwd);
   const repoRoot = paths.worktree;
   const changed: string[] = [];
   const notes: string[] = [];
+  const existingConfig = await readText(paths.teamConfigFile);
+  let currentConfig: Record<string, unknown> | null = null;
+  if (existingConfig !== null && Object.keys(requested).length > 0) {
+    try {
+      const parsed: unknown = JSON.parse(existingConfig);
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error("not an object");
+      currentConfig = parsed as Record<string, unknown>;
+    } catch {
+      throw new CliError(`${CONFIG} is not a JSON object; fix or delete it and run init again`);
+    }
+  }
 
   // 1. The bundle. Vendoring it pins the whole team to one protocol version.
   const vendored = await vendorBundle(paths, io);
@@ -94,27 +116,12 @@ export async function run(args: string[], io: Io): Promise<number> {
     changed.push(ATTRIBUTES);
   }
 
-  // 2. Team config. Written once with every default spelled out; never overwritten.
-  const requested: Record<string, unknown> = {};
-  if (values.remote !== undefined) {
-    if (mergeConfig({ remote: values.remote }).remote !== values.remote) {
-      throw new UsageError(`"${values.remote}" is not a remote name. Use the name of a configured git remote, such as origin.`);
-    }
-    requested.remote = values.remote;
-  }
-  if (values["no-capture-intent"]) requested.captureIntent = false;
-  const existingConfig = await readText(paths.teamConfigFile);
+  // 2. Team config. Written once with every default spelled out; afterwards only the keys asked for change.
   if (existingConfig === null) {
     await writeFile(paths.teamConfigFile, JSON.stringify(mergeConfig(DEFAULT_CONFIG, requested), null, 2) + "\n");
     changed.push(CONFIG);
-  } else if (Object.keys(requested).length > 0) {
-    let current: unknown;
-    try {
-      current = JSON.parse(existingConfig);
-    } catch {
-      throw new CliError(`${CONFIG} is not valid JSON; fix or delete it and run init again`);
-    }
-    const next = JSON.stringify({ ...(current as Record<string, unknown>), ...requested }, null, 2) + "\n";
+  } else if (currentConfig !== null) {
+    const next = JSON.stringify({ ...currentConfig, ...requested }, null, 2) + "\n";
     if (next !== existingConfig) {
       await writeFile(paths.teamConfigFile, next);
       changed.push(CONFIG);
@@ -127,7 +134,6 @@ export async function run(args: string[], io: Io): Promise<number> {
   changed.push(...agentsMd.changed);
 
   // 4. Hook adapters: the ones asked for, or the ones that detect themselves.
-  const chosen = chooseAdapters(values.agent ?? [], values.all === true);
   const installed: string[] = [];
   for (const adapter of chosen ?? ADAPTERS) {
     try {
