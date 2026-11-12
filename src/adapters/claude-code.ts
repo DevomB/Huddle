@@ -10,16 +10,30 @@
 //   SessionStart        session-start   timeout 10
 //   UserPromptSubmit    prompt          timeout 5
 //   PreToolUse          pre-edit        timeout 5, matcher: the file-editing tools
-//   PostToolUse         post-edit       timeout 5, async, every tool
+//   PostToolUse         post-edit       timeout 5, async, every tool but Read, Grep and Glob
 //   Stop                turn-end        timeout 5
 //   SessionEnd          session-end     timeout 5
 //
-// PostToolUse has no matcher on purpose. It is the session's heartbeat: a
+// PostToolUse is the session's heartbeat, not only a record of edits: a
 // session that only runs shell commands still shows as live, and a shell
-// command can edit files too. It is async so that no tool call waits for it.
+// command can edit files too. It leaves out the three tools that cannot
+// change a file and that agents call in bursts, each of which would start a
+// node process for nothing. It is async so that no tool call waits for it,
+// and Claude Code does not enforce `timeout` on an async hook: for that one
+// registration the only deadline is the engine's own.
+//
+// Two things about where Claude Code looks, both from its settings page:
+// - It reads .claude/settings.json from the directory a session starts in,
+//   not from the repository root. A session started in a subdirectory, or
+//   moved with /cd, runs none of these hooks. install() and check() say so.
+// - It reads .claude/settings.local.json from the repository root, and in a
+//   linked worktree from the main checkout's root.
 
+import { exec, execFile } from "node:child_process";
+import { realpath } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
+import { locateRepo } from "../core/paths.ts";
 import { asRecord, asText, checkHooks, clip, contextOutput, exists, installHooks, onPath, readJsonObject } from "./json-hooks.ts";
 import type { HookFile, Json, Registration } from "./json-hooks.ts";
 import { SILENT } from "./types.ts";
@@ -37,11 +51,20 @@ const LOCAL_SETTINGS = ".claude/settings.local.json";
  */
 const EDIT_TOOLS: readonly string[] = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
 
+/**
+ * Every tool except Read, Grep and Glob. A matcher with any character besides
+ * letters, digits, "_", "-", spaces, "," and "|" is a JavaScript regular expression, tested
+ * unanchored against the tool name, so this is a negative lookahead from the
+ * start of the name. Checked on Claude Code 2.1.322: with it the hook ran for
+ * Bash, Write and Edit and not for Read, Grep or Glob.
+ */
+const NOT_READ_ONLY = "^(?!(?:Read|Grep|Glob)$)";
+
 const REGISTRATIONS: readonly Registration[] = [
   { event: "SessionStart", type: "session-start", timeout: 10 },
   { event: "UserPromptSubmit", type: "prompt", timeout: 5 },
   { event: "PreToolUse", type: "pre-edit", timeout: 5, matcher: EDIT_TOOLS.join("|") },
-  { event: "PostToolUse", type: "post-edit", timeout: 5, async: true },
+  { event: "PostToolUse", type: "post-edit", timeout: 5, async: true, matcher: NOT_READ_ONLY },
   { event: "Stop", type: "turn-end", timeout: 5 },
   // SessionEnd hooks share 1.5 s unless a hook asks for longer, and
   // session-end has to finish a sync: the timeout is what buys the time.
@@ -74,17 +97,55 @@ interface Native {
  */
 const MACHINE_PROMPT = /^\s*<[a-z]+(?:-[a-z0-9]+)+[\s>]/;
 
-/** Claude Code puts pasted text between two lines of this shape. The text in between is the user's. */
-const PASTE_MARKER = /^<\/?pasted_content id="[^"]*">$/;
+/**
+ * A paste long enough to collapse in the prompt box ("[Pasted text #1 +12
+ * lines]": over 800 characters or over three lines) arrives expanded, and in
+ * sessions where Claude Code marks pasted text it sits between two lines of
+ * their own:
+ *
+ *   <pasted_content id="k3j9">
+ *   ...what was pasted...
+ *   </pasted_content id="k3j9">
+ *
+ * The id is random and the same on both lines, so that pasted text cannot
+ * close its own block.
+ */
+const PASTE_OPEN = /^<pasted_content(?: id="([^"]*)")?>$/;
+const PASTE_CLOSE = /^<\/pasted_content(?: id="([^"]*)")?>$/;
 
+/**
+ * The part of a prompt that the user typed. The prompt becomes the intent
+ * that is published to the team, and a paste is where secrets, logs and other
+ * people's data come from, so a marked paste is dropped whole: its two marker
+ * lines and everything between them. A block that is never closed by its own
+ * id takes the rest of the prompt with it; losing typed text costs an intent,
+ * keeping pasted text can publish a password.
+ *
+ * What this cannot do: a short paste, and any paste in a session that does
+ * not mark them, carries no marker and reads exactly like typing.
+ */
 function typedPrompt(value: unknown): string {
   if (typeof value !== "string" || MACHINE_PROMPT.test(value)) return "";
   if (!value.includes("pasted_content")) return value.trim();
-  return value
-    .split("\n")
-    .filter((line) => !PASTE_MARKER.test(line.trim()))
-    .join("\n")
-    .trim();
+  const typed: string[] = [];
+  let inPaste = false;
+  let id: string | undefined;
+  for (const line of value.split("\n")) {
+    const text = line.trim();
+    if (inPaste) {
+      const close = PASTE_CLOSE.exec(text);
+      if (close !== null && close[1] === id) inPaste = false;
+      continue;
+    }
+    const open = PASTE_OPEN.exec(text);
+    if (open !== null) {
+      inPaste = true;
+      id = open[1];
+    } else if (!PASTE_CLOSE.test(text)) {
+      typed.push(line); // a closing line with nothing open is Claude Code's too, and goes
+    }
+  }
+  return typed.join("\n").trim();
 }
 
 /** The file an editing tool is about to change, or has changed. Always absolute; backslashes on Windows. */
@@ -240,7 +301,8 @@ const SETTINGS_FILE: HookFile = {
       return typeof script === "string" && /(?:^|[\\/])huddle\.mjs$/.test(script) && verb === "hook" && agent === NAME;
     }
     // Shell form, as an older version or a hand edit might have left it.
-    return typeof handler.command === "string" && /huddle\.mjs["']?\s+hook\s+claude-code(?![\w-])/.test(handler.command);
+    // The file has to be named exactly huddle.mjs: "not-huddle.mjs hook claude-code" is somebody else's.
+    return typeof handler.command === "string" && /(?:^|[\s"'\\/])huddle\.mjs["']?\s+hook\s+claude-code(?![\w-])/.test(handler.command);
   },
   bundleOf(handler) {
     const script = Array.isArray(handler.args) ? asText(handler.args[0]) : "";
@@ -248,12 +310,18 @@ const SETTINGS_FILE: HookFile = {
   },
 };
 
+/** What a teammate has to know for the hooks to run at all. init and doctor print these. */
+const ROOT_NOTE =
+  "Start claude at the root of the checkout. Claude Code reads .claude/settings.json from the directory a session starts in, so a session started in a subdirectory, or moved with /cd, runs none of huddle's hooks and stays invisible to the team.";
+const NODE_NOTE =
+  "Every teammate needs Node 20 or later on the PATH that Claude Code itself sees. If it cannot start node, Claude Code shows a hook error on every event. An app or IDE extension started outside a shell may not see a node installed by nvm, fnm or volta.";
 const TRUST_NOTE =
-  "Claude Code runs a project's hooks only once its workspace trust dialog has been accepted for the folder. Each teammate is asked the first time they start claude in the repo.";
+  "In an interactive session Claude Code runs a project's hooks only once its workspace trust dialog has been accepted for the folder. Each teammate is asked the first time they start claude in the repo.";
+const NOTES: readonly string[] = [ROOT_NOTE, NODE_NOTE, TRUST_NOTE];
 
 async function install(opts: InstallOptions): Promise<InstallResult> {
   const changed = await installHooks(SETTINGS_FILE, opts.repoRoot, opts.bundle);
-  return { changed: changed ? [SETTINGS] : [], notes: [TRUST_NOTE] };
+  return { changed: changed ? [SETTINGS] : [], notes: [...NOTES] };
 }
 
 // ---------------------------------------------------------------------------
@@ -265,17 +333,64 @@ export interface Surroundings {
   env: NodeJS.ProcessEnv;
   home: string;
   platform?: NodeJS.Platform;
+  /** What `claude --version` prints, or null when it cannot be run. Left out: the version is not checked. */
+  claudeVersion?: () => Promise<string | null>;
 }
 
 function here(): Surroundings {
-  return { env: process.env, home: homedir(), platform: process.platform };
+  return { env: process.env, home: homedir(), platform: process.platform, claudeVersion: installedVersion };
+}
+
+/** Asks the claude on the PATH. On Windows it is a .cmd shim, which only a shell can start. */
+function installedVersion(): Promise<string | null> {
+  return new Promise((resolve) => {
+    const done = (error: Error | null, stdout: string): void => resolve(error === null ? stdout.trim() : null);
+    const options = { timeout: 3000, windowsHide: true, encoding: "utf8" } as const;
+    if (process.platform === "win32") exec("claude --version", options, done);
+    else execFile("claude", ["--version"], options, done);
+  });
+}
+
+/** Hooks with `args` (exec form) arrived in this release. An older one does not know the field and cannot run huddle's handlers. */
+const FIRST_WITH_ARGS = [2, 1, 139] as const;
+
+/** A note when the installed Claude Code is too old for the handlers, null when it is new enough or unknown. */
+function tooOldNote(printed: string | null): string | null {
+  const found = /^(\d+)\.(\d+)\.(\d+)/.exec(printed ?? "");
+  if (found === null) return null;
+  for (let part = 0; part < FIRST_WITH_ARGS.length; part++) {
+    const have = Number(found[part + 1]);
+    const need = FIRST_WITH_ARGS[part] ?? 0;
+    if (have > need) return null;
+    if (have < need) {
+      return `Claude Code ${found[0]} on this machine is older than ${FIRST_WITH_ARGS.join(".")}, the first release that can run the hooks huddle installs. Update Claude Code.`;
+    }
+  }
+  return null;
+}
+
+/**
+ * In a linked worktree, the root of the main checkout; otherwise null. Claude
+ * Code keeps .claude/settings.local.json there, except on Windows, where the
+ * file stays in the directory the session starts in.
+ */
+async function mainCheckout(repoRoot: string, around: Surroundings): Promise<string | null> {
+  if (around.platform === "win32") return null;
+  const paths = await locateRepo(repoRoot);
+  if (paths === null || basename(paths.commonDir) !== ".git") return null; // not a repo, or one with no main checkout
+  const [main, self] = await Promise.all([realpath(dirname(paths.commonDir)), realpath(repoRoot)]).catch(() => [null, null]);
+  return main === null || main === self ? null : main;
 }
 
 function userConfigDir(around: Surroundings): string {
   return asText(around.env.CLAUDE_CONFIG_DIR) || join(around.home, ".claude");
 }
 
-/** `disableAllHooks` after precedence: local over project over user. Managed settings are out of reach here. */
+/**
+ * `disableAllHooks` after precedence: local over project over user. Two
+ * higher layers are out of reach here: managed settings, and a --settings
+ * flag on the command line.
+ */
 function hooksDisabledBy(layers: Array<{ name: string; settings: Json | null | "invalid" }>): string | null {
   for (const layer of layers) {
     if (layer.settings === null || layer.settings === "invalid") continue;
@@ -288,13 +403,21 @@ function hooksDisabledBy(layers: Array<{ name: string; settings: Json | null | "
 export async function checkClaudeCode(repoRoot: string, around: Surroundings): Promise<CheckResult> {
   const { result, settings } = await checkHooks(SETTINGS_FILE, repoRoot);
   if (!result.installed) return result;
-  const notes = [TRUST_NOTE];
+  const notes = [...NOTES];
   const userSettings = join(userConfigDir(around), "settings.json");
+  // In a worktree the local file that counts is the main checkout's. A file
+  // left in the worktree by a release before 2.1.211 is still read, below it.
+  const main = await mainCheckout(repoRoot, around);
+  const mainLocal = main === null ? null : join(main, LOCAL_SETTINGS);
   const disabledBy = hooksDisabledBy([
+    ...(mainLocal === null ? [] : [{ name: mainLocal, settings: await readJsonObject(mainLocal) }]),
     { name: LOCAL_SETTINGS, settings: await readJsonObject(join(repoRoot, LOCAL_SETTINGS)) },
     { name: SETTINGS, settings },
     { name: userSettings, settings: await readJsonObject(userSettings) },
   ]);
+  // What stops the hooks outright goes first.
+  const tooOld = tooOldNote(around.claudeVersion === undefined ? null : await around.claudeVersion());
+  if (tooOld !== null) notes.unshift(tooOld);
   if (disabledBy !== null) {
     notes.unshift(`Hooks are turned off for Claude Code here: "disableAllHooks" is true in ${disabledBy}. huddle's hooks will not run until that is removed.`);
   }

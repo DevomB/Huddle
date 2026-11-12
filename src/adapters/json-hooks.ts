@@ -27,7 +27,11 @@ export interface Registration {
   /** The agent's name for the event. */
   event: string;
   type: HookEventType;
-  /** Seconds. A safety net above the engine's own budget (plan.md §3), with room for node to start. */
+  /**
+   * Seconds. A safety net above the engine's own budget (plan.md §3), with
+   * room for node to start. Not a net everywhere: Claude Code does not enforce
+   * it on an async hook.
+   */
   timeout: number;
   /** Absent: every occurrence of the event. */
   matcher?: string;
