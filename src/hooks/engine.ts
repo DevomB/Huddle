@@ -35,6 +35,12 @@
 // moved to another worktree, changed its intent or left, and the end of a
 // turn, after which nothing else might run for minutes.
 //
+// Prompts. The start of a prompt becomes the session's intent, which is
+// published (hooks/intent.ts). Not when captureIntent is off in the settings,
+// and not while the agent is working in another repository. Capture that is
+// switched off also takes back what a prompt gave the session before, at the
+// session's next event: see touch().
+//
 // Subagents share their parent's session id. Their events keep the session
 // alive and are warned before an edit, and that is all: they never move the
 // session to another worktree, record an intent, use up the parent's briefing
@@ -202,10 +208,18 @@ export function sessionIdOf(raw: unknown): string {
 }
 
 interface Where {
+  /** The worktree the event is about: where the session is, and what the event's paths are checked against. */
   paths: RepoPaths;
   /**
+   * The set-up checkout the event goes by: its settings apply, and syncs are
+   * started in it. That is `paths` itself, except in a worktree whose branch
+   * has no .huddle (see locate).
+   */
+  home: RepoPaths;
+  /**
    * The agent is working outside this repository right now. Its session is
-   * kept alive where it was, and nothing is learned from where it went.
+   * kept alive where it was, and nothing is learned from where it went: no
+   * files, no branch, and not what was typed there either.
    */
   away: boolean;
 }
@@ -234,18 +248,22 @@ async function sameDirectory(a: string, b: string): Promise<boolean> {
  * up for huddle. Otherwise it is the one the hook was started in (io.cwd; for
  * Claude Code the project directory), provided that one is set up:
  *   - the agent is in another worktree of that same clone, on a branch from
- *     before `huddle init`: use the worktree it is in;
+ *     before `huddle init`: the session is in the worktree it is in, and goes
+ *     by the checkout the hook was started in (Where.home). A worktree
+ *     without .huddle has no settings, and the defaults are not the team's:
+ *     with them, a team that switched prompt capture off or syncs with
+ *     another remote than origin would have its prompts pushed to origin;
  *   - the agent is somewhere else entirely: the session stays where it was.
  */
 async function locate(event: HookEvent, io: Io): Promise<Where | null> {
   const cwd = typeof event.cwd === "string" && event.cwd !== "" ? event.cwd : io.cwd;
   const there = await locateRepo(cwd);
-  if (there !== null && (await isSetUp(there))) return { paths: there, away: false };
+  if (there !== null && (await isSetUp(there))) return { paths: there, home: there, away: false };
   if (resolve(cwd) === resolve(io.cwd)) return null;
   const home = await locateRepo(io.cwd);
   if (home === null || !(await isSetUp(home))) return null;
-  if (there !== null && (await sameDirectory(there.commonDir, home.commonDir))) return { paths: there, away: false };
-  return { paths: home, away: true };
+  if (there !== null && (await sameDirectory(there.commonDir, home.commonDir))) return { paths: there, home, away: false };
+  return { paths: home, home, away: true };
 }
 
 // ---------------------------------------------------------------------------
@@ -258,7 +276,12 @@ interface Run {
   io: Io;
   /** The session id, cleaned. */
   id: string;
+  /** The worktree the event is about (Where.paths). */
   paths: RepoPaths;
+  /** The set-up checkout the event goes by (Where.home). Both share one state directory. */
+  home: RepoPaths;
+  /** The settings of `home`. */
+  config: Config;
   away: boolean;
   /**
    * The event does not speak for the session: it is a subagent's, or it names
@@ -297,13 +320,18 @@ export function noteCrash(error: unknown): void {
   log(lastTrace?.paths ?? null, "hook", "crashed", error);
 }
 
-function contextFor(run: Run, config: Config, identity: Identity): Ctx {
+/**
+ * The context of the checkout the event goes by (run.home), which is where a
+ * sync has to be started to run on the same settings. Where the agent is
+ * working is run.paths; the calls below that need it are given it.
+ */
+function contextFor(run: Run, identity: Identity): Ctx {
   return {
     io: run.io,
-    paths: run.paths,
-    config,
+    paths: run.home,
+    config: run.config,
     identity,
-    transport: createTransport({ cwd: run.paths.worktree, remote: config.remote }),
+    transport: createTransport({ cwd: run.home.worktree, remote: run.config.remote }),
     now: run.now,
   };
 }
@@ -318,7 +346,13 @@ interface Touched {
   created: boolean;
   /** The session is in another worktree than it was. */
   moved: boolean;
+  /** The intent is another one than it was: a prompt replaced it, or it was taken back (see touch). */
   intentChanged: boolean;
+}
+
+/** Teammates have something new to learn about the session, so its sync is not left to the throttle. */
+function isNews(touched: Touched | null): boolean {
+  return touched !== null && (touched.created || touched.moved || touched.intentChanged);
 }
 
 /**
@@ -326,6 +360,12 @@ interface Touched {
  * `intent`, when not empty, becomes the session's intent. Null when the
  * session could not be recorded (the store is busy or broken): that is
  * logged, and the caller carries on without it.
+ *
+ * With prompt capture off, an intent that was taken from a prompt is taken
+ * back here, at whatever event of the session comes first. Capture can be
+ * switched off while a session runs, and whoever switches it off wants
+ * prompts to stop being shared, the one that is out there included. An intent
+ * stated with `huddle intent` was put there to be shared, and stays.
  */
 async function touch(run: Run, intent = ""): Promise<Touched | null> {
   const { event, id, paths, now, passive } = run;
@@ -354,7 +394,13 @@ async function touch(run: Run, intent = ""): Promise<Touched | null> {
             moved = true;
           }
         }
-        if (intent !== "" && intent !== session.intent && replacesIntent(session, intent)) {
+        if (!run.config.captureIntent) {
+          if (session.intentSource === "prompt" && session.intent !== "") {
+            session.intent = "";
+            session.intentSource = "none";
+            intentChanged = true;
+          }
+        } else if (intent !== "" && intent !== session.intent && replacesIntent(session, intent)) {
           session.intent = intent;
           session.intentSource = "prompt";
           intentChanged = true;
@@ -406,9 +452,8 @@ async function syncFor(ctx: Ctx, budgetMs: number): Promise<void> {
 }
 
 /** A background sync after an event: not throttled when teammates have something new to learn. */
-function syncAfter(run: Run, config: Config, touched: Touched | null, news = false): void {
-  const force = news || (touched !== null && (touched.created || touched.moved));
-  effects.spawnBackgroundSync(run.paths, run.io.self, force ? { force: true } : { config, now: run.now });
+function syncAfter(run: Run, touched: Touched | null): void {
+  effects.spawnBackgroundSync(run.home, run.io.self, isNews(touched) ? { force: true } : { config: run.config, now: run.now });
 }
 
 /** The worktree whose files are the viewer's own (see session.currentView). */
@@ -459,11 +504,11 @@ async function sessionStart(run: Run): Promise<Prepared> {
   // is made up for by a full one at the next prompt.
   await removeSeen(paths, id).catch((error: unknown) => log(paths, "hook", "session-start: could not forget what was shown", error));
   try {
-    const [config, identity, touched] = await Promise.all([loadConfig(paths), getIdentity(paths), touch(run)]);
-    const ctx = contextFor(run, config, identity);
+    const [identity, touched] = await Promise.all([getIdentity(run.home), touch(run)]);
+    const ctx = contextFor(run, identity);
     const budget = deadline.left() - BRIEFING_RESERVE_MS;
     if (budget > 0) await syncFor(ctx, budget);
-    else effects.spawnBackgroundSync(paths, io.self, { force: true });
+    else effects.spawnBackgroundSync(run.home, io.self, { force: true });
     const view = await currentView(ctx, id, undefined, viewerOf(run, touched));
     const briefing = renderBriefing(view);
     outcome.context = lines(briefing.text, staleNote(view));
@@ -475,21 +520,21 @@ async function sessionStart(run: Run): Promise<Prepared> {
 }
 
 async function prompt(run: Run): Promise<Prepared> {
-  const { event, id, paths } = run;
-  const config = await loadConfig(paths);
-  const intent = config.captureIntent ? toIntent(event.prompt) : "";
+  const { event, id, paths, config } = run;
+  // What is typed while the agent is in another repository is about that one, and not this team's to read.
+  const intent = config.captureIntent && !run.away ? toIntent(event.prompt) : "";
   const [touched, identity, since] = await Promise.all([
     touch(run, intent),
-    getIdentityFast(paths).catch((error: unknown) => {
+    getIdentityFast(run.home).catch((error: unknown) => {
       log(paths, "hook", "prompt: no briefing", error);
       return null;
     }),
     readSeen(paths, id),
   ]);
-  syncAfter(run, config, touched, touched !== null && touched.intentChanged);
+  syncAfter(run, touched);
   if (identity === null) return { outcome: {} };
 
-  const view = await currentView(contextFor(run, config, identity), id, touched?.state, viewerOf(run, touched));
+  const view = await currentView(contextFor(run, identity), id, touched?.state, viewerOf(run, touched));
   // Without a briefing to compare with (hooks installed mid-session, or a session-start that failed) this is the full one.
   const baseline = since !== null && Object.hasOwn(since.items, BRIEFED) ? since : null;
   const briefing = renderBriefing(view, { since: baseline });
@@ -582,8 +627,8 @@ function capWarned(items: Record<string, string>): Record<string, string> {
 async function overlapWarning(run: Run, targets: string[]): Promise<Prepared> {
   const { id, paths, now } = run;
   const remember = !run.passive;
-  const [identity, config, since] = await Promise.all([getIdentityFast(paths), loadConfig(paths), remember ? readSeen(paths, id) : null]);
-  const view = await currentView(contextFor(run, config, identity), id, undefined, paths.worktree);
+  const [identity, since] = await Promise.all([getIdentityFast(run.home), remember ? readSeen(paths, id) : null]);
+  const view = await currentView(contextFor(run, identity), id, undefined, paths.worktree);
 
   const items: Record<string, string> = { ...(since?.items ?? {}) };
   /** The paths with something to say, each with what is remembered once it has been said. */
@@ -663,8 +708,7 @@ async function refreshFirst(run: Run): Promise<boolean> {
     // Recorded first: if it cannot be, there is no limit on how often this would wait, so it does not wait at all.
     await ensureStateDir(paths);
     await writeFileAtomic(stamp, now.toISOString());
-    const [config, identity] = await Promise.all([loadConfig(paths), getIdentityFast(paths)]);
-    await syncFor(contextFor(run, config, identity), budget);
+    await syncFor(contextFor(run, await getIdentityFast(run.home)), budget);
     return true;
   } catch (error) {
     log(paths, "hook", "pre-edit: could not refresh the team state first", error);
@@ -680,7 +724,7 @@ async function preEdit(run: Run): Promise<Prepared> {
   const recorded = touch(run).then(async (touched) => {
     // A sync that was waited for publishes a session that is new as well.
     if (patient && (await refreshFirst(run))) return;
-    if (touched !== null && (touched.created || touched.moved)) effects.spawnBackgroundSync(paths, io.self, { force: true });
+    if (isNews(touched)) effects.spawnBackgroundSync(run.home, io.self, { force: true });
   });
   // Otherwise the session is recorded alongside the check, not before it: the check does not need it, and the budget is short.
   if (patient) await recorded;
@@ -698,8 +742,7 @@ async function preEdit(run: Run): Promise<Prepared> {
 
 /** post-edit, and every event of a subagent except pre-edit: the session is alive, and a sync may be due. */
 async function heartbeat(run: Run): Promise<Prepared> {
-  const [touched, config] = await Promise.all([touch(run), loadConfig(run.paths)]);
-  syncAfter(run, config, touched);
+  syncAfter(run, await touch(run));
   return { outcome: {} };
 }
 
@@ -709,11 +752,11 @@ async function turnEnd(run: Run): Promise<Prepared> {
   // and the turn's last edits must not wait that long to be published.
   // Detached and never waited for: such a sync waits up to 20 s for a round
   // that is already running.
-  effects.spawnBackgroundSync(run.paths, run.io.self, { force: true });
+  effects.spawnBackgroundSync(run.home, run.io.self, { force: true });
   return { outcome: {} };
 }
 
-/** Removes the session from `paths`; when there was one, a sync that is not throttled publishes that it left. */
+/** Removes the session from the clone of `paths`, a set-up checkout; when there was one, a sync that is not throttled publishes that it left. */
 async function endSession(run: Run, paths: RepoPaths): Promise<void> {
   try {
     if (await removeSession(paths, run.id, { waitMs: storeWait(run.deadline) })) {
@@ -725,12 +768,12 @@ async function endSession(run: Run, paths: RepoPaths): Promise<void> {
 }
 
 async function sessionEnd(run: Run): Promise<Prepared> {
-  const { event, io, paths } = run;
-  await endSession(run, paths);
+  const { event, io } = run;
+  await endSession(run, run.home);
   // A session that started in one set-up clone and ended in another has a record in both.
   if (!run.away && typeof event.cwd === "string" && event.cwd !== "" && resolve(event.cwd) !== resolve(io.cwd)) {
-    const home = await locateRepo(io.cwd);
-    if (home !== null && (await isSetUp(home)) && !(await sameDirectory(home.commonDir, paths.commonDir))) await endSession(run, home);
+    const first = await locateRepo(io.cwd);
+    if (first !== null && (await isSetUp(first)) && !(await sameDirectory(first.commonDir, run.home.commonDir))) await endSession(run, first);
   }
   return { outcome: {} };
 }
@@ -741,8 +784,9 @@ async function sessionEnd(run: Run): Promise<Prepared> {
  * this worktree, else the worktree's manual session).
  */
 async function ambientSession(run: Run): Promise<string> {
-  const [config, identity] = await Promise.all([loadConfig(run.paths), getIdentityFast(run.paths)]);
-  return (await resolveSession(contextFor(run, config, identity))).id;
+  const ctx = contextFor(run, await getIdentityFast(run.home));
+  // "This worktree" is the one the event happened in.
+  return (await resolveSession({ ...ctx, paths: run.paths })).id;
 }
 
 async function prepare(event: HookEvent, io: Io, deadline: Deadline, trace: Trace): Promise<Prepared> {
@@ -759,6 +803,8 @@ async function prepare(event: HookEvent, io: Io, deadline: Deadline, trace: Trac
     io,
     id: named,
     paths: where.paths,
+    home: where.home,
+    config: await loadConfig(where.home),
     away: where.away,
     passive: ambient || event.subagent === true,
     now: clockNow(io.env),

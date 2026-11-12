@@ -22,6 +22,7 @@ import { sync } from "../src/core/sync.ts";
 import { handleEvent, runHook } from "../src/hooks/engine.ts";
 import {
   MIN,
+  NOTHING_ASKED,
   aliceBuildsAuth,
   ambient,
   at,
@@ -46,8 +47,6 @@ import {
   until,
 } from "./engine.kit.ts";
 import type { Clone } from "./harness.ts";
-
-const NOTHING_ASKED = { background: [], options: [], waited: [] };
 
 /** The session a command typed in the clone's worktree acts as when nothing else says which. */
 const ownSession = async (clone: Clone): Promise<string> => manualSessionId(await clone.paths(), {});
