@@ -8,11 +8,14 @@ import { ageMs } from "./clock.ts";
 import type { Ctx } from "./context.ts";
 import { cleanText, LIMITS, normalizeDoc } from "./docs.ts";
 import { manualSessionId } from "./identity.ts";
-import { readCache, readLocal, updateLocal } from "./store.ts";
+import { readCache, readCacheStatus, readLocal, updateLocal } from "./store.ts";
+import type { CacheState } from "./store.ts";
+import { freshnessWarnings } from "./render.ts";
+import type { SyncResult } from "./sync.ts";
 import { actorRef } from "./types.ts";
-import type { ActorDoc, Identity, LocalSession, LocalState, Session } from "./types.ts";
-import { buildView } from "./view.ts";
-import type { TeamView } from "./view.ts";
+import type { ActorDoc, Cache, Identity, LocalSession, LocalState, Session } from "./types.ts";
+import { buildView, classifyFreshness, teamCompleteness } from "./view.ts";
+import type { Completeness, FreshnessReport, RefreshOutcome, TeamView } from "./view.ts";
 
 export interface CurrentSession {
   id: string;
@@ -128,6 +131,11 @@ export function toActorDoc(identity: Identity, sessions: LocalSession[], now: Da
  */
 export async function currentView(ctx: Ctx, sessionId: string, state?: LocalState, worktree?: string): Promise<TeamView> {
   const [cache, local] = await Promise.all([readCache(ctx.paths), state ?? readLocal(ctx.paths)]);
+  return viewFrom(ctx, cache, local, sessionId, worktree);
+}
+
+/** buildView over `cache` with this clone's own entry replaced by its local sessions (see currentView). Edits `cache`. */
+function viewFrom(ctx: Ctx, cache: Cache, local: LocalState, sessionId: string, worktree?: string): TeamView {
   const ref = actorRef(ctx.identity.actor);
   // Sessions that share the viewer's worktree share its dirty files: those are
   // the viewer's own work as much as theirs, so they are not shown as someone
@@ -139,4 +147,48 @@ export async function currentView(ctx: Ctx, sessionId: string, state?: LocalStat
   const own = normalizeDoc(toActorDoc(ctx.identity, sessions, ctx.now, ctx.config.ttlMinutes));
   if (own) cache.refs[ref] = { sha: cache.refs[ref]?.sha ?? "", doc: own };
   return buildView(cache, { actor: ctx.identity.actor, session: sessionId }, ctx.now, { ttlMinutes: ctx.config.ttlMinutes });
+}
+
+/** What a sync this command ran says about its own refresh (CONTRACT 4.2). */
+export function refreshOutcome(result: SyncResult): RefreshOutcome {
+  if (result.error === "offline" || result.error === "denied") return result.error;
+  if (result.skipped === "throttled") return "none"; // a round ran moments ago; fetchedAt says how long
+  if (result.skipped === "locked") return "busy";
+  if (result.fetched) return "ok";
+  return "failed";
+}
+
+/** The team view together with how far it can be trusted. */
+export interface TeamRead {
+  view: TeamView;
+  cacheState: CacheState;
+  freshness: FreshnessReport;
+  completeness: Completeness;
+  /** freshnessWarnings: the same sentences for text, stderr and JSON. */
+  warnings: string[];
+}
+
+/**
+ * currentView, plus the freshness and completeness of what it shows. `refresh`
+ * is what this command's own sync did, "none" when it did not run one.
+ */
+export async function readTeam(ctx: Ctx, sessionId: string, refresh: RefreshOutcome = "none"): Promise<TeamRead> {
+  const [{ cache, state: cacheState }, local] = await Promise.all([readCacheStatus(ctx.paths), readLocal(ctx.paths)]);
+  const freshness = classifyFreshness({ cacheState, fetchedAt: cache.fetchedAt, now: ctx.now, syncIntervalSeconds: ctx.config.syncIntervalSeconds, refresh });
+  // Completeness is judged on the remote's documents, before this clone's own entry is replaced.
+  const snapshot: Cache = { fetchedAt: cache.fetchedAt, refs: { ...cache.refs } };
+  const view = viewFrom(ctx, cache, local, sessionId);
+  const completeness = teamCompleteness(snapshot, view);
+  // This clone's own actor ref is judged by local state, which can always be read.
+  const ownRef = actorRef(ctx.identity.actor);
+  if (snapshot.refs[ownRef] !== undefined && snapshot.refs[ownRef]?.doc === null) {
+    completeness.unreadableActors--;
+    completeness.complete = completeness.unreadableActors === 0 && completeness.uncovered === 0;
+  }
+  return { view, cacheState, freshness, completeness, warnings: freshnessWarnings(freshness, completeness, ctx.config.remote) };
+}
+
+/** The keys CONTRACT 4.2 adds to every JSON read, next to the command's own. */
+export function envelope(team: TeamRead): { schemaVersion: 1; freshness: FreshnessReport["freshness"]; complete: boolean; ageSeconds: number | null; warnings: string[] } {
+  return { schemaVersion: 1, freshness: team.freshness.freshness, complete: team.completeness.complete, ageSeconds: team.freshness.ageSeconds, warnings: team.warnings };
 }
