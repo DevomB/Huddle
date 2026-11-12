@@ -70,22 +70,74 @@ interface Contender {
 }
 
 /**
- * Everyone claims the same task at the same moment. Checks the exit test's
- * two clauses and returns how the losers lost.
+ * How long one contender may run. Every wait in a claim is bounded, but a
+ * loser can wait twice for its clone's sync.lock (FORCED_LOCK_WAIT_MS, 20 s:
+ * before its claim and again after losing the push), and each network git call
+ * has 10 s. With five sessions of one clone queued on that lock on a loaded
+ * runner, a claim can take 40 s and more inside its own limits, so the
+ * harness's default 30 s would kill commands that are still working (and leave
+ * their lock behind).
  */
-async function race(h: Harness, id: string, contenders: Contender[], now: string): Promise<{ winner: Contender; beaten: number; late: number }> {
-  const results = await Promise.all(contenders.map(({ clone, session }) => clone.huddle(["task", "claim", id], { now, session })));
-  const describeAll = (): string => results.map((r, i) => `${contenders[i]!.clone.name}/${contenders[i]!.session ?? "-"}: ${r.code} ${r.stdout.trim()} ${r.stderr.trim()}`).join("\n");
+const CONTENDER_LIMIT_MS = 120_000;
 
-  const winners = results.flatMap((result, index) => (result.code === 0 ? [index] : []));
-  assert.equal(winners.length, 1, `expected exactly one winner:\n${describeAll()}`);
-  const winner = contenders[winners[0]!]!;
-  assert.match(results[winners[0]!]!.stdout, new RegExp(`^claimed \\[${id}\\] `));
+/**
+ * A contender that got no verdict in the race: refused before anything was
+ * decided ("busy" after the 20 s lock wait, the remote not reached, or the
+ * clone's own state not published: exit 1, nothing changed), an outcome that
+ * is unknown (the push went out and its answer was lost), or killed at the
+ * limit. It runs again once the race is over.
+ */
+function noVerdict(result: RunResult): boolean {
+  if (result.code === -1) return true;
+  return result.code === 1 && /another huddle command is still syncing|could not reach remote|own state could not be published|may or may not have been made/.test(result.stderr);
+}
+
+/**
+ * Everyone claims the same task at the same moment. Checks the exit test's
+ * two clauses and returns how the losers lost. The remote is the referee: it
+ * holds one owner, exactly that contender is told it won, and everyone else
+ * exits 3 naming it. A contender without a verdict in the race (see noVerdict)
+ * is run again afterwards, one at a time, and is held to the same rule.
+ */
+async function race(h: Harness, id: string, contenders: Contender[], now: string): Promise<{ winner: Contender; beaten: number; late: number; rerun: number }> {
+  const claim = ({ clone, session }: Contender): Promise<RunResult> => clone.huddle(["task", "claim", id], { now, session, timeoutMs: CONTENDER_LIMIT_MS });
+  const first = await Promise.all(contenders.map(claim));
+  const final = [...first];
+  let rerun = 0;
+  for (const [index, result] of first.entries()) {
+    if (!noVerdict(result)) continue;
+    final[index] = await claim(contenders[index]!);
+    rerun++;
+  }
+  const lines = (results: RunResult[]): string => results.map((r, i) => `${contenders[i]!.clone.name}/${contenders[i]!.session ?? "-"}: ${r.code} ${r.stdout.trim()} ${r.stderr.trim()}`).join("\n");
+  // On a failure, each clone's huddle log too: its timestamped [sync] and [tasks] lines show where the time went.
+  const logs = (): string =>
+    [...new Set(contenders.map(({ clone }) => clone))]
+      .map((clone) => {
+        const file = join(clone.dir, ".git", "huddle", "log");
+        return `--- ${clone.name}: ${file}\n${existsSync(file) ? readFileSync(file, "utf8").trimEnd() : "(no log)"}`;
+      })
+      .join("\n");
+  const describeAll = (): string => `the race:\n${lines(first)}\nafter running the ones without a verdict again:\n${lines(final)}\nhuddle logs:\n${logs()}`;
+
+  // The remote agrees on one owner, and it is one of the contenders.
+  const onRemote = remoteTask(h, id);
+  assert.equal(onRemote.status, "claimed", describeAll());
+  const winnerIndex = contenders.findIndex(({ clone, session }) => clone.name === onRemote.owner?.user && (session === undefined || session === onRemote.owner?.session));
+  assert.ok(winnerIndex >= 0, `the remote's owner is none of the contenders: ${JSON.stringify(onRemote.owner)}\n${describeAll()}`);
+  const winner = contenders[winnerIndex]!;
+
+  // Exactly one contender is told it won, and it is the remote's owner. A success
+  // reported only on the rerun is a push whose answer was lost in the race.
+  const winners = final.flatMap((result, index) => (result.code === 0 ? [index] : []));
+  assert.deepEqual(winners, [winnerIndex], `expected exactly one winner, the remote's owner:\n${describeAll()}`);
+  assert.ok(first[winnerIndex]!.code === 0 || noVerdict(first[winnerIndex]!), describeAll());
+  assert.match(final[winnerIndex]!.stdout, new RegExp(`^claimed \\[${id}\\] `));
 
   let beaten = 0;
   let late = 0;
-  results.forEach((result: RunResult, index) => {
-    if (index === winners[0]) return;
+  final.forEach((result: RunResult, index) => {
+    if (index === winnerIndex) return;
     // Exit code 3 is "overlap or lost race", and the message says who has the task.
     assert.equal(result.code, 3, `loser should exit 3:\n${describeAll()}`);
     const named = new RegExp(`\\[${id}\\] .* (was claimed first by|is taken by) ${winner.clone.name} / manual$`);
@@ -93,13 +145,7 @@ async function race(h: Harness, id: string, contenders: Contender[], now: string
     if (result.stdout.includes("was claimed first by")) beaten++;
     else late++;
   });
-
-  // The remote agrees: claimed, by the winner's session.
-  const onRemote = remoteTask(h, id);
-  assert.equal(onRemote.status, "claimed");
-  assert.equal(onRemote.owner?.user, winner.clone.name);
-  if (winner.session) assert.equal(onRemote.owner?.session, winner.session);
-  return { winner, beaten, late };
+  return { winner, beaten, late, rerun };
 }
 
 function ioFor(dir: string, env: Record<string, string>): Io {
@@ -147,7 +193,7 @@ describe("task claim races (exit test)", () => {
   after(() => h.cleanup());
 
   test("20 simultaneous claim races each have exactly one winner, and the loser's message names the winner", async (t) => {
-    const tally = { races: 0, beaten: 0, late: 0 };
+    const tally = { races: 0, beaten: 0, late: 0, rerun: 0 };
     const wins = new Map<string, number>();
     for (let n = 0; n < 20; n++) {
       // A fresh task per race, added by a different clone each time.
@@ -156,11 +202,12 @@ describe("task claim races (exit test)", () => {
       tally.races++;
       tally.beaten += result.beaten;
       tally.late += result.late;
+      tally.rerun += result.rerun;
       wins.set(result.winner.clone.name, (wins.get(result.winner.clone.name) ?? 0) + 1);
     }
     t.diagnostic(
       `${tally.races} races of 4 simultaneous claims from 4 clones: ${tally.races} winners; ${tally.beaten} losers lost the compare-and-swap, ` +
-        `${tally.late} arrived after it; every loser named the winner. Wins: ${[...wins].map(([name, count]) => `${name} ${count}`).join(", ")}`,
+        `${tally.late} arrived after it (${tally.rerun} of them only when run again after a race without a verdict); every loser named the winner. Wins: ${[...wins].map(([name, count]) => `${name} ${count}`).join(", ")}`,
     );
     // If no loser ever lost the swap itself, these were not simultaneous and the test proved nothing about atomicity.
     assert.ok(tally.beaten > 0, "no race was decided by the compare-and-swap");
@@ -170,7 +217,7 @@ describe("task claim races (exit test)", () => {
     const id = await addVia(clones[0]!, "the big race", at(30));
     const contenders = clones.flatMap((clone) => [1, 2, 3, 4, 5].map((n) => ({ clone, session: `${clone.name}-session-${n}` })));
     const result = await race(h, id, contenders, at(30));
-    t.diagnostic(`20 simultaneous claims: 1 winner (${result.winner.clone.name}, ${result.winner.session}); ${result.beaten} lost the compare-and-swap, ${result.late} arrived after it`);
+    t.diagnostic(`20 simultaneous claims: 1 winner (${result.winner.clone.name}, ${result.winner.session}); ${result.beaten} lost the compare-and-swap, ${result.late} arrived after it; ${result.rerun} ran again after the race without a verdict`);
 
     // Everyone sees the same owner afterwards, and sees that owner as live.
     for (const clone of clones) {
