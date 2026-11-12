@@ -6,8 +6,7 @@ import { LIMITS } from "../core/docs.ts";
 import { currentBranch, toRepoPattern } from "../core/files.ts";
 import { EXIT, UsageError } from "../core/io.ts";
 import type { Io } from "../core/io.ts";
-import { resolveSession } from "../core/session.ts";
-import { touchSession } from "../core/store.ts";
+import { changeSession, resolveSession } from "../core/session.ts";
 import { spawnBackgroundSync } from "../core/sync.ts";
 
 export const summary = "Claim files by glob for this session";
@@ -25,22 +24,25 @@ export async function run(args: string[], io: Io): Promise<number> {
     return EXIT.OK;
   }
 
-  const claims = [...existing];
+  const wanted: string[] = [];
   for (const raw of positionals) {
     const pattern = toRepoPattern(ctx.paths, io.cwd, raw);
     if (pattern === null) throw new UsageError(`"${raw}" is outside this repository\nUsage: ${USAGE}`);
-    if (!claims.includes(pattern)) claims.push(pattern);
+    if (!wanted.includes(pattern)) wanted.push(pattern);
   }
-  if (claims.length > LIMITS.claims) throw new UsageError(`a session can hold at most ${LIMITS.claims} claims; release some first`);
 
-  await touchSession(ctx.paths, {
-    id: me.id,
-    worktree: ctx.paths.worktree,
-    agent: me.agent,
-    branch: await currentBranch(ctx.paths.worktree),
-    claims,
-    seenAt: ctx.now.toISOString(),
+  const branch = await currentBranch(ctx.paths.worktree);
+  // Added to the list as it is stored now, under the lock: `existing` above may already be out of date.
+  const stored = await changeSession(ctx, me, { create: true }, (session) => {
+    const claims = [...session.claims];
+    for (const pattern of wanted) if (!claims.includes(pattern)) claims.push(pattern);
+    if (claims.length > LIMITS.claims) throw new UsageError(`a session can hold at most ${LIMITS.claims} claims; release some first`);
+    session.claims = claims;
+    session.worktree = ctx.paths.worktree;
+    session.agent = me.agent;
+    session.branch = branch;
   });
+  const claims = stored?.claims ?? [];
   io.out(`claimed: ${claims.join(", ")}`);
   spawnBackgroundSync(ctx.paths, io.self, { force: true });
   return EXIT.OK;

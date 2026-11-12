@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { LIMITS, normalizeDoc } from "../src/core/docs.ts";
 import type { Cache, DecisionDoc, TaskDoc } from "../src/core/types.ts";
 import { matchWork } from "../src/core/glob.ts";
-import { buildView, countTasks, overlaps, taskState } from "../src/core/view.ts";
+import { MAX_CLOCK_SKEW_MS, buildView, countTasks, overlaps, taskState } from "../src/core/view.ts";
 import { ME, NOW, cacheOf, loadTeam, makeSession } from "./fixtures/cache/team.ts";
 
 const MINUTE = 60_000;
@@ -67,9 +67,64 @@ test("view: ttlMinutes is configurable and defaults to 15", () => {
   assert.deepEqual(ids(buildView(cache, ME, new Date(NOW.getTime() + 20 * MINUTE)).sessions), [], "everyone ages out");
 });
 
-test("view: a seenAt in the future (clock skew) counts as live", () => {
+test("view: a seenAt a few minutes in the future (clock skew) counts as just seen", () => {
   const cache = cacheOf([{ actor: "skew2222", user: "skewed", sessions: [makeSession({ id: "s1", seenAt: "2026-11-12T12:04:00.000Z" })] }]);
   assert.deepEqual(ids(buildView(cache, ME, NOW).sessions), ["s1"]);
+});
+
+test("view: a seenAt far in the future is not live, however long its clock says it has left", () => {
+  assert.equal(MAX_CLOCK_SKEW_MS, 5 * MINUTE);
+  const at = (aheadMs: number): string => new Date(NOW.getTime() + aheadMs).toISOString();
+  const liveWith = (seenAt: string): string[] => ids(buildView(cacheOf([{ actor: "skew2222", user: "skewed", sessions: [makeSession({ id: "s1", seenAt })] }]), ME, NOW).sessions);
+
+  // The edge: exactly the tolerance ahead is still "just seen", one millisecond more is not.
+  assert.deepEqual(liveWith(at(MAX_CLOCK_SKEW_MS)), ["s1"]);
+  assert.deepEqual(liveWith(at(MAX_CLOCK_SKEW_MS + 1)), []);
+  // A clock an hour fast, a day fast, and a stamp that would otherwise never age out.
+  for (const seenAt of [at(60 * MINUTE), at(24 * 60 * MINUTE), "2099-01-01T00:00:00.000Z", "9999-12-31T23:59:59.999Z"]) assert.deepEqual(liveWith(seenAt), [], seenAt);
+
+  // It stays out as the viewer's clock moves on, until the stamp is within reach.
+  const hourFast = cacheOf([{ actor: "skew2222", user: "skewed", sessions: [makeSession({ id: "s1", seenAt: at(60 * MINUTE) })] }]);
+  assert.deepEqual(ids(buildView(hourFast, ME, new Date(NOW.getTime() + 54 * MINUTE)).sessions), []);
+  assert.deepEqual(ids(buildView(hourFast, ME, new Date(NOW.getTime() + 55 * MINUTE)).sessions), ["s1"]);
+  assert.deepEqual(ids(buildView(hourFast, ME, new Date(NOW.getTime() + 75 * MINUTE)).sessions), [], "and then ages out like any other");
+});
+
+test("view: a session that is not live for its clock holds nothing: no overlap, no task, no place over a believable entry", () => {
+  const future = "2026-11-12T18:00:00.000Z";
+  const owner = { actor: "skew2222", user: "skewed", session: "s1", agent: "codex" };
+  const task: TaskDoc = { v: 0, kind: "task", id: "tratelim", title: "Rate limiting", status: "claimed", owner, createdBy: owner, createdAt: "2026-11-12T11:00:00.000Z", updatedAt: "2026-11-12T11:30:00.000Z" };
+  const withTask = (seenAt: string): Cache => {
+    const cache = cacheOf([{ actor: "skew2222", user: "skewed", sessions: [makeSession({ id: "s1", seenAt, files: ["src/auth/jwt.ts"], claims: ["src/payments/**"] })] }]);
+    cache.refs["refs/huddle/tasks/tratelim"] = { sha: "1".repeat(40), doc: task };
+    return cache;
+  };
+
+  const view = buildView(withTask(future), ME, NOW);
+  assert.deepEqual(view.sessions, []);
+  assert.deepEqual(overlaps(view, "src/auth/jwt.ts"), []);
+  assert.deepEqual(overlaps(view, "src/payments/stripe.ts"), []);
+  assert.equal(view.tasks[0]?.ownerLive, false, "its claimed task can be claimed again");
+  assert.equal(taskState(view.tasks[0] as (typeof view.tasks)[number]), "stale");
+
+  // The same session with a believable stamp does hold all three.
+  const sane = buildView(withTask("2026-11-12T11:59:00.000Z"), ME, NOW);
+  assert.equal(overlaps(sane, "src/auth/jwt.ts").length, 1);
+  assert.equal(sane.tasks[0]?.ownerLive, true);
+
+  // Two entries for one id: the far-future one does not win over the believable one.
+  const doubled = cacheOf([
+    {
+      actor: "skew2222",
+      user: "skewed",
+      sessions: [makeSession({ id: "s1", seenAt: "2026-11-12T11:58:00.000Z", intent: "believable" }), makeSession({ id: "s1", seenAt: future, intent: "from the future" })],
+    },
+  ]);
+  const kept = buildView(doubled, ME, NOW).sessions;
+  assert.deepEqual(
+    kept.map((session) => [session.id, session.intent]),
+    [["s1", "believable"]],
+  );
 });
 
 test("view: without a session id the viewer sees every session of its own clone", () => {

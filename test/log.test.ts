@@ -69,12 +69,18 @@ test("processes that all find the log full keep the history: only one of them ro
     await rm(`${logFile}.1`, { force: true });
     await rm(gate, { force: true });
     await writeFile(logFile, `history round ${round}\n` + "x".repeat(MAX_LOG_BYTES) + "\n");
-    const children = Array.from({ length: 12 }, (_, id) =>
-      spawn(process.execPath, ["--input-type=module", "-e", worker, logFile, gate, String(id)], { stdio: ["ignore", "ignore", "inherit"] }),
-    );
+    // The exit listeners are attached when the process starts. Attached after the gate opens,
+    // they can miss a process that has already finished, and the test then waits for ever.
+    const exits = Array.from({ length: 12 }, (_, id) => {
+      const child = spawn(process.execPath, ["--input-type=module", "-e", worker, logFile, gate, String(id)], { stdio: ["ignore", "ignore", "inherit"] });
+      return new Promise<number>((resolve) => {
+        child.on("error", () => resolve(-1));
+        child.on("exit", (code) => resolve(code ?? -1));
+      });
+    });
     await new Promise((resolve) => setTimeout(resolve, 700)); // let every process load and reach the gate
     await writeFile(gate, "");
-    const codes = await Promise.all(children.map((child) => new Promise((resolve) => child.on("exit", resolve))));
+    const codes = await Promise.all(exits);
     assert.deepEqual(codes, Array(12).fill(0));
 
     const history = await readFile(`${logFile}.1`, "utf8");

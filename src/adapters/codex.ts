@@ -24,7 +24,7 @@
 //   the patch text, relative to the payload's cwd as a rule.
 // - A handler is a command line for a shell: the user's login shell on macOS
 //   and Linux, cmd.exe on Windows. There is no exec form. Since it is a shell
-//   command anyway, it starts with a check that node exists.
+//   command anyway, it starts with checks that node and the bundle exist.
 // - SessionEnd hooks get three seconds at most.
 // - There is no way for a hook to set a variable in the agent's shell, so
 //   HUDDLE_SESSION is not passed on.
@@ -187,27 +187,33 @@ const SHELL_INERT = /^[A-Za-z0-9._/-]+$/;
  * which may be a subdirectory, so the repo root is asked of git; this is the
  * form Codex's documentation recommends.
  *
- * The file is committed for the whole team, and a teammate without node would
- * otherwise see a failed hook on every event, so the command first checks for
- * node and does nothing without it. Every part of it ("command -v", "||",
- * "exit", ";" and "$( )" inside double quotes) reads the same in sh, bash,
- * zsh and fish.
+ * The file is committed for the whole team, and Codex reports a hook that
+ * exits non-zero as failed, on every event. So the command first checks that
+ * it can do its job and does nothing otherwise: no node on the PATH; or no
+ * bundle where git says the root is, which also covers a missing git, a
+ * directory that is not a repository, a sparse checkout without the bundle
+ * and a nested clone. Asking git twice costs a few milliseconds and keeps to
+ * what reads the same in sh, bash, zsh and fish: "command -v", "test -f",
+ * "||", "exit", ";" and "$( )" inside double quotes. A variable would not.
  */
 function posixCommand(bundle: string): string {
-  return `command -v node >/dev/null 2>&1 || exit 0; node "$(git rev-parse --show-toplevel)/${bundle}" hook ${NAME}`;
+  const path = (quiet: string): string => `"$(git rev-parse --show-toplevel${quiet})/${bundle}"`;
+  return `command -v node >/dev/null 2>&1 || exit 0; test -f ${path(" 2>/dev/null")} || exit 0; node ${path("")} hook ${NAME}`;
 }
 
 /**
  * On Windows Codex runs `commandWindows` with cmd.exe /C, which has no "$( )".
- * The same check for node comes first: outside a batch file "exit /b 0" ends
- * cmd.exe itself, with success. The "@" keeps cmd from echoing the command
- * into the hook's output.
+ * The same two checks: outside a batch file "exit /b 0" ends cmd.exe itself,
+ * with success, and "if exist" skips a bundle that is not there. The "@"
+ * keeps cmd from echoing the command into the hook's output.
  */
 function windowsCommand(bundle: string): string {
-  return `where node >nul 2>nul || exit /b 0 & for /f "delims=" %i in ('git rev-parse --show-toplevel') do @node "%i/${bundle}" hook ${NAME}`;
+  return `where node >nul 2>nul || exit /b 0 & for /f "delims=" %i in ('git rev-parse --show-toplevel 2^>nul') do @if exist "%i/${bundle}" node "%i/${bundle}" hook ${NAME}`;
 }
 
-const POSIX_COMMAND = /^command -v node >\/dev\/null 2>&1 \|\| exit 0; node "\$\(git rev-parse --show-toplevel\)\/([A-Za-z0-9._/-]+)" hook codex$/;
+/** The POSIX command exactly as posixCommand() writes it, with the bundle path captured where it is tested for. */
+const POSIX_COMMAND =
+  /^command -v node >\/dev\/null 2>&1 \|\| exit 0; test -f "\$\(git rev-parse --show-toplevel 2>\/dev\/null\)\/([A-Za-z0-9._/-]+)" \|\| exit 0; node "\$\(git rev-parse --show-toplevel\)\/\1" hook codex$/;
 
 /**
  * Any command that runs a file named exactly huddle.mjs as `hook codex`,
