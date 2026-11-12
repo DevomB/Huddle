@@ -1,8 +1,8 @@
 // T1.4. One sync round (plan.md §3 Sync), and starting one in the background.
 
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { ageMs } from "./clock.ts";
@@ -54,11 +54,17 @@ function stampFile(paths: RepoPaths): string {
   return join(paths.stateDir, "sync-stamp");
 }
 
-function throttledAt(stamp: string | null, config: Config, now: Date): boolean {
-  if (!stamp) return false;
+/** How much longer the throttle holds, in milliseconds; 0 when a background sync may run now. */
+function throttleLeftMs(stamp: string | null, config: Config, now: Date): number {
+  if (!stamp) return 0;
   const age = ageMs(stamp.trim(), now);
+  const interval = config.syncIntervalSeconds * 1000;
   // A stamp from the future (clock change, pinned test clock) must not block syncing forever.
-  return age >= 0 && age < config.syncIntervalSeconds * 1000;
+  return age >= 0 && age < interval ? interval - age : 0;
+}
+
+function throttledAt(stamp: string | null, config: Config, now: Date): boolean {
+  return throttleLeftMs(stamp, config, now) > 0;
 }
 
 function readStamp(paths: RepoPaths): string | null {
@@ -103,6 +109,8 @@ export async function sync(ctx: Ctx, opts: SyncOptions = {}): Promise<SyncResult
       // Another process may have synced while we waited for the lock.
       if (!opts.force && throttledAt(readStamp(ctx.paths), ctx.config, ctx.now)) return skipped("throttled");
       await writeFile(stampFile(ctx.paths), ctx.now.toISOString());
+      // After the stamp and before the round reads local state: see pendingFile.
+      clearPending(ctx.paths);
       return round(ctx);
     });
     return locked.acquired ? locked.value : skipped("locked");
@@ -344,8 +352,8 @@ function backgroundDisabled(): boolean {
   return process.env.HUDDLE_NO_BACKGROUND === "1";
 }
 
-function startDetached(paths: RepoPaths, self: string, force: boolean) {
-  const child = spawn(process.execPath, [self, "sync", "--background", ...(force ? ["--force"] : [])], {
+function startDetached(paths: RepoPaths, self: string, args: string[]) {
+  const child = spawn(process.execPath, [self, "sync", "--background", ...args], {
     cwd: paths.worktree,
     detached: true,
     stdio: "ignore",
@@ -360,16 +368,136 @@ function startDetached(paths: RepoPaths, self: string, force: boolean) {
  * immediately. `self` is the path of the running huddle script (io.self).
  * Never throws. Does nothing when HUDDLE_NO_BACKGROUND=1 (tests). The throttle
  * is enforced inside the sync; `opts.config` only saves starting a process
- * that would be throttled anyway.
+ * that would be throttled anyway. A throttled sync is not lost: one deferred
+ * sync runs when the interval ends (deferSync).
  */
 export function spawnBackgroundSync(paths: RepoPaths, self: string, opts: BackgroundOptions = {}): void {
   try {
     if (backgroundDisabled() || !self) return;
-    if (!opts.force && opts.config && throttledAt(readStamp(paths), opts.config, opts.now ?? new Date())) return;
-    startDetached(paths, self, opts.force === true).unref();
+    const now = opts.now ?? new Date();
+    if (!opts.force && opts.config && throttledAt(readStamp(paths), opts.config, now)) {
+      deferSync(paths, self, opts.config, now);
+      return;
+    }
+    startDetached(paths, self, opts.force === true ? ["--force"] : []).unref();
   } catch (error) {
     log(paths, "sync", "could not start a background sync", error);
   }
+}
+
+/**
+ * The deferred sync that is waiting for the throttle to end, if there is one:
+ * `{ token, dueAt }`, dueAt in real milliseconds. A background sync that is
+ * skipped leaves one behind, so that what it would have published is still
+ * published when the interval is over, even when no other event follows (a
+ * plain `git commit` has no end of turn after it).
+ * - At most one waits per clone: whoever creates this file starts it.
+ * - Every round removes the file once its stamp is written and before it
+ *   reads local state. So an event that found the file is covered by that
+ *   round, and an event after it is throttled by that stamp and leaves a new
+ *   file.
+ * - The waiting process syncs only if the file still holds its token: if not,
+ *   a round has run since, and that round covered what it was waiting for.
+ * So background syncs that are not forced stay one interval apart.
+ */
+function pendingFile(paths: RepoPaths): string {
+  return join(paths.stateDir, "sync-pending");
+}
+
+interface Pending {
+  token: string;
+  dueAt: number;
+}
+
+/** A deferred sync that has not run this long after it was due is taken for dead, and may be replaced. */
+const PENDING_GRACE_MS = FORCED_LOCK_WAIT_MS + 10_000;
+/** No deferred sync waits longer than the longest syncIntervalSeconds. */
+const PENDING_MAX_WAIT_MS = 3_600_000;
+
+function readPending(paths: RepoPaths): Pending | null {
+  try {
+    const parsed = JSON.parse(readFileSync(pendingFile(paths), "utf8")) as Partial<Pending> | null;
+    if (parsed && typeof parsed.token === "string" && typeof parsed.dueAt === "number") return { token: parsed.token, dueAt: parsed.dueAt };
+  } catch {
+    // Not there, or being written at this moment.
+  }
+  return null;
+}
+
+/** Removes the file: whatever it holds, or only when it holds `token`. Never throws. */
+function clearPending(paths: RepoPaths, token?: string): void {
+  try {
+    if (token !== undefined && readPending(paths)?.token !== token) return;
+    rmSync(pendingFile(paths), { force: true });
+  } catch {
+    // A file left behind is replaced once it is past its grace time.
+  }
+}
+
+/** Creates the file. False when a deferred sync is already waiting. */
+function claimPending(paths: RepoPaths, pending: Pending): boolean {
+  const file = pendingFile(paths);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      writeFileSync(file, JSON.stringify(pending), { flag: "wx" });
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+    const current = readPending(paths);
+    let since = current?.dueAt;
+    if (since === undefined) {
+      try {
+        since = statSync(file).mtimeMs; // unreadable: judged by its age
+      } catch {
+        since = 0; // gone in the meantime
+      }
+    }
+    if (Date.now() <= since + PENDING_GRACE_MS) return false;
+    rmSync(file, { force: true });
+  }
+  return false;
+}
+
+/**
+ * Makes sure a sync runs when the throttle interval is over: starts one
+ * detached process that waits until then, unless one is already waiting.
+ * For a background sync that was skipped (throttled, or another sync held the
+ * lock). Never throws. Does nothing when HUDDLE_NO_BACKGROUND=1 (tests).
+ */
+export function deferSync(paths: RepoPaths, self: string, config: Config, now: Date = new Date()): void {
+  if (backgroundDisabled() || !self) return;
+  const token = randomBytes(8).toString("hex");
+  let claimed = false;
+  try {
+    const wait = Math.min(throttleLeftMs(readStamp(paths), config, now), PENDING_MAX_WAIT_MS);
+    claimed = claimPending(paths, { token, dueAt: Date.now() + wait });
+    if (!claimed) return;
+    const child = startDetached(paths, self, ["--deferred", token]);
+    child.on("error", () => clearPending(paths, token));
+    child.unref();
+  } catch (error) {
+    // A claim with no process behind it would hold every later one off until its grace time is over.
+    if (claimed) clearPending(paths, token);
+    log(paths, "sync", "could not defer a background sync", error);
+  }
+}
+
+/**
+ * For the process deferSync started: waits until the deferred sync is due.
+ * False when it is not wanted any more, because a sync ran in the meantime.
+ */
+export async function deferredSyncDue(paths: RepoPaths, token: string): Promise<boolean> {
+  const mine = readPending(paths);
+  if (mine?.token !== token) return false;
+  const wait = Math.min(mine.dueAt - Date.now(), PENDING_MAX_WAIT_MS);
+  if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+  return readPending(paths)?.token === token;
+}
+
+/** For the same process, when it is done: removes the file if it still holds `token`. */
+export function releaseDeferredSync(paths: RepoPaths, token: string): void {
+  clearPending(paths, token);
 }
 
 /**
@@ -385,7 +513,7 @@ export async function syncWithin(ctx: Ctx, budgetMs: number): Promise<boolean> {
     return true;
   }
   try {
-    const child = startDetached(ctx.paths, ctx.io.self, true);
+    const child = startDetached(ctx.paths, ctx.io.self, ["--force"]);
     return await new Promise<boolean>((resolve) => {
       const timer = setTimeout(() => {
         child.unref();
