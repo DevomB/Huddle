@@ -233,6 +233,24 @@ test("toRepoPath makes agent-supplied paths repo-relative and rejects paths outs
   assert.equal(toRepoPath(paths, clone.dir, join(h.root, "alice-other", "x.ts")), null, "a directory that merely shares the prefix");
 });
 
+test(
+  "toRepoPath on Windows: drive letter and separators in any form, and the case on disk, as git reports the path",
+  { skip: process.platform === "win32" ? false : "Windows-only: a case-insensitive file system with drive letters" },
+  async (t) => {
+    const h = await createHarness(t);
+    const clone = await h.clone("alice");
+    const paths = await clone.paths();
+    await clone.write("src/Auth.ts", "x\n");
+    const lowerDrive = clone.dir.replace(/^[A-Z]:/, (drive) => drive.toLowerCase());
+    assert.equal(toRepoPath(paths, clone.dir, join(clone.dir, "SRC", "auth.TS")), "src/Auth.ts", "case on disk");
+    assert.equal(toRepoPath(paths, clone.dir, join(lowerDrive, "src", "Auth.ts")), "src/Auth.ts", "lower-case drive letter");
+    assert.equal(toRepoPath(paths, clone.dir, `${clone.dir.replace(/\\/g, "/")}/src/Auth.ts`), "src/Auth.ts", "forward slashes");
+    assert.equal(toRepoPath(paths, clone.dir, "SRC\\new\\File.ts"), "src/new/File.ts", "a new file keeps its own case below what exists");
+    // What git itself reports for the file is the same path.
+    assert.match(await clone.git("status", "--porcelain", "--untracked-files=all"), /src\/Auth\.ts/);
+  },
+);
+
 test("toRepoPath sees through a symlink to the worktree", async (t) => {
   const h = await createHarness(t);
   const clone = await h.clone("alice");
