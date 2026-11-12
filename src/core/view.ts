@@ -129,8 +129,8 @@ export function buildView(cache: Cache, self: Self, now: Date, opts: ViewOptions
 
   const live = new Set<string>();
   if (self.session !== undefined) live.add(sessionKey(self.actor, self.session)); // the viewer is running right now
-  // Every actor ref in the cache: its sessions by id (latest stamp wins), or null when its document cannot be read.
-  const actors = new Map<string, Map<string, Session> | null>();
+  // Every actor ref in the cache: its sessions by id (latest stamp wins) and when its clone wrote it, or null when its document cannot be read.
+  const actors = new Map<string, { sessions: Map<string, Session>; updatedAt: string } | null>();
   const decisions: ViewDecision[] = [];
   const tasks: TaskDoc[] = [];
 
@@ -158,7 +158,7 @@ export function buildView(cache: Cache, self: Self, now: Date, opts: ViewOptions
         const previous = latest.get(session.id);
         if (previous === undefined || Date.parse(session.seenAt) > Date.parse(previous.seenAt)) latest.set(session.id, session);
       }
-      actors.set(doc.actor, stamps);
+      actors.set(doc.actor, { sessions: stamps, updatedAt: doc.updatedAt });
       for (const session of latest.values()) {
         if (!(nowMs - Date.parse(session.seenAt) < ttlMs)) continue;
         live.add(sessionKey(doc.actor, session.id));
@@ -212,10 +212,15 @@ export function buildView(cache: Cache, self: Self, now: Date, opts: ViewOptions
     if (task.status !== "claimed" || task.owner === null) return null;
     if (live.has(sessionKey(task.owner.actor, task.owner.session))) return "live";
     if (view.fetchedAt === null) return "unknown"; // never fetched, or the cache could not be read
-    const sessions = actors.get(task.owner.actor);
-    if (sessions === undefined || sessions === null) return "unknown";
-    const session = sessions.get(task.owner.session);
-    if (session === undefined) return "expired"; // the owner's clone says the session is over
+    const owner = actors.get(task.owner.actor);
+    if (owner === undefined || owner === null) return "unknown";
+    const session = owner.sessions.get(task.owner.session);
+    if (session === undefined) {
+      // The owner's clone says the session is over, if it wrote that after the claim. A document from
+      // before the claim cannot list the claiming session yet: a sync leaves a ref that kept moving at
+      // its old copy (transport fetchAll). Both stamps are the owner's clone's clock, so no skew enters.
+      return Date.parse(owner.updatedAt) < Date.parse(task.updatedAt) ? "unknown" : "expired";
+    }
     // Not live: either last seen a TTL ago or more, or stamped too far ahead to mean anything.
     return Date.parse(session.seenAt) - nowMs > MAX_CLOCK_SKEW_MS || Number.isNaN(Date.parse(session.seenAt)) ? "unknown" : "expired";
   };
