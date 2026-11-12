@@ -178,7 +178,8 @@ test("AGENTS.md that is a link: the file it points at is the one that has to be 
   await alice.write("CLAUDE.md", "# Project rules\n");
   await symlink("CLAUDE.md", join(alice.dir, "AGENTS.md"));
   await commitAll(h, alice, "rules for agents");
-  assert.equal((await alice.huddle(["init"])).code, 0);
+  // Agents named, not detected: which agents a machine has installed must not decide what there is to add.
+  assert.equal((await alice.huddle(["init", "--agent", "claude-code", "--agent", "codex"])).code, 0);
   // Everything but the file the block went into.
   await alice.git("add", ".huddle", ".claude", ".codex");
   await alice.git("-c", `core.hooksPath=${join(h.root, "no-hooks")}`, "commit", "--quiet", "-m", "Set up huddle");
