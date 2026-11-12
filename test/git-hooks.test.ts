@@ -805,7 +805,7 @@ test("git install: a hooks directory outside the repository is not huddle's to c
   assert.equal(check.installed, false);
   assert.match(check.detail, /^no git hooks: core\.hooksPath points outside this repository/);
   assert.deepEqual(await removeGitHooks(alice.dir), []);
-  assert.equal(await gitHooks.detect(alice.dir), true, "init still asks, so that the reason is shown");
+  assert.equal(await gitHooks.detect(alice.dir), false, "a plain init stays out of it, as it does everywhere");
 
   // Through a link, too: the hooks directory inside .git is a link to the shared one.
   await alice.git("config", "--unset", "core.hooksPath");
@@ -1075,19 +1075,24 @@ test("git hooks, end to end: on a branch from before huddle was set up the hooks
 // detect and the registry
 // ---------------------------------------------------------------------------
 
-test("git adapter: registered, and on for every repository with a working tree", async (t) => {
+test("git adapter: registered, and an option that is asked for by name, never set up by a plain init", async (t) => {
   assert.equal(getAdapter("git"), gitHooks);
   assert.ok(ADAPTERS.includes(gitHooks));
   assert.equal(gitHooks.name, "git");
   assert.equal(gitHooks.title, "git hooks");
+  // What this version sets up: two agents, and the git hooks for whoever asks.
+  assert.deepEqual(ADAPTERS.map((adapter) => adapter.name), ["claude-code", "codex", "git"]);
 
   const h = await createHarness(t);
   const alice = await h.clone("alice");
-  assert.equal(await gitHooks.detect(alice.dir), true);
-  assert.equal(await gitHooks.detect(h.remote), false, "a bare repository has no working tree to commit from");
+  // Every repository has git: detecting it would put these hooks into every clone that runs `huddle init`.
+  assert.equal(await gitHooks.detect(alice.dir), false);
+  assert.equal(await gitHooks.detect(h.remote), false);
   const nowhere = await realpath(await mkdtemp(join(tmpdir(), "huddle-nowhere-")));
   t.after(() => rm(nowhere, { recursive: true, force: true }));
   assert.equal(await gitHooks.detect(nowhere), false);
+  // Asked for by name, it says where it cannot work.
+  await assert.rejects(gitHooks.install({ repoRoot: h.remote, bundle: BUNDLE }), /this is not a git repository with a working tree/);
   await assert.rejects(gitHooks.install({ repoRoot: nowhere, bundle: BUNDLE }), /this is not a git repository with a working tree/);
   assert.deepEqual(await gitHooks.check(nowhere), { installed: false, detail: "no git hooks: this is not a git repository with a working tree", notes: [] });
 });
