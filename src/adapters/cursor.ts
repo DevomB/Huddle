@@ -13,20 +13,27 @@
 //   beforeSubmitPrompt   prompt                             timeout 5
 //   postToolUse          pre-edit when the tool edited a    timeout 5, matcher Write|Delete|Shell
 //                        file, else prompt without a text
+//   postToolUseFailure   prompt without a text              timeout 5, matcher Write|Delete|Shell
 //   afterFileEdit        post-edit                          timeout 5
 //   stop                 turn-end                           timeout 5
 //   sessionEnd           session-end                        timeout 5
 //
 // Where Cursor differs from Claude Code, and it matters here:
 //
-// - A hook can put text in front of the agent in two places only:
-//   sessionStart and postToolUse, both through `additional_context`.
-//   beforeSubmitPrompt can let the prompt pass or block it and has no field
-//   that reaches the agent. So the prompt records the intent and nothing is
-//   shown, and what changed in the team comes with the next tool call
-//   instead: a postToolUse that is no file edit is handed to the engine as a
-//   prompt without a text, which is a sign of life plus the briefing on
-//   whatever is new.
+// - A hook can put text in front of the agent in three places only:
+//   sessionStart, postToolUse and postToolUseFailure, all through
+//   `additional_context`. beforeSubmitPrompt can let the prompt pass or block
+//   it and has no field that reaches the agent. So the prompt records the
+//   intent and nothing is shown, and what changed in the team comes after a
+//   tool call instead: a postToolUse that is no file edit, and every
+//   postToolUseFailure, is handed to the engine as a prompt without a text,
+//   which is a sign of life plus the briefing on whatever is new.
+// - As things stand that means: after a shell command, or after a tool call
+//   that failed. The postToolUse of an edit goes to the engine as a pre-edit
+//   (next point), and a pre-edit answers with overlap warnings only. A turn
+//   that edits and runs no shell command hears no news. The engine is getting
+//   an event that carries both; when it has it, the edit's postToolUse
+//   becomes that one.
 // - Nothing can be said before an edit without stopping it. preToolUse's
 //   `agent_message` is "fed back to the agent when the action is denied", and
 //   preToolUse is one of the hooks where an answer Cursor cannot read blocks
@@ -40,11 +47,23 @@
 //   shows `tool_input` for Shell only. It is read as `file_path`, the name
 //   every documented Cursor payload uses for a file (afterFileEdit,
 //   beforeReadFile), then as `path`. If Cursor calls it something else, an
-//   edit still counts as a sign of life and brings the news, and no overlap
-//   warning is ever given.
-// - No hook can be asynchronous: Cursor waits for each one. So postToolUse is
-//   registered for the tools that change things and not for Read or Grep,
-//   and an edit costs two short processes.
+//   edit still counts as a sign of life and brings the news, no overlap
+//   warning is ever given, and the hook says so on stderr with the names of
+//   the fields it did find (never their values), so that it leaves a trace.
+// - sessionStart "runs as fire-and-forget; the agent loop does not wait for or
+//   enforce a blocking response", and huddle's session-start waits up to 4 s
+//   for a sync before it answers. So the briefing given there may never reach
+//   the agent. It is printed, and it is not recorded as shown (`unshown`): the
+//   first shell command brings the briefing again. Twice at worst, where the
+//   other choice was never at worst. sessionEnd is fire-and-forget too ("the
+//   response is logged but not used"). For the other hooks the page does not
+//   say whether Cursor waits; huddle keeps them short either way, which is
+//   why postToolUse is registered for the tools that change things and not
+//   for Read or Grep.
+// - Every hook of every source runs, and of several `additional_context`
+//   answers to one event "the last response wins". A hook of the user's that
+//   answers postToolUse too can replace huddle's text, which huddle has then
+//   recorded as shown. install() and check() say so in a note.
 // - A handler is a command line, run from the project root, by PowerShell on
 //   Windows. `node <bundle> hook cursor <event>` reads the same in every
 //   shell, which a check for node or for the bundle would not. Where either
@@ -52,34 +71,49 @@
 //   then carries on ("Hook failed, action proceeds").
 // - The event comes from the command line, not from the payload: Cursor ran
 //   the command it found under that event.
-// - The session id is `conversation_id`, which every hook carries;
-//   `session_id` on sessionStart and sessionEnd is "same as conversation_id".
-// - `env` returned from sessionStart reaches later hooks, not the agent's
-//   shell, so HUDDLE_SESSION is not passed on. `huddle intent` typed by the
-//   agent finds the session anyway: it is the one last active in the worktree.
+// - The session id is `conversation_id`, which the page lists among the fields
+//   of every hook; for sessionStart it says `session_id` is the "same as
+//   conversation_id".
+// - `env` returned from sessionStart is "available to all subsequent hook
+//   executions". Nothing says it reaches the agent's shell, so HUDDLE_SESSION
+//   is not passed on. `huddle intent` typed by the agent finds the session
+//   anyway: it is the one last active in the worktree.
 // - Cloud agents run a project's hooks, but not sessionStart and sessionEnd.
 //   A session there appears with its first prompt and ages out.
 // - Which conversation_id a subagent's tool calls carry is not documented.
 //   Whatever id an event carries is its session.
 // - Cursor also runs Claude Code's hooks from .claude/settings.json unless
 //   that is switched off. claude-code.ts stands down for a payload that is
-//   Cursor's, so that one Cursor session is not handled by two adapters.
+//   Cursor's, so that one Cursor session is not recorded by two adapters.
+//   That leaves a repository with huddle's Claude Code hooks and without
+//   these: a Cursor session there would be invisible. So detect() says yes
+//   wherever the Claude Code hooks are, and a default `huddle init` installs
+//   both.
 
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { asRecord, asText, checkHooks, clip, exists, installHooks, isVersion } from "./json-hooks.ts";
+import { asRecord, asText, checkHooks, clip, exists, fileNamesHook, installHooks, isVersion, plainCommand, twiceNote } from "./json-hooks.ts";
 import type { Check, HookFile, Installed, Json, Registration } from "./json-hooks.ts";
 import { SILENT } from "./types.ts";
 import type { Adapter, HookEvent, HookInput, HookOutcome, HookOutput, InstallOptions } from "./types.ts";
 
 const NAME = "cursor";
 const HOOKS = ".cursor/hooks.json";
+/** The version of the hooks file this adapter writes entries for. */
+const VERSION = 1;
 
 /**
  * The tools whose postToolUse huddle wants: the two that change a file by
  * name, and the shell, which is how a session that edits nothing still shows
  * as alive. A matcher is a regular expression tested against the tool type;
  * this one is in the form of the page's own example ("Shell|Read|Write").
+ *
+ * Not anchored, on purpose. Anchored it would leave out an MCP tool whose
+ * name contains one of the words, which costs a short process that answers
+ * nothing. But the tool types are known from the page alone: if one is spelled
+ * a little differently in a real Cursor, an anchored matcher never fires and
+ * huddle is deaf there, with nothing to show for it. Anchor it once it has
+ * been seen to work.
  */
 const AFTER_TOOLS = "Write|Delete|Shell";
 
@@ -87,6 +121,8 @@ const REGISTRATIONS: readonly Registration[] = [
   { event: "sessionStart", type: "session-start", timeout: 10 },
   { event: "beforeSubmitPrompt", type: "prompt", timeout: 5 },
   { event: "postToolUse", type: "pre-edit", timeout: 5, matcher: AFTER_TOOLS },
+  // "Called when a tool fails, times out, or is denied." No edit happened, so it is never a pre-edit.
+  { event: "postToolUseFailure", type: "prompt", timeout: 5, matcher: AFTER_TOOLS },
   // No matcher: this event is "matched against the value Write" and nothing else.
   { event: "afterFileEdit", type: "post-edit", timeout: 5 },
   { event: "stop", type: "turn-end", timeout: 5 },
@@ -96,7 +132,14 @@ const REGISTRATIONS: readonly Registration[] = [
 const REGISTERED = new Map<string, Registration>(REGISTRATIONS.map((registration) => [registration.event, registration]));
 
 /** The events whose answer has a field that reaches the agent. */
-const SPEAKS: ReadonlySet<string> = new Set(["sessionStart", "postToolUse"]);
+const SPEAKS: ReadonlySet<string> = new Set(["sessionStart", "postToolUse", "postToolUseFailure"]);
+
+/** What parse() hands to format() through HookEvent.native. */
+interface Native {
+  event: string;
+  /** A file tool whose input named no file where editedPaths() looks: the tool, and the names of the fields it did have. */
+  unnamed?: { tool: string; fields: string[] };
+}
 
 // ---------------------------------------------------------------------------
 // parse: a Cursor payload on stdin -> a normalized event
@@ -115,13 +158,28 @@ function toolInput(value: unknown): Json | null {
   }
 }
 
+/** Is this the payload of a tool that changes one file by name? */
+function isFileTool(payload: Json): boolean {
+  return FILE_TOOLS.includes(asText(payload.tool_name));
+}
+
 /** The file a tool changed, or [] when the tool is not one that names a file or the name is not where this looks. */
 function editedPaths(payload: Json): string[] {
-  if (!FILE_TOOLS.includes(asText(payload.tool_name))) return [];
+  if (!isFileTool(payload)) return [];
   const input = toolInput(payload.tool_input);
   if (input === null) return [];
   const path = asText(input.file_path) || asText(input.path);
   return path === "" ? [] : [path];
+}
+
+/** Field names are Cursor's own words; anything else in their place is not repeated. */
+const FIELD_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,39}$/;
+
+/** The names of the fields a tool's input has, for the trace of an edit huddle could not name. Never a value. */
+function fieldNames(payload: Json): string[] {
+  return Object.keys(toolInput(payload.tool_input) ?? {})
+    .filter((name) => FIELD_NAME.test(name))
+    .slice(0, 12);
 }
 
 function parsePayload(input: HookInput): HookEvent | null {
@@ -140,20 +198,25 @@ function parsePayload(input: HookInput): HookEvent | null {
     // The tool hooks say where the tool ran. The others say nothing, and a
     // project's hooks start in the project root.
     cwd: asText(payload.cwd) || input.cwd,
-    native: { event: registration.event },
   };
+  const native: Native = { event: registration.event };
+  event.native = native;
 
   if (event.type === "session-end") {
     const reason = asText(payload.reason);
     if (reason !== "") event.reason = reason;
   } else if (event.type === "prompt") {
-    const prompt = asText(payload.prompt).trim();
+    // Only the user's prompt has a text. After a failed tool call there is none to take an intent from.
+    const prompt = registration.event === "beforeSubmitPrompt" ? asText(payload.prompt).trim() : "";
     if (prompt !== "") event.prompt = prompt;
   } else if (event.type === "pre-edit") {
     const paths = editedPaths(payload);
-    // Not an edit huddle can name: the session is alive, and may hear the news.
-    if (paths.length === 0) event.type = "prompt";
-    else event.paths = paths;
+    if (paths.length > 0) event.paths = paths;
+    else {
+      // Not an edit huddle can name: the session is alive, and may hear the news.
+      event.type = "prompt";
+      if (isFileTool(payload)) native.unnamed = { tool: asText(payload.tool_name), fields: fieldNames(payload) };
+    }
   } else if (event.type === "post-edit") {
     // afterFileEdit: "file_path": "<absolute path>".
     const path = asText(payload.file_path);
@@ -181,17 +244,36 @@ function parse(input: HookInput): HookEvent | null {
  */
 const MAX_CONTEXT_CHARS = 6000;
 
+/**
+ * One line for stderr, which Cursor shows in its Hooks output channel, when an
+ * edit could not be named. Without it nothing would ever show that the overlap
+ * warnings are missing.
+ */
+function unnamedTrace(native: Json | null): string {
+  const unnamed = asRecord(native?.unnamed);
+  if (unnamed === null) return "";
+  const fields = Array.isArray(unnamed.fields) ? (unnamed.fields as unknown[]).filter((name): name is string => typeof name === "string") : [];
+  const found = fields.length === 0 ? "no fields huddle can read" : `the fields ${fields.join(", ")}`;
+  return `huddle: Cursor's ${asText(unnamed.tool)} call did not name its file where huddle looks (file_path, path); its input has ${found}. huddle cannot warn about overlaps on files edited this way. Please report this line.\n`;
+}
+
 function format(event: HookEvent, outcome: HookOutcome): HookOutput {
-  if (typeof outcome.context !== "string" || outcome.context.trim() === "") return SILENT;
+  const native = asRecord(event.native);
+  const stderr = unnamedTrace(native);
+  const silent: HookOutput = stderr === "" ? SILENT : { ...SILENT, stderr };
+  if (typeof outcome.context !== "string" || outcome.context.trim() === "") return silent;
   // Nothing is printed where no field reaches the agent. On stop the only
   // field there is, followup_message, would start another turn; on
   // beforeSubmitPrompt the only ones decide whether the prompt goes through.
   // `unshown` tells the engine so: it leaves what the session was shown as it
   // is, and the same news comes up at the next event that can carry it.
-  if (!SPEAKS.has(asText(asRecord(event.native)?.event))) return { ...SILENT, unshown: true };
+  const nativeEvent = asText(native?.event);
+  if (!SPEAKS.has(nativeEvent)) return { ...silent, unshown: true };
   // outcome.env is not used: see the top of the file. And no `permission` or
   // `continue` is ever printed, so huddle neither allows nor blocks anything.
-  return { stdout: JSON.stringify({ additional_context: clip(outcome.context, MAX_CONTEXT_CHARS) }), stderr: "", exitCode: 0 };
+  const output: HookOutput = { stdout: JSON.stringify({ additional_context: clip(outcome.context, MAX_CONTEXT_CHARS) }), stderr, exitCode: 0 };
+  // Cursor does not wait for sessionStart's answer (top of the file), so what is said there does not count as said.
+  return nativeEvent === "sessionStart" ? { ...output, unshown: true } : output;
 }
 
 // ---------------------------------------------------------------------------
@@ -208,17 +290,22 @@ const SHELL_INERT = /^[A-Za-z0-9._/-]+$/;
 const COMMAND = /^node ([A-Za-z0-9._/-]+) hook cursor ([A-Za-z]+)$/;
 
 /**
- * Any command that runs a file named exactly huddle.mjs as `hook cursor`,
- * however the path is written: an older install, or one edited by hand.
+ * The whole command and nothing else: `node <path>/huddle.mjs hook cursor
+ * <event>`, however the path is written. A line of the user's that runs this
+ * among other things (`fmt.sh && node ...`, `node ...; notify.sh`), or only
+ * mentions it, is theirs.
  */
-const OURS = /(?:^|[\s"'\\/])huddle\.mjs["']?\s+hook\s+cursor(?![\w-])/;
+const OURS = plainCommand(NAME);
 
 const HOOKS_FILE: HookFile = {
   path: HOOKS,
   registrations: REGISTRATIONS,
   flat: true,
   /** "Config schema version. Must be a positive integer (use 1)." */
-  version: 1,
+  version: VERSION,
+  agent: NAME,
+  /** A handler's `type` is "command" unless it says otherwise, so one that spells it out is the same handler. */
+  defaults: { type: "command" },
   /**
    * Project hooks "run from the project root", so the bundle's repo-relative
    * path is enough. Neither `failClosed` nor `loop_limit` is set: a huddle
@@ -247,12 +334,15 @@ const TRUST_NOTE = "Cursor runs a project's hooks only in a workspace that is tr
 const NODE_NOTE =
   "Every teammate needs Node 20 or later on the PATH that Cursor itself sees. An app started outside a shell may not see a node installed by nvm, fnm or volta. Whether the hooks run, and why not, is in Cursor's Hooks output channel.";
 const LATER_NOTE =
-  "Cursor lets a hook speak to its agent only when a session starts and after a tool call. So what changed in the team reaches the agent with its next tool call rather than with the prompt, and a warning about a file a teammate is working on comes right after the first edit of it, not before.";
-const NOTES: readonly string[] = [TRUST_NOTE, NODE_NOTE, LATER_NOTE];
+  "Cursor lets a hook speak to its agent only after a tool call, and when a session starts, where it does not wait for the answer. huddle is called after edits, deletions and shell commands. So what changed in the team reaches the agent with its next shell command, or after a tool call that failed, not with the prompt and not after an edit. A warning about a file a teammate is working on comes right after the first edit of it, not before.";
+const LAST_WINS_NOTE =
+  "If another hook answers the same Cursor event with an additional_context of its own, Cursor keeps only one of the answers, and it may not be huddle's.";
+const NOTES: readonly string[] = [TRUST_NOTE, NODE_NOTE, LATER_NOTE, LAST_WINS_NOTE];
 
 async function install(opts: InstallOptions): Promise<Installed> {
-  const changed = await installHooks(HOOKS_FILE, opts.repoRoot, opts.bundle);
-  return { changed: changed ? [HOOKS] : [], notes: [...NOTES], files: [HOOKS] };
+  const { changed, twice } = await installHooks(HOOKS_FILE, opts.repoRoot, opts.bundle);
+  const also = twiceNote(HOOKS_FILE, twice);
+  return { changed: changed ? [HOOKS] : [], notes: also === null ? [...NOTES] : [...NOTES, also], files: [HOOKS] };
 }
 
 // ---------------------------------------------------------------------------
@@ -270,22 +360,30 @@ function here(): Surroundings {
 }
 
 async function check(repoRoot: string): Promise<Check> {
-  const { result, settings } = await checkHooks(HOOKS_FILE, repoRoot);
+  const { result, settings, twice } = await checkHooks(HOOKS_FILE, repoRoot);
   if (!result.installed) return result;
-  // The hooks are all there, and Cursor still wants a version on the file.
-  if (settings !== null && !isVersion(settings.version)) {
+  // The hooks are all there, and Cursor still wants a version on the file: the one these entries are written for.
+  if (settings !== null && settings.version !== VERSION) {
     const detail =
       settings.version === undefined
         ? `${HOOKS} has no "version", which Cursor requires. Run huddle init.`
-        : `${HOOKS} has a "version" that is not a positive whole number, which Cursor requires. Fix the file, then run huddle init.`;
+        : !isVersion(settings.version)
+          ? `${HOOKS} has a "version" that is not a positive whole number, which Cursor requires. Fix the file, then run huddle init.`
+          : `${HOOKS} has "version": ${String(settings.version)}, and huddle's hooks in it are written for version ${VERSION}. Whether they work there is not known.`;
     return { installed: false, broken: true, detail, notes: [] };
   }
-  return { ...result, notes: [...NOTES] };
+  const also = twiceNote(HOOKS_FILE, twice);
+  return { ...result, notes: also === null ? [...NOTES] : [...NOTES, also] };
 }
+
+/** Where the Claude Code adapter keeps its hooks, and its name in huddle's command (claude-code.ts). */
+const CLAUDE_SETTINGS = ".claude/settings.json";
+const CLAUDE_NAME = "claude-code";
 
 /**
  * detect(), with the surroundings passed in. True on any sign that Cursor is
- * used on this repo or by this user. It leans towards yes: the hook config is
+ * used on this repo or by this user, and wherever huddle's Claude Code hooks
+ * are installed, whoever uses Cursor or does not. It leans towards yes: the hook config is
  * committed for the whole team, and one unused file costs less than a
  * teammate whose agent stays invisible.
  *
@@ -294,6 +392,8 @@ async function check(repoRoot: string): Promise<Check> {
  */
 export async function detectCursor(repoRoot: string, around: Surroundings): Promise<boolean> {
   if (await exists(join(repoRoot, ".cursor"))) return true;
+  // Cursor runs huddle's Claude Code hooks, and they stand down for it (claude-code.ts). Where they are, these have to be too.
+  if (await fileNamesHook(join(repoRoot, CLAUDE_SETTINGS), CLAUDE_NAME)) return true;
   if (asText(around.env.CURSOR_AGENT) !== "") return true; // set in the shells Cursor's agent runs commands in
   return exists(join(around.home, ".cursor")); // the user's own hooks.json and the CLI's config live here
 }

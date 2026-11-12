@@ -352,7 +352,8 @@ async function readJson(file: string): Promise<Json> {
 
 function isOurs(candidate: unknown): boolean {
   const command = (candidate as Json | null)?.command;
-  return typeof command === "string" && command.endsWith(" hook codex");
+  // The whole line in the form install writes, for any bundle. A line of the user's that ends the same way is not it.
+  return typeof command === "string" && /^command -v node >\/dev\/null 2>&1 \|\| exit 0; test -f "\$\(git rev-parse --show-toplevel 2>\/dev\/null\)\/[\w.\/-]+" \|\| exit 0; node "\$\(git rev-parse --show-toplevel\)\/[\w.\/-]+" hook codex$/.test(command);
 }
 
 /** The file with every huddle handler taken out again, and the groups and events that leaves empty. */
@@ -530,6 +531,68 @@ test("install: hooks for another agent, or that merely look similar, are not hud
   const { root, file } = await scratchRepo(t, { hooks: { Stop: [{ hooks: lookalikes }] } });
   await codex.install({ repoRoot: root, bundle: BUNDLE });
   assert.deepEqual(((await readJson(file)).hooks as Record<string, Json[]>).Stop, [{ hooks: lookalikes }, { hooks: [handler(5)] }]);
+});
+
+test("install: a command of the user's that runs huddle's hook among other things, or only names it, is the user's and stays", async (t) => {
+  // The three from the review of the Cursor adapter, as they would stand in Codex's file, each with keys of its own.
+  const chained = { type: "command", command: "node .huddle/huddle.mjs hook codex; ./notify.sh", timeout: 30, statusMessage: "notifying" };
+  const after = { type: "command", command: "./format.sh && node .huddle/huddle.mjs hook codex" };
+  const mention = { type: "command", command: "echo 'TODO: node .huddle/huddle.mjs hook codex is noisy' >> notes.txt" };
+  // And huddle's own line, as install writes it, inside a longer one.
+  const wrapped = { type: "command", command: `${String(handler(5).command)} 2>> hooks.log` };
+  const theirs = { hooks: { Stop: [{ hooks: [chained] }], PostToolUse: [{ matcher: "Bash", hooks: [after, wrapped] }], SessionEnd: [{ hooks: [mention] }] } };
+  const { root, file } = await scratchRepo(t, theirs);
+  const result = await codex.install({ repoRoot: root, bundle: BUNDLE });
+  assert.deepEqual(result.changed, [".codex/hooks.json"]);
+  const merged = await readJson(file);
+  const hooks = merged.hooks as Record<string, unknown[]>;
+  // Each is where it was, as it was, and huddle's own handler stands in a group of its own next to it.
+  assert.deepEqual(hooks.Stop, [{ hooks: [chained] }, { hooks: [handler(5)] }]);
+  assert.deepEqual(hooks.PostToolUse, [{ matcher: "Bash", hooks: [after, wrapped] }, { hooks: [handler(5, { async: true })] }]);
+  assert.deepEqual(hooks.SessionEnd, [{ hooks: [mention] }, { hooks: [handler(3)] }]);
+  assert.deepEqual(withoutHuddle(merged), theirs, "taking huddle's handlers out again gives back the original");
+  assert.deepEqual(countOurs(merged), ONE_EACH);
+
+  // The user is told that the hook may now run twice, by init and by doctor.
+  const twice =
+    "In .codex/hooks.json, a hook command of your own under Stop, PostToolUse, SessionEnd also names huddle's hook. huddle left it as it is and has its own handler next to it. If yours runs huddle's hook, the hook now runs twice on that event: take it out of yours.";
+  assert.deepEqual(result.notes.slice(1), [twice]);
+  const text = await readFile(file, "utf8");
+  const again = await codex.install({ repoRoot: root, bundle: BUNDLE });
+  assert.deepEqual([again.changed, again.notes.slice(1)], [[], [twice]]);
+  assert.equal(await readFile(file, "utf8"), text);
+  await withBundle(root);
+  const checked = await checkCodex(root, { env: {}, home: await emptyDir(t) });
+  assert.equal(checked.installed, true);
+  assert.ok(checked.notes.includes(twice), checked.notes.join("\n"));
+});
+
+test("install: huddle's handlers under an event this version does not use are taken out, and nothing else is", async (t) => {
+  const userGuard = { type: "command", command: "./guard.sh" };
+  const stale = {
+    hooks: {
+      ...(installed().hooks as Json),
+      // A group of huddle's alone goes; from a group shared with the user's handler only huddle's goes.
+      PermissionRequest: [{ hooks: [handler(5)] }, { matcher: "Bash", hooks: [userGuard, handler(5)] }],
+      Notification: [{ hooks: [{ type: "command", command: "node .huddle/huddle.mjs hook codex" }] }],
+      SubagentStop: [{ hooks: [userGuard] }],
+    },
+  };
+  const { root, file } = await scratchRepo(t, stale);
+  await withBundle(root);
+  const around = { env: {}, home: await emptyDir(t) };
+  assert.deepEqual(await checkCodex(root, around), {
+    installed: false,
+    broken: true,
+    detail: "huddle hooks in .codex/hooks.json are still there under PermissionRequest, Notification, which this version does not use. Run huddle init.",
+    notes: [],
+  });
+  assert.deepEqual((await codex.install({ repoRoot: root, bundle: BUNDLE })).changed, [".codex/hooks.json"]);
+  assert.deepEqual(await readJson(file), {
+    hooks: { ...(installed().hooks as Json), PermissionRequest: [{ matcher: "Bash", hooks: [userGuard] }], SubagentStop: [{ hooks: [userGuard] }] },
+  });
+  assert.equal((await checkCodex(root, around)).installed, true);
+  assert.deepEqual((await codex.install({ repoRoot: root, bundle: BUNDLE })).changed, []);
 });
 
 test("install: a bundle path that is not inert in a shell is refused before anything is written", async (t) => {
@@ -762,8 +825,26 @@ test("check: a file with no huddle hooks, or that cannot be read, is not install
     await withBundle(root);
     assert.deepEqual(await checkCodex(root, around), { installed: false, detail: "no huddle hooks in .codex/hooks.json. Run huddle init.", notes: [] });
   }
-  const { root } = await scratchRepo(t, "{ nope");
-  assert.deepEqual(await checkCodex(root, around), { installed: false, broken: true, detail: ".codex/hooks.json cannot be read as a JSON object. Fix the file, then run huddle init.", notes: [] });
+  // A file huddle cannot parse, with nothing of huddle's in it: not installed, and not huddle's to call broken.
+  for (const content of ["{ nope", "[]", '// mine\n{ "hooks": {} }']) {
+    const { root } = await scratchRepo(t, content);
+    assert.deepEqual(
+      await checkCodex(root, around),
+      { installed: false, detail: ".codex/hooks.json cannot be read as a JSON object, so huddle cannot add its hooks to it. There are none in it now.", notes: [] },
+      content,
+    );
+  }
+  // With huddle's hooks in it, it is broken: they are there and nobody can say whether they still work.
+  const whole = `${JSON.stringify(installed(), null, 2)}\n`;
+  for (const content of [whole.replace(/\}\n$/, ",}\n"), `// team hooks\n${whole}`, `<<<<<<< HEAD\n${whole}=======\n${whole}>>>>>>> theirs\n`, whole.slice(0, whole.indexOf('"Stop"'))]) {
+    const { root } = await scratchRepo(t, content);
+    await withBundle(root);
+    assert.deepEqual(
+      await checkCodex(root, around),
+      { installed: false, broken: true, detail: ".codex/hooks.json cannot be read as a JSON object, and huddle's hooks are in it. Fix the file, then run huddle init.", notes: [] },
+      content.slice(0, 40),
+    );
+  }
 });
 
 test("check: reads the hooks feature switch out of a config.toml", () => {

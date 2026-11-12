@@ -87,6 +87,9 @@ const EXPECTED: Record<string, Omit<HookEvent, "native"> | null> = {
   "post-tool-use.write.unnamed": { type: "prompt", ...base },
   "post-tool-use.delete": { type: "pre-edit", ...base, paths: [`${ROOT}/src/auth/old.ts`] },
   "post-tool-use.mcp": { type: "prompt", ...base },
+  // After a tool call that failed, timed out or was denied: no edit happened, whatever the tool was.
+  "post-tool-use-failure.shell": { type: "prompt", ...base, cwd: `${ROOT}/packages/api` },
+  "post-tool-use-failure.write": { type: "prompt", ...base },
   "after-file-edit": { type: "post-edit", ...base, paths: [`${ROOT}/src/auth/jwt.ts`] },
   stop: { type: "turn-end", ...base },
   "session-end": { type: "session-end", ...base, reason: "user_close" },
@@ -108,11 +111,16 @@ test("fixtures: every payload has an expectation, and every normalized event has
   }
 });
 
+/** What parse() notes for format() besides the event: the one edit here whose file it could not name. */
+const NOTED: Record<string, Json> = {
+  "post-tool-use.write.unnamed": { unnamed: { tool: "Write", fields: ["target"] } },
+};
+
 for (const [name, expected] of Object.entries(EXPECTED)) {
   test(`parse: ${name}`, () => {
     const event = parse(fixtureText(name));
     assert.deepEqual(bare(event), expected);
-    if (event !== null) assert.deepEqual(event.native, { event: fixture(name).hook_event_name });
+    if (event !== null) assert.deepEqual(event.native, { event: fixture(name).hook_event_name, ...NOTED[name] });
   });
 }
 
@@ -176,8 +184,45 @@ test("parse: after a tool call, a file edit is one that Write or Delete made to 
     const event = parse({ ...write, tool_name: tool, tool_input: input });
     assert.equal(event?.type, "prompt", JSON.stringify([tool, input]));
     assert.equal(event?.paths, undefined, JSON.stringify([tool, input]));
-    assert.deepEqual(event?.native, { event: "postToolUse" });
+    // A Write that names no file is noted, for the line on stderr. No other tool here was expected to name one.
+    const native = event?.native as Json;
+    assert.equal(native.event, "postToolUse");
+    assert.equal("unnamed" in native, tool === "Write", JSON.stringify([tool, input]));
   }
+});
+
+test("parse: of an edit it cannot name, what is noted is the tool and the names of its input's fields, never a value", () => {
+  const write = fixture("post-tool-use.write");
+  const noted = (tool_input: unknown, tool_name = "Write"): unknown => (parse({ ...write, tool_name, tool_input })?.native as Json).unnamed;
+  assert.deepEqual(noted({ target: "/home/dev/acme/.env", contents: "API_KEY=sk-live-123" }), { tool: "Write", fields: ["target", "contents"] });
+  assert.deepEqual(noted({ target: "gone.ts" }, "Delete"), { tool: "Delete", fields: ["target"] });
+  assert.deepEqual(noted(JSON.stringify({ uri: "file:///a/b.ts" })), { tool: "Write", fields: ["uri"] });
+  // A field name is a short word. Anything else in its place is not repeated, and neither are more than a dozen.
+  assert.deepEqual(noted({ "rm -rf /": 1, "a\nb": 2, "<script>": 3, "": 4, ["x".repeat(41)]: 5, ok_name: 6, ["y".repeat(40)]: 7 }), { tool: "Write", fields: ["ok_name", "y".repeat(40)] });
+  const many = Object.fromEntries(Array.from({ length: 30 }, (_, index) => [`field${index}`, index]));
+  assert.deepEqual(noted(many), { tool: "Write", fields: Array.from({ length: 12 }, (_, index) => `field${index}`) });
+  for (const nothing of [{}, null, "not json", ["/a/b.ts"], { file_path: "" }]) {
+    const fields = (noted(nothing) as { fields: string[] }).fields;
+    assert.deepEqual(fields, nothing !== null && typeof nothing === "object" && "file_path" in nothing ? ["file_path"] : [], JSON.stringify(nothing));
+  }
+  // Nothing is noted for an edit that was named.
+  assert.equal(noted({ file_path: "/a/b.ts" }), undefined);
+});
+
+test("parse: a tool call that failed is a sign of life and never an edit, whatever the tool and whatever went wrong", () => {
+  const failed = fixture("post-tool-use-failure.write");
+  for (const failure_type of ["timeout", "error", "permission_denied", "a kind added later", 7, undefined]) {
+    for (const tool_name of ["Write", "Delete", "Shell", "MCP:create_issue"]) {
+      const event = parse({ ...failed, tool_name, failure_type });
+      assert.equal(event?.type, "prompt", `${tool_name} ${String(failure_type)}`);
+      assert.equal(event !== null && ("paths" in event || "prompt" in event), false, `${tool_name} ${String(failure_type)}`);
+      assert.deepEqual(event?.native, { event: "postToolUseFailure" });
+    }
+  }
+  // Not even when its input names no file: there is no edit that huddle could have missed.
+  assert.deepEqual(parse({ ...failed, tool_input: { target: "x.ts" } })?.native, { event: "postToolUseFailure" });
+  // The command line decides, as for every event.
+  assert.equal(parse(fixture("post-tool-use.write"), ["postToolUseFailure"])?.type, "prompt");
 });
 
 test("parse: only what the user sent is a prompt text", () => {
@@ -188,10 +233,12 @@ test("parse: only what the user sent is a prompt text", () => {
     assert.equal(event?.type, "prompt");
     assert.equal(event !== null && "prompt" in event, false, JSON.stringify(empty));
   }
-  // The prompt-without-a-text that a tool call becomes never picks one up from the payload.
-  const afterShell = parse({ ...fixture("post-tool-use.shell"), prompt: "not the user's words" });
-  assert.equal(afterShell?.type, "prompt");
-  assert.equal(afterShell !== null && "prompt" in afterShell, false);
+  // The prompt-without-a-text that a tool call becomes never picks one up from the payload, failed or not.
+  for (const name of ["post-tool-use.shell", "post-tool-use.write.unnamed", "post-tool-use-failure.shell", "post-tool-use-failure.write"]) {
+    const afterTool = parse({ ...fixture(name), prompt: "not the user's words", error_message: "not the user's words either" });
+    assert.equal(afterTool?.type, "prompt", name);
+    assert.equal(afterTool !== null && "prompt" in afterTool, false, name);
+  }
 });
 
 test("parse: cwd is where the tool ran when the payload says, and the hook's own directory otherwise", () => {
@@ -251,8 +298,8 @@ test("parse: anything that is not a payload huddle knows is null, and nothing th
 // format
 // ---------------------------------------------------------------------------
 
-test("format: at session start and after a tool call the context goes out as additional_context, and nothing else does", () => {
-  const speaking: HookEvent[] = [eventOf("session-start", "sessionStart"), eventOf("pre-edit", "postToolUse"), eventOf("prompt", "postToolUse")];
+test("format: after a tool call, failed or not, the context goes out as additional_context, and nothing else does", () => {
+  const speaking: HookEvent[] = [eventOf("pre-edit", "postToolUse"), eventOf("prompt", "postToolUse"), eventOf("prompt", "postToolUseFailure")];
   for (const event of speaking) {
     const output = format(event, { context: BRIEFING, env: { HUDDLE_SESSION: SESSION } });
     assert.deepEqual(JSON.parse(output.stdout), { additional_context: BRIEFING }, event.type);
@@ -261,7 +308,47 @@ test("format: at session start and after a tool call the context goes out as add
     assert.equal(output.exitCode, 0);
     assert.equal(output.unshown, undefined);
     assert.equal(output.appendLines, undefined);
+    assert.equal("unshown" in output, false, "what was said after a tool call counts as said");
   }
+});
+
+test("format: at session start the context goes out too, and does not count as shown, because Cursor does not wait for the answer", () => {
+  const output = format(eventOf("session-start", "sessionStart"), { context: BRIEFING, env: { HUDDLE_SESSION: SESSION } });
+  // The engine prints stdout whatever `unshown` says, and leaves what the session has seen as it was: the briefing comes again.
+  assert.deepEqual(output, { stdout: JSON.stringify({ additional_context: BRIEFING }), stderr: "", exitCode: 0, unshown: true });
+  // With nothing to say there is nothing that was not shown.
+  assert.deepEqual(format(eventOf("session-start", "sessionStart"), {}), SILENT);
+});
+
+const UNNAMED_TRACE =
+  "huddle: Cursor's Write call did not name its file where huddle looks (file_path, path); its input has the fields target. huddle cannot warn about overlaps on files edited this way. Please report this line.\n";
+
+test("format: an edit huddle could not name leaves one line on stderr, with the names of the fields and never what was in them", () => {
+  const unnamed = fixture("post-tool-use.write.unnamed");
+  const event = parse(unnamed);
+  assert.ok(event);
+  // With news to tell and without: the line is about the edit, not about the news.
+  assert.deepEqual(format(event, { context: BRIEFING }), { stdout: JSON.stringify({ additional_context: BRIEFING }), stderr: UNNAMED_TRACE, exitCode: 0 });
+  assert.deepEqual(format(event, {}), { stdout: "", stderr: UNNAMED_TRACE, exitCode: 0 });
+
+  const secret = parse({ ...unnamed, tool_name: "Delete", tool_input: { target: "/home/dev/acme/.env", contents: "API_KEY=sk-live-123", "$(reboot)": true } });
+  assert.ok(secret);
+  const line = format(secret, {}).stderr;
+  assert.equal(
+    line,
+    "huddle: Cursor's Delete call did not name its file where huddle looks (file_path, path); its input has the fields target, contents. huddle cannot warn about overlaps on files edited this way. Please report this line.\n",
+  );
+  assert.equal(/\.env|API_KEY|sk-live|reboot/.test(line), false, line);
+  const empty = parse({ ...unnamed, tool_input: {} });
+  assert.ok(empty);
+  assert.match(format(empty, {}).stderr, /^huddle: Cursor's Write call .*; its input has no fields huddle can read\. .*\n$/);
+
+  // An event that did not come out of parse() says nothing it was not handed in the right shape.
+  const made = (native: unknown): HookOutput => format({ type: "prompt", agent: "cursor", sessionId: SESSION, cwd: ROOT, native }, {});
+  assert.deepEqual(made({ event: "postToolUse", unnamed: "Write" }), SILENT);
+  assert.deepEqual(made({ event: "postToolUse", unnamed: ["Write"] }), SILENT);
+  assert.match(made({ event: "postToolUse", unnamed: { tool: "Write", fields: [7, "a", null, "b"] } }).stderr, /its input has the fields a, b\./);
+  assert.match(made({ event: "postToolUse", unnamed: { tool: "Write", fields: "target" } }).stderr, /its input has no fields huddle can read\./);
 });
 
 test("format: where Cursor gives a hook no way to reach the agent, nothing is printed and the context counts as not shown", () => {
@@ -282,7 +369,7 @@ test("format: where Cursor gives a hook no way to reach the agent, nothing is pr
 });
 
 test("format: nothing to say prints nothing, and that is not the same as not being able to say it", () => {
-  for (const native of ["sessionStart", "beforeSubmitPrompt", "postToolUse", "afterFileEdit", "stop", "sessionEnd"]) {
+  for (const native of ["sessionStart", "beforeSubmitPrompt", "postToolUse", "postToolUseFailure", "afterFileEdit", "stop", "sessionEnd"]) {
     for (const outcome of [{}, { context: "" }, { context: "  \n " }, { env: { HUDDLE_SESSION: SESSION } }, { context: 7 as unknown as string }]) {
       assert.deepEqual(format(eventOf("prompt", native), outcome), SILENT, `${native} ${JSON.stringify(outcome)}`);
     }
@@ -296,10 +383,12 @@ test("format: every fixture goes in and comes out without a word that decides an
     if (event === null) continue;
     const output = format(event, { context: BRIEFING, env: { HUDDLE_SESSION: SESSION } });
     assert.equal(output.exitCode, 0, name);
-    assert.equal(output.stderr, "", name);
-    const speaks = ["sessionStart", "postToolUse"].includes(String(fixture(name).hook_event_name));
+    assert.equal(output.stderr, name === "post-tool-use.write.unnamed" ? UNNAMED_TRACE : "", name);
+    const native = String(fixture(name).hook_event_name);
+    const speaks = ["sessionStart", "postToolUse", "postToolUseFailure"].includes(native);
     assert.equal(output.stdout !== "", speaks, name);
-    assert.equal(output.unshown === true, !speaks, name);
+    // Shown is what was printed where Cursor waits for it.
+    assert.equal(output.unshown === true, !speaks || native === "sessionStart", name);
     if (speaks) {
       const printed = JSON.parse(output.stdout) as Json;
       assert.deepEqual(Object.keys(printed), ["additional_context"], name);
@@ -326,7 +415,7 @@ test("format: context too long is cut at a line, with a pointer to the rest", ()
 // ---------------------------------------------------------------------------
 
 const BUNDLE = ".huddle/huddle.mjs";
-const EVENTS = ["sessionStart", "beforeSubmitPrompt", "postToolUse", "afterFileEdit", "stop", "sessionEnd"];
+const EVENTS = ["sessionStart", "beforeSubmitPrompt", "postToolUse", "postToolUseFailure", "afterFileEdit", "stop", "sessionEnd"];
 const ONE_EACH = Object.fromEntries(EVENTS.map((event) => [event, 1]));
 
 function handler(event: string, timeout: number, extra: Json = {}): Json {
@@ -341,6 +430,7 @@ function installed(): Json {
       sessionStart: [handler("sessionStart", 10)],
       beforeSubmitPrompt: [handler("beforeSubmitPrompt", 5)],
       postToolUse: [handler("postToolUse", 5, { matcher: "Write|Delete|Shell" })],
+      postToolUseFailure: [handler("postToolUseFailure", 5, { matcher: "Write|Delete|Shell" })],
       afterFileEdit: [handler("afterFileEdit", 5)],
       stop: [handler("stop", 5)],
       sessionEnd: [handler("sessionEnd", 5)],
@@ -365,7 +455,7 @@ async function readJson(file: string): Promise<Json> {
 
 function isOurs(candidate: unknown): boolean {
   const command = (candidate as Json | null)?.command;
-  return typeof command === "string" && / hook cursor [A-Za-z]+$/.test(command);
+  return typeof command === "string" && /^node \S+ hook cursor [A-Za-z]+$/.test(command);
 }
 
 /** The file with every huddle handler taken out again, and the events that leaves empty. */
@@ -396,10 +486,15 @@ test("install: an empty repo gets .cursor/hooks.json with one handler per event"
   assert.deepEqual((result as { files?: string[] }).files, [".cursor/hooks.json"]);
   const again = await cursor.install({ repoRoot: root, bundle: BUNDLE });
   assert.deepEqual([again.changed, (again as { files?: string[] }).files], [[], [".cursor/hooks.json"]]);
-  assert.equal(result.notes.length, 3);
+  assert.equal(result.notes.length, 4);
   assert.match(result.notes[0] ?? "", /only in a workspace that is trusted/);
   assert.match(result.notes[1] ?? "", /Node 20 or later on the PATH that Cursor itself sees/);
+  // When the agent hears what: with a shell command or after a failed tool call. Not with the prompt, and not after an edit.
+  assert.match(result.notes[2] ?? "", /reaches the agent with its next shell command, or after a tool call that failed, not with the prompt and not after an edit\./);
+  assert.match(result.notes[2] ?? "", /when a session starts, where it does not wait for the answer/);
   assert.match(result.notes[2] ?? "", /right after the first edit of it, not before/);
+  assert.match(result.notes[3] ?? "", /another hook answers the same Cursor event .* Cursor keeps only one of the answers, and it may not be huddle's\./);
+  assert.deepEqual(again.notes, result.notes);
 
   const text = await readFile(file, "utf8");
   assert.deepEqual(JSON.parse(text), installed());
@@ -433,10 +528,15 @@ test("install: what is written follows the rules in Cursor's hook reference", as
     assert.equal(guard in hooks, false, guard);
   }
   // The matcher is a regular expression on the tool type, in the form of the reference's own example.
-  const matcher = new RegExp(String(hooks.postToolUse?.[0]?.matcher));
-  for (const tool of ["Write", "Delete", "Shell"]) assert.ok(matcher.test(tool), tool);
-  for (const tool of ["Read", "Grep", "Task", "MCP:create_issue", "WebFetch"]) assert.equal(matcher.test(tool), false, tool);
-  for (const event of EVENTS.filter((name) => name !== "postToolUse")) assert.equal("matcher" in (hooks[event]?.[0] ?? {}), false, event);
+  // The same one after a tool call and after one that failed.
+  for (const event of ["postToolUse", "postToolUseFailure"]) {
+    const matcher = new RegExp(String(hooks[event]?.[0]?.matcher));
+    for (const tool of ["Write", "Delete", "Shell"]) assert.ok(matcher.test(tool), `${event} ${tool}`);
+    for (const tool of ["Read", "Grep", "Task", "MCP:create_issue", "WebFetch"]) assert.equal(matcher.test(tool), false, `${event} ${tool}`);
+    // Not anchored, and meant so (cursor.ts): a tool type spelled a little differently from the reference still gets through.
+    assert.ok(matcher.test("FileWrite"), event);
+  }
+  for (const event of EVENTS.filter((name) => !name.startsWith("postToolUse"))) assert.equal("matcher" in (hooks[event]?.[0] ?? {}), false, event);
 });
 
 test("install: installing twice adds nothing", async (t) => {
@@ -480,7 +580,7 @@ test("install: a user's existing hooks survive, untouched and in place", async (
   assert.deepEqual(Object.keys(merged), ["version", "hooks"]);
   const hooks = merged.hooks as Record<string, Json[]>;
   const userHooks = USER_HOOKS.hooks as Record<string, Json[]>;
-  assert.deepEqual(Object.keys(hooks), ["sessionStart", "preToolUse", "beforeShellExecution", "postToolUse", "afterFileEdit", "stop", "beforeSubmitPrompt", "sessionEnd"]);
+  assert.deepEqual(Object.keys(hooks), ["sessionStart", "preToolUse", "beforeShellExecution", "postToolUse", "afterFileEdit", "stop", "beforeSubmitPrompt", "postToolUseFailure", "sessionEnd"]);
   // The user's own come first, huddle's after them.
   assert.deepEqual(hooks.sessionStart, [...(userHooks.sessionStart ?? []), handler("sessionStart", 10)]);
   assert.deepEqual(hooks.postToolUse, [...(userHooks.postToolUse ?? []), handler("postToolUse", 5, { matcher: "Write|Delete|Shell" })]);
@@ -518,6 +618,7 @@ test("install: handlers left by an older or hand-edited install are brought up t
       postToolUse: [handler("postToolUse", 5, { matcher: "Write|Delete|Shell" })],
       stop: [handler("stop", 5)],
       sessionEnd: [userGuard, handler("sessionEnd", 5)],
+      postToolUseFailure: [handler("postToolUseFailure", 5, { matcher: "Write|Delete|Shell" })],
       afterFileEdit: [handler("afterFileEdit", 5)],
     },
   });
@@ -541,6 +642,174 @@ test("install: hooks for another agent, or that merely look similar, are not hud
   assert.deepEqual(((await readJson(file)).hooks as Record<string, unknown[]>).stop, [...lookalikes, handler("stop", 5)]);
 });
 
+test("install: a command of the user's that runs huddle's hook among other things, or only names it, is the user's and stays", async (t) => {
+  // The three from the review of this adapter, each with keys of its own that a replacement would have lost.
+  const chained = { command: "node .huddle/huddle.mjs hook cursor stop; .cursor/hooks/notify.sh", timeout: 30, loop_limit: 3 };
+  const after = { command: ".cursor/hooks/format.sh && node .huddle/huddle.mjs hook cursor afterFileEdit" };
+  const mention = { command: "echo 'TODO: node .huddle/huddle.mjs hook cursor is noisy' >> notes.txt" };
+  const theirs = { version: 1, hooks: { stop: [chained], afterFileEdit: [after], sessionEnd: [mention] } };
+  const { root, file } = await scratchRepo(t, theirs);
+  const result = await cursor.install({ repoRoot: root, bundle: BUNDLE });
+  assert.deepEqual(result.changed, [".cursor/hooks.json"]);
+  const merged = await readJson(file);
+  const hooks = merged.hooks as Record<string, unknown[]>;
+  // Each is where it was, as it was, and huddle's own handler stands next to it.
+  assert.deepEqual(hooks.stop, [chained, handler("stop", 5)]);
+  assert.deepEqual(hooks.afterFileEdit, [after, handler("afterFileEdit", 5)]);
+  assert.deepEqual(hooks.sessionEnd, [mention, handler("sessionEnd", 5)]);
+  assert.deepEqual(withoutHuddle(merged), theirs, "taking huddle's handlers out again gives back the original");
+  assert.deepEqual(countOurs(merged), ONE_EACH);
+
+  // The user is told that the hook may now run twice, by init and by doctor, every time.
+  const twice =
+    "In .cursor/hooks.json, a hook command of your own under stop, afterFileEdit, sessionEnd also names huddle's hook. huddle left it as it is and has its own handler next to it. If yours runs huddle's hook, the hook now runs twice on that event: take it out of yours.";
+  assert.equal(result.notes.length, 5);
+  assert.equal(result.notes[4], twice);
+  const text = await readFile(file, "utf8");
+  const again = await cursor.install({ repoRoot: root, bundle: BUNDLE });
+  assert.deepEqual([again.changed, again.notes[4]], [[], twice]);
+  assert.equal(await readFile(file, "utf8"), text);
+  await withBundle(root);
+  const checked = await cursor.check(root);
+  assert.equal(checked.installed, true);
+  assert.equal(checked.notes[4], twice);
+});
+
+test("install: huddle's is the whole command line and nothing else, however the path is written", async (t) => {
+  const stopOf = async (command: string): Promise<unknown[]> => {
+    const { root, file } = await scratchRepo(t, { version: 1, hooks: { stop: [{ command, timeout: 99 }] } });
+    await cursor.install({ repoRoot: root, bundle: BUNDLE });
+    return ((await readJson(file)).hooks as Record<string, unknown[]>).stop ?? [];
+  };
+  // Written by an older install or by hand, and replaced by the one handler this version writes.
+  const ours = [
+    "node .huddle/huddle.mjs hook cursor stop",
+    "node .huddle/huddle.mjs hook cursor",
+    "node huddle.mjs hook cursor stop",
+    "  node   .huddle/huddle.mjs   hook   cursor   stop  ",
+    'node ".huddle/huddle.mjs" hook cursor stop',
+    "node '/work/my repo/.huddle/huddle.mjs' hook cursor stop",
+    "node ./.huddle/huddle.mjs hook cursor sessionEnd",
+    "/usr/local/bin/node .huddle/huddle.mjs hook cursor stop",
+    "node.exe .huddle\\huddle.mjs hook cursor stop",
+    "C:\\nodejs\\node.exe C:\\work\\acme\\.huddle\\huddle.mjs hook cursor stop",
+  ];
+  for (const command of ours) assert.deepEqual(await stopOf(command), [handler("stop", 5)], command);
+
+  // Anything more on the line, before or after, and the line is the user's: it stays, and huddle's is added.
+  const theirs = [
+    "node .huddle/huddle.mjs hook cursor stop && echo done",
+    "node .huddle/huddle.mjs hook cursor stop || true",
+    "node .huddle/huddle.mjs hook cursor stop | tee -a hooks.log",
+    "node .huddle/huddle.mjs hook cursor stop > /dev/null",
+    "node .huddle/huddle.mjs hook cursor stop 2>&1",
+    "node .huddle/huddle.mjs hook cursor stop &",
+    "node .huddle/huddle.mjs hook cursor stop;",
+    "node .huddle/huddle.mjs hook cursor stop extra",
+    "node .huddle/huddle.mjs hook cursor stop\nrm -rf build",
+    "node .huddle/huddle.mjs hook cursor $EVENT",
+    "node .huddle/huddle.mjs hook cursor --verbose",
+    "(node .huddle/huddle.mjs hook cursor stop)",
+    "DEBUG=1 node .huddle/huddle.mjs hook cursor stop",
+    "timeout 2 node .huddle/huddle.mjs hook cursor stop",
+    "exec node .huddle/huddle.mjs hook cursor stop",
+    "node --inspect .huddle/huddle.mjs hook cursor stop",
+    "node $(which huddle.mjs) hook cursor stop",
+    "node `pwd`/huddle.mjs hook cursor stop",
+    "node $HOME/huddle.mjs hook cursor stop",
+    'node ".huddle/huddle.mjs" "hook" cursor stop',
+    "bun .huddle/huddle.mjs hook cursor stop",
+    "mynode .huddle/huddle.mjs hook cursor stop",
+    "node .huddle/not-huddle.mjs hook cursor stop",
+    "node .huddle/huddle.mjs.bak hook cursor stop",
+    "node .huddle/huddle.mjs hook cursor-extras stop",
+    "node .huddle/huddle.mjs hook codex",
+    "node .huddle/huddle.mjs status",
+    "echo node .huddle/huddle.mjs hook cursor stop",
+    "# node .huddle/huddle.mjs hook cursor stop",
+  ];
+  for (const command of theirs) assert.deepEqual(await stopOf(command), [{ command, timeout: 99 }, handler("stop", 5)], command);
+});
+
+test("install: a handler that spells out the default type is huddle's as it should be, and stays as written", async (t) => {
+  // "type": "command" is what Cursor assumes when the key is missing.
+  const typed = installed();
+  const typedHooks = typed.hooks as Record<string, Json[]>;
+  typedHooks.stop = [{ type: "command", ...handler("stop", 5) }];
+  typedHooks.postToolUse = [{ ...handler("postToolUse", 5, { matcher: "Write|Delete|Shell" }), type: "command" }];
+  const { root, file } = await scratchRepo(t, typed);
+  const text = await readFile(file, "utf8");
+  assert.deepEqual((await cursor.install({ repoRoot: root, bundle: BUNDLE })).changed, []);
+  assert.equal(await readFile(file, "utf8"), text);
+  await withBundle(root);
+  assert.equal((await cursor.check(root)).installed, true);
+
+  // It is still huddle's to bring up to date: with another timeout it is replaced, not doubled.
+  typedHooks.stop = [{ type: "command", ...handler("stop", 60) }];
+  await writeFile(file, JSON.stringify(typed, null, 2));
+  assert.equal((await cursor.check(root)).detail, "huddle hooks in .cursor/hooks.json are not what this version installs for stop. Run huddle init.");
+  assert.deepEqual((await cursor.install({ repoRoot: root, bundle: BUNDLE })).changed, [".cursor/hooks.json"]);
+  assert.deepEqual(((await readJson(file)).hooks as Record<string, unknown[]>).stop, [handler("stop", 5)]);
+
+  // Only the default counts as nothing. A key with any other value is a difference, and any other type is not huddle's at all.
+  typedHooks.stop = [{ ...handler("stop", 5), failClosed: false }];
+  await writeFile(file, JSON.stringify(typed, null, 2));
+  assert.equal((await cursor.check(root)).installed, false);
+  const other = { type: "prompt", ...handler("stop", 5) };
+  typedHooks.stop = [other];
+  await writeFile(file, JSON.stringify(typed, null, 2));
+  await cursor.install({ repoRoot: root, bundle: BUNDLE });
+  assert.deepEqual(((await readJson(file)).hooks as Record<string, unknown[]>).stop, [other, handler("stop", 5)]);
+});
+
+test("install: huddle's handlers under an event this version does not use are taken out, and nothing else is", async (t) => {
+  const userGuard = { command: ".cursor/hooks/guard.sh" };
+  const stale = {
+    version: 1,
+    hooks: {
+      ...(installed().hooks as Json),
+      // Left by a hand edit or by a version that still used the event: a process per tool call that answers nothing.
+      preToolUse: [userGuard, handler("preToolUse", 5), { type: "command", command: "node .huddle/huddle.mjs hook cursor" }],
+      afterShellExecution: [handler("afterShellExecution", 5)],
+      // The user's alone, and one that only names huddle's hook.
+      beforeReadFile: [userGuard],
+      subagentStop: [{ command: "node .huddle/huddle.mjs hook cursor subagentStop && ./tidy.sh" }],
+    },
+  };
+  const { root, file } = await scratchRepo(t, stale);
+  await withBundle(root);
+  // doctor says so before init has run again...
+  assert.deepEqual(await cursor.check(root), {
+    installed: false,
+    broken: true,
+    detail: "huddle hooks in .cursor/hooks.json are still there under preToolUse, afterShellExecution, which this version does not use. Run huddle init.",
+    notes: [],
+  });
+  // ...and init is what clears them.
+  const result = await cursor.install({ repoRoot: root, bundle: BUNDLE });
+  assert.deepEqual(result.changed, [".cursor/hooks.json"]);
+  assert.deepEqual(await readJson(file), {
+    version: 1,
+    hooks: { ...(installed().hooks as Json), preToolUse: [userGuard], beforeReadFile: [userGuard], subagentStop: stale.hooks.subagentStop },
+  });
+  assert.match(result.notes[4] ?? "", /a hook command of your own under subagentStop also names huddle's hook/);
+  assert.equal((await cursor.check(root)).installed, true);
+  assert.deepEqual((await cursor.install({ repoRoot: root, bundle: BUNDLE })).changed, []);
+
+  // Stale handlers and missing ones are told apart in one sentence.
+  const both = await readJson(file);
+  const hooks = both.hooks as Record<string, unknown[]>;
+  delete hooks.stop;
+  hooks.preCompact = [handler("preCompact", 5)];
+  await writeFile(file, JSON.stringify(both, null, 2));
+  assert.equal((await cursor.check(root)).detail, "huddle hooks in .cursor/hooks.json are missing for stop and still there under preCompact, which this version does not use. Run huddle init.");
+  // A file with nothing of huddle's but a stale handler is not "no huddle hooks".
+  await writeFile(file, JSON.stringify({ version: 1, hooks: { preCompact: [handler("preCompact", 5)] } }, null, 2));
+  const onlyStale = await cursor.check(root);
+  assert.equal((onlyStale as { broken?: boolean }).broken, true);
+  assert.match(onlyStale.detail, /^huddle hooks in \.cursor\/hooks\.json are missing for sessionStart, .* and still there under preCompact, which this version does not use\. Run huddle init\.$/);
+});
+
 test("install: the version Cursor requires is added when missing, left alone when there, and refused when it is not one", async (t) => {
   const missing = await scratchRepo(t, { hooks: { stop: [{ command: "./audit.sh" }] } });
   assert.deepEqual((await cursor.install({ repoRoot: missing.root, bundle: BUNDLE })).changed, [".cursor/hooks.json"]);
@@ -548,10 +817,21 @@ test("install: the version Cursor requires is added when missing, left alone whe
   assert.equal(added.version, 1);
   assert.deepEqual((added.hooks as Record<string, unknown[]>).stop, [{ command: "./audit.sh" }, handler("stop", 5)]);
 
-  // A later schema is not huddle's to turn back.
-  const later = await scratchRepo(t, { version: 2, hooks: {} });
-  await cursor.install({ repoRoot: later.root, bundle: BUNDLE });
-  assert.equal((await readJson(later.file)).version, 2);
+  // Another version may be another shape. Nothing is written into it, and the user is told why.
+  for (const version of [2, 3, 10]) {
+    const content = `{ "version": ${version}, "hooks": {} }\n`;
+    const later = await scratchRepo(t, content);
+    await assert.rejects(
+      cursor.install({ repoRoot: later.root, bundle: BUNDLE }),
+      (error: unknown) => {
+        assert.ok(error instanceof CliError, String(error));
+        assert.equal(error.message, `.cursor/hooks.json has "version": ${version}. This huddle writes hooks for version 1 of that file only, so it left the file alone.`);
+        return true;
+      },
+      String(version),
+    );
+    assert.equal(await readFile(later.file, "utf8"), content, "untouched");
+  }
 
   // The version alone missing is a change too, and the only one.
   const { version: _version, ...rest } = installed();
@@ -630,6 +910,139 @@ test("install: writes through a symlinked hooks file and keeps the file's mode",
   assert.deepEqual(await readJson(real), installed());
   assert.match(await readFile(real, "utf8"), /^\{\n\t"version"/, "tabs kept");
   assert.equal((await stat(real)).mode & 0o777, 0o640);
+});
+
+const DANGLING = ".cursor/hooks.json is, or lies behind, a symbolic link to a place that does not exist. huddle does not write through it. Remove the link or create its target, then run huddle init.";
+const outsideOf = (target: string): string =>
+  `.cursor/hooks.json is, through a symbolic link, a file outside this checkout (${target}). huddle does not write there: its hooks would not reach your teammates, and would run wherever else that file is used. Put a real file in its place, then run huddle init.`;
+
+async function refusedWith(root: string, sentence: string): Promise<void> {
+  await assert.rejects(cursor.install({ repoRoot: root, bundle: BUNDLE }), (error: unknown) => {
+    assert.ok(error instanceof CliError, `a message for the user, not a crash: ${String(error)}`);
+    assert.equal(error.message, sentence);
+    return true;
+  });
+}
+
+test("install: a symlink that leads nowhere, as the hooks file or as its directory, is refused, and nothing is created where it points", { skip: process.platform === "win32" }, async (t) => {
+  const { root, file } = await scratchRepo(t);
+  await mkdir(join(root, ".cursor"));
+  await symlink(join(root, "elsewhere", "hooks.json"), file);
+  await refusedWith(root, DANGLING);
+  assert.ok((await lstat(file)).isSymbolicLink(), "still the link");
+  assert.equal(existsSync(join(root, "elsewhere")), false);
+  assert.deepEqual(await readdir(join(root, ".cursor")), ["hooks.json"], "no temporary file is left behind");
+  // doctor gives the same reason, and does not send the user to an init that would refuse.
+  assert.deepEqual(await cursor.check(root), { installed: false, detail: DANGLING, notes: [] });
+
+  const linkedDir = await scratchRepo(t);
+  await symlink(join(linkedDir.root, "gone"), join(linkedDir.root, ".cursor"));
+  await refusedWith(linkedDir.root, DANGLING);
+  assert.equal(existsSync(join(linkedDir.root, "gone")), false);
+  assert.deepEqual(await cursor.check(linkedDir.root), { installed: false, detail: DANGLING, notes: [] });
+});
+
+test("install: a hooks file that a symlink puts outside the checkout is not written, whether the file or its directory is the link", { skip: process.platform === "win32" }, async (t) => {
+  // A directory next to the checkout: a dotfiles folder, say, whose files other projects link to as well.
+  const { root: outer } = await scratchRepo(t);
+  const root = join(outer, "repo");
+  const shared = join(outer, "dotfiles");
+  await mkdir(join(root, ".cursor"), { recursive: true });
+  await mkdir(shared);
+  const sharedFile = join(shared, "hooks.json");
+  const theirs = `${JSON.stringify(USER_HOOKS, null, 2)}\n`;
+  await writeFile(sharedFile, theirs);
+
+  // The file is the link.
+  await symlink(sharedFile, join(root, ".cursor", "hooks.json"));
+  await refusedWith(root, outsideOf(sharedFile));
+  assert.equal(await readFile(sharedFile, "utf8"), theirs, "the file out there is as it was");
+  assert.deepEqual(await readdir(shared), ["hooks.json"]);
+  assert.deepEqual(await cursor.check(root), { installed: false, detail: outsideOf(sharedFile), notes: [] });
+  // Also when the file out there already holds everything: where it is does not change.
+  await writeFile(sharedFile, `${JSON.stringify(installed(), null, 2)}\n`);
+  await refusedWith(root, outsideOf(sharedFile));
+  assert.equal((await cursor.check(root)).installed, false);
+  // A link to a file that is not there yet, in a directory that is.
+  await rm(sharedFile);
+  await refusedWith(root, DANGLING);
+  assert.deepEqual(await readdir(shared), []);
+
+  // The directory is the link, and the file would be created through it.
+  await rm(join(root, ".cursor"), { recursive: true });
+  await symlink(shared, join(root, ".cursor"));
+  await refusedWith(root, outsideOf(sharedFile));
+  assert.deepEqual(await readdir(shared), [], "nothing was created out there");
+  assert.deepEqual(await cursor.check(root), { installed: false, detail: outsideOf(sharedFile), notes: [] });
+
+  // A link that stays inside the checkout is written through, as before, directory or file.
+  await rm(join(root, ".cursor"));
+  await mkdir(join(root, "config", "cursor"), { recursive: true });
+  await symlink(join("config", "cursor"), join(root, ".cursor"));
+  assert.deepEqual((await cursor.install({ repoRoot: root, bundle: BUNDLE })).changed, [".cursor/hooks.json"]);
+  assert.deepEqual(await readJson(join(root, "config", "cursor", "hooks.json")), installed());
+  assert.ok((await lstat(join(root, ".cursor"))).isSymbolicLink(), "still a link");
+  await withBundle(root);
+  assert.equal((await cursor.check(root)).installed, true);
+
+  // And a checkout that is itself reached through a link is still one checkout.
+  const alias = join(outer, "alias");
+  await symlink(root, alias);
+  assert.deepEqual((await cursor.install({ repoRoot: alias, bundle: BUNDLE })).changed, []);
+  assert.equal((await cursor.check(alias)).installed, true);
+});
+
+test("install: a hooks file its owner has made read-only is left alone", { skip: process.platform === "win32" || process.getuid?.() === 0 }, async (t) => {
+  const { root, file } = await scratchRepo(t, USER_HOOKS);
+  const before = await readFile(file, "utf8");
+  await chmod(file, 0o444);
+  // The directory is writable, so replacing the file by a rename would have worked.
+  await refusedWith(root, ".cursor/hooks.json is read-only, so huddle left it alone. Make it writable, then run huddle init again.");
+  assert.equal(await readFile(file, "utf8"), before);
+  assert.equal((await stat(file)).mode & 0o777, 0o444);
+  assert.deepEqual(await readdir(join(root, ".cursor")), ["hooks.json"], "no temporary file is left behind");
+  // Once it is writable init does its work, and with nothing left to change a read-only file is no obstacle.
+  await chmod(file, 0o644);
+  assert.deepEqual((await cursor.install({ repoRoot: root, bundle: BUNDLE })).changed, [".cursor/hooks.json"]);
+  await chmod(file, 0o444);
+  assert.deepEqual((await cursor.install({ repoRoot: root, bundle: BUNDLE })).changed, []);
+  await withBundle(root);
+  assert.equal((await cursor.check(root)).installed, true);
+});
+
+test("install: a hooks file that cannot be read or written is refused in a sentence, not with an error code", { skip: process.platform === "win32" }, async (t) => {
+  const refused = refusedWith;
+  // A directory where the file should be.
+  const asDirectory = await scratchRepo(t);
+  await mkdir(asDirectory.file, { recursive: true });
+  await refused(asDirectory.root, ".cursor/hooks.json could not be read (it is a directory), so huddle left it alone.");
+  assert.deepEqual(await cursor.check(asDirectory.root), { installed: false, detail: ".cursor/hooks.json cannot be read (it is a directory).", notes: [] });
+
+  // A file where its directory should be.
+  const asFile = await scratchRepo(t);
+  await writeFile(join(asFile.root, ".cursor"), "not a directory\n");
+  await refused(asFile.root, ".cursor/hooks.json could not be read (a file stands where one of its directories should be), so huddle left it alone.");
+  assert.equal(await readFile(join(asFile.root, ".cursor"), "utf8"), "not a directory\n");
+  assert.deepEqual(await cursor.check(asFile.root), { installed: false, detail: ".cursor/hooks.json cannot be read (a file stands where one of its directories should be).", notes: [] });
+
+  // No permission. Root reads and writes everything, so there is nothing to see as root.
+  if (process.getuid?.() === 0) return;
+  const unreadable = await scratchRepo(t, USER_HOOKS);
+  await chmod(unreadable.file, 0o000);
+  await refused(unreadable.root, ".cursor/hooks.json could not be read (permission denied), so huddle left it alone.");
+  assert.deepEqual(await cursor.check(unreadable.root), { installed: false, detail: ".cursor/hooks.json cannot be read (permission denied).", notes: [] });
+  await chmod(unreadable.file, 0o644);
+
+  const unwritable = await scratchRepo(t, USER_HOOKS);
+  const before = await readFile(unwritable.file, "utf8");
+  await chmod(join(unwritable.root, ".cursor"), 0o555);
+  try {
+    await refused(unwritable.root, ".cursor/hooks.json could not be written (permission denied).");
+    assert.equal(await readFile(unwritable.file, "utf8"), before, "untouched");
+    assert.deepEqual(await readdir(join(unwritable.root, ".cursor")), ["hooks.json"]);
+  } finally {
+    await chmod(join(unwritable.root, ".cursor"), 0o755); // or the scratch directory cannot be removed
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -731,10 +1144,10 @@ test("check: reports what install left, and what is still missing", async (t) =>
   await withBundle(root);
   const whole = await cursor.check(root);
   assert.equal(whole.installed, true);
-  assert.equal(whole.detail, "6 hooks in .cursor/hooks.json");
+  assert.equal(whole.detail, "7 hooks in .cursor/hooks.json");
   assert.equal("broken" in whole, false);
   assert.deepEqual(whole.notes, (await cursor.install({ repoRoot: root, bundle: BUNDLE })).notes, "doctor says what init said");
-  assert.equal(whole.notes.length, 3);
+  assert.equal(whole.notes.length, 4);
 
   // One event gone, one changed by hand.
   const settings = await readJson(file);
@@ -762,8 +1175,59 @@ test("check: reports what install left, and what is still missing", async (t) =>
 test("check: a file with no huddle hooks, or that cannot be read, is not installed", async (t) => {
   const others = await scratchRepo(t, USER_HOOKS);
   assert.deepEqual(await cursor.check(others.root), { installed: false, detail: "no huddle hooks in .cursor/hooks.json. Run huddle init.", notes: [] });
-  const broken = await scratchRepo(t, "{ not json");
-  assert.deepEqual(await cursor.check(broken.root), { installed: false, broken: true, detail: ".cursor/hooks.json cannot be read as a JSON object. Fix the file, then run huddle init.", notes: [] });
+  // A file huddle cannot parse, with nothing of huddle's in it: whether Cursor can read it is Cursor's business.
+  for (const content of ["{ not json", "[]\n", '// my hooks\n{ "version": 1, "hooks": { "stop": [{ "command": "./audit.sh" }] } }\n', '{ "note": "node .huddle/huddle.mjs hook codex", ']) {
+    const unparsed = await scratchRepo(t, content);
+    assert.deepEqual(
+      await cursor.check(unparsed.root),
+      { installed: false, detail: ".cursor/hooks.json cannot be read as a JSON object, so huddle cannot add its hooks to it. There are none in it now.", notes: [] },
+      content,
+    );
+  }
+});
+
+test("check: a file that cannot be parsed is broken when huddle's hooks are in it", async (t) => {
+  const whole = `${JSON.stringify(installed(), null, 2)}\n`;
+  const damaged = [
+    // A trailing comma left by a hand edit.
+    whole.replace(/\}\n$/, ",}\n"),
+    // A comment, which Cursor may or may not accept; huddle cannot tell whether its hooks still stand as they should.
+    `// team hooks\n${whole}`,
+    // A merge that was not finished.
+    `<<<<<<< HEAD\n${whole}=======\n${whole}>>>>>>> theirs\n`,
+    // Cut off in the middle.
+    whole.slice(0, whole.indexOf("afterFileEdit")),
+    // On one line, as another tool might have rewritten it.
+    `${JSON.stringify(installed())},`,
+  ];
+  for (const content of damaged) {
+    const { root } = await scratchRepo(t, content);
+    await withBundle(root);
+    assert.deepEqual(
+      await cursor.check(root),
+      { installed: false, broken: true, detail: ".cursor/hooks.json cannot be read as a JSON object, and huddle's hooks are in it. Fix the file, then run huddle init.", notes: [] },
+      content.slice(0, 40),
+    );
+  }
+});
+
+test("check: hooks that run a bundle outside the checkout are broken, whether or not a file is there", async (t) => {
+  const { root: outer } = await scratchRepo(t);
+  const root = join(outer, "repo");
+  const file = join(root, ".cursor", "hooks.json");
+  await mkdir(join(root, ".cursor"), { recursive: true });
+  // The file the first of them points at exists: it is where it is that is wrong.
+  await writeFile(join(outer, "huddle.mjs"), "// bundle\n");
+  for (const bundle of ["../huddle.mjs", ".huddle/../../huddle.mjs", "../../nowhere/huddle.mjs", "/opt/huddle/huddle.mjs"]) {
+    const settings = JSON.parse(JSON.stringify(installed()).split(".huddle/huddle.mjs").join(bundle)) as Json;
+    await writeFile(file, JSON.stringify(settings, null, 2));
+    assert.deepEqual(await cursor.check(root), { installed: false, broken: true, detail: `hooks in .cursor/hooks.json run ${bundle}, which is outside this checkout. Run huddle init.`, notes: [] }, bundle);
+  }
+  // init points them back at the bundle it vendored.
+  await cursor.install({ repoRoot: root, bundle: BUNDLE });
+  await withBundle(root);
+  assert.equal((await cursor.check(root)).installed, true);
+  assert.deepEqual(await readJson(file), installed());
 });
 
 test("check: hooks that are all there are still not installed while the file has no version Cursor can use", async (t) => {
@@ -787,8 +1251,14 @@ test("check: hooks that are all there are still not installed while the file has
       JSON.stringify(version),
     );
   }
+  // Another version: the hooks are there, and nobody knows whether Cursor reads them the same way.
   await writeFile(file, JSON.stringify({ ...settings, version: 2 }, null, 2));
-  assert.equal((await cursor.check(root)).installed, true, "a later version is Cursor's business");
+  assert.deepEqual(await cursor.check(root), {
+    installed: false,
+    broken: true,
+    detail: '.cursor/hooks.json has "version": 2, and huddle\'s hooks in it are written for version 1. Whether they work there is not known.',
+    notes: [],
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -818,6 +1288,30 @@ test("detect: any sign of Cursor on the repo or the machine, and a program calle
   assert.equal(await detectCursor(root, nothing), true, "the repo's .cursor");
 });
 
+test("detect: wherever huddle's Claude Code hooks are, Cursor's belong too, because Cursor runs those and they stand down for it", async (t) => {
+  const { root } = await scratchRepo(t);
+  const home = join(root, "home");
+  await mkdir(home);
+  const nothing = { env: { PATH: "" }, home };
+  // Claude Code settings of the user's own say nothing about Cursor.
+  await mkdir(join(root, ".claude"));
+  await writeFile(join(root, ".claude", "settings.json"), JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: "command", command: "./notify.sh" }] }] } }));
+  assert.equal(await detectCursor(root, nothing), false);
+  // Neither does a hook of another adapter that somebody put there.
+  await writeFile(join(root, ".claude", "settings.json"), JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: "command", command: "node .huddle/huddle.mjs hook codex" }] }] } }));
+  assert.equal(await detectCursor(root, nothing), false);
+
+  // `huddle init` installs adapter after adapter, Claude Code before Cursor: by the time Cursor is asked, this is there.
+  await rm(join(root, ".claude", "settings.json"));
+  await claudeCode.install({ repoRoot: root, bundle: BUNDLE });
+  assert.equal(await detectCursor(root, nothing), true);
+  // And then doctor has nothing to say about Cursor on the Claude Code side.
+  await cursor.install({ repoRoot: root, bundle: BUNDLE });
+  await withBundle(root);
+  const notes = (await claudeCode.check(root)).notes;
+  assert.equal(notes.some((note) => /Cursor/.test(note)), false, notes.join("\n"));
+});
+
 test("the adapter is registered under the name used in `huddle hook cursor`, and git hooks stay last", () => {
   assert.equal(getAdapter("cursor"), cursor);
   assert.equal(cursor.name, "cursor");
@@ -843,9 +1337,12 @@ test("a payload of Cursor's is the Cursor adapter's alone: the Claude Code adapt
     const text = readFileSync(join(CLAUDE_FIXTURES, file), "utf8");
     const payload = JSON.parse(text) as Json;
     if (asClaude(text) !== null) handled++;
-    assert.equal(asClaude(JSON.stringify({ ...payload, cursor_version: "1.7.2" })), null, file);
+    // Whatever stands there: the page shows a text, and a number or a list would be Cursor's just the same.
+    for (const version of ["1.7.2", 17, 1.7, true, false, 0, ["1.7.2"], { major: 1 }]) {
+      assert.equal(asClaude(JSON.stringify({ ...payload, cursor_version: version })), null, `${file} ${JSON.stringify(version)}`);
+    }
     // Only a version that is there counts: Claude Code's own payloads are untouched.
-    assert.deepEqual(asClaude(JSON.stringify({ ...payload, cursor_version: "" })), asClaude(text), file);
+    for (const absent of ["", null]) assert.deepEqual(asClaude(JSON.stringify({ ...payload, cursor_version: absent })), asClaude(text), `${file} ${JSON.stringify(absent)}`);
   }
   assert.ok(handled > 10, "the Claude Code fixtures themselves are still handled");
 });
@@ -890,8 +1387,9 @@ test("Cursor, through the engine: a briefing at the start, the intent from the p
   const run = (name: string, seconds: number, over: Json = {}): Promise<Ran> => cursorHook(bob, name, seconds, over);
   const write = { tool_input: { file_path: join(bob.dir, "src", "auth.ts") } };
 
-  // sessionStart: the briefing, through the one field that reaches the agent.
+  // sessionStart: the briefing, through the one field that reaches the agent. Cursor does not wait for it, so it may never arrive.
   assert.deepEqual(await run("session-start", 20), tells(text(FULL_HEAD, aliceLine(20), FULL_FOOT)));
+  assert.deepEqual(await seenKeys(bob, SESSION), [], "not on record as shown");
   assert.deepEqual(
     (await sessionsOf(bob)).map((session) => [session.id, session.agent, session.worktree]),
     [[SESSION, "cursor", bob.dir]],
@@ -907,7 +1405,10 @@ test("Cursor, through the engine: a briefing at the start, the intent from the p
   // afterFileEdit can say nothing; it is what gets the edit published. And the same file again is not warned about twice.
   assert.deepEqual(await run("after-file-edit", 25, { file_path: join(bob.dir, "src", "auth.ts") }), QUIET);
   assert.deepEqual(await run("post-tool-use.write", 26, write), QUIET);
-  // A shell command with nothing new to hear of: a sign of life.
+  // The first shell command: the briefing again, this time where Cursor waits for it, so this time it counts.
+  assert.deepEqual(await run("post-tool-use.shell", 27), tells(text(FULL_HEAD, aliceLine(27), FULL_FOOT)));
+  assert.notDeepEqual(await seenKeys(bob, SESSION), []);
+  // The next one, with nothing new to hear of: a sign of life.
   assert.deepEqual(await run("post-tool-use.shell", 27), QUIET);
   assert.equal((await sessionOf(bob, SESSION))?.seenAt, at(27));
   // Events huddle does not register for are no events at all.
@@ -933,12 +1434,12 @@ test("Cursor, through the engine: a briefing at the start, the intent from the p
   assert.deepEqual(await sessionsOf(bob), []);
 
   // What bob's clone asked of the network on the way. One sync waited for, at the start. Then, each left behind:
-  // the intent at once (22), the edit through afterFileEdit (25) and the shell command (27) left to the throttle,
+  // the intent at once (22), the edit through afterFileEdit (25) and the two shell commands (27) left to the throttle,
   // the next intent at once (35), two more shell commands left to the throttle (36, 37), and the ends of the turn
   // (40) and of the session (50) at once. The two overlap checks (24, 26) ask for nothing.
   assert.equal(asked.waited.length, 1);
   const asks = asked.background.filter((one) => one.worktree === bob.dir);
-  assert.deepEqual(asks, [forced(bob), throttled(bob), throttled(bob), forced(bob), throttled(bob), throttled(bob), forced(bob), forced(bob)]);
+  assert.deepEqual(asks, [forced(bob), throttled(bob), throttled(bob), throttled(bob), forced(bob), throttled(bob), throttled(bob), forced(bob), forced(bob)]);
 });
 
 test("Cursor, through the engine: an edit whose file the payload does not name where huddle looks still counts, and brings the news instead of a warning", async (t) => {
@@ -947,8 +1448,9 @@ test("Cursor, through the engine: an edit whose file the payload does not name w
   await bob.write("src/auth.ts", "export const auth = false;\n");
   const unnamed = await cursorHook(bob, "post-tool-use.write.unnamed", 20);
   // Bob's clone has never synced, so there is nobody to brief on yet; the session is there all the same.
+  // And the edit huddle could not name leaves its line where Cursor shows a hook's errors.
   assert.equal(unnamed.code, 0);
-  assert.deepEqual(unnamed.stderr, []);
+  assert.deepEqual(unnamed.stderr, [UNNAMED_TRACE]);
   assert.deepEqual(
     (await sessionsOf(bob)).map((session) => [session.id, session.agent, session.seenAt]),
     [[SESSION, "cursor", at(20)]],
@@ -956,6 +1458,7 @@ test("Cursor, through the engine: an edit whose file the payload does not name w
   await publish(bob, 21);
   // With the team's state fetched, the same payload is told what a prompt would be told: the briefing, not a warning.
   const told = await cursorHook(bob, "post-tool-use.write.unnamed", 22);
+  assert.deepEqual(told.stderr, [UNNAMED_TRACE]);
   assert.equal(told.stdout.length, 1);
   const context = String((JSON.parse(told.stdout[0] ?? "{}") as Json).additional_context);
   assert.ok(context.includes(aliceLine(22)), context);
