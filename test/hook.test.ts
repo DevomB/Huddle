@@ -569,6 +569,29 @@ test("an adapter with no way to show a context says so, and the news is kept for
   assert.deepEqual(await run("post-tool-use.apply-patch", 42, edit), says("PostToolUse", late));
   assert.deepEqual(await run("post-tool-use.apply-patch", 43, edit), SILENT);
   assert.deepEqual(await run("pre-tool-use.apply-patch.add", 44, edit), SILENT);
+
+  // An agent that cannot be spoken to at a prompt either (Cursor): its adapter says of the event after a tool call
+  // that the session may be briefed there, and what the prompt could not say arrives with it.
+  const parse = codex.parse;
+  codex.parse = (input) => {
+    const event = parse(input);
+    return event !== null && event.type === "post-edit" ? { ...event, brief: true } : event;
+  };
+  // The briefing that the session start at 40 could not show is still owed. The warning was given at 42.
+  const owed = text(FULL_HEAD, `- alice / claude-code on main (${ago(30, 45)}): "Switch the JWT middleware to sessions". Files: src/auth.ts`, FULL_FOOT);
+  assert.deepEqual(await run("post-tool-use.apply-patch", 45, edit), says("PostToolUse", owed));
+  assert.deepEqual(await run("post-tool-use.apply-patch", 46, edit), SILENT);
+  // And so is news that comes while the agent works.
+  await fire(alice, "session-end", 50);
+  await publish(alice, 51);
+  await publish(bob, 52);
+  codex.format = mute;
+  assert.deepEqual(await run("user-prompt-submit", 55), SILENT);
+  // Saying that it may brief is not the same as being able to: an answer that was not shown uses up nothing here either.
+  assert.deepEqual(await run("post-tool-use.apply-patch", 56, edit), SILENT);
+  codex.format = format;
+  assert.deepEqual(await run("post-tool-use.apply-patch", 57, edit), says("PostToolUse", text(DELTA_HEAD, "Left: alice / claude-code (main).")));
+  assert.deepEqual(await run("post-tool-use.apply-patch", 58, edit), SILENT);
 });
 
 test("appendLines adds a line to a file once, makes the directory, and refuses a line that is more than one", async (t) => {

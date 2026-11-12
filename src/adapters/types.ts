@@ -34,6 +34,16 @@ export interface HookEvent {
    * add. An agent that can only be spoken to after a tool call gets it there.
    */
   paths?: string[];
+  /**
+   * `post-edit` events: the session is briefed here as well, the way it is at
+   * a prompt (the full briefing if it has none yet, else what changed). For
+   * an agent whose prompt hook has no way to speak to the model (Cursor's
+   * beforeSubmitPrompt): its updates come after a tool call or not at all.
+   * The update follows the warning about the event's paths, if there is one,
+   * in the same context, and the event gets a prompt's time budget. Not on a
+   * subagent's event, and no other event type looks at it.
+   */
+  brief?: boolean;
   /** `session-start`: the agent's own word for why (startup, resume, clear, compact, ...). */
   source?: string;
   /** `session-end`: the agent's own word for why. */
