@@ -37,9 +37,11 @@ node .huddle/huddle.mjs doctor   # checks the remote, push access, hooks
 
 `init` copies the bundle into `.huddle/huddle.mjs`, writes `.huddle/config.json`, adds a short block to `AGENTS.md`, and installs hooks for the agents it finds. Teammates get all of that with their next `git pull`. Nobody else installs anything: the hooks run the copy in the repository.
 
+If your repository ignores an agent's directory (`.claude/` in `.gitignore` is common), git leaves that agent's hook file out of the commit without saying so, and your teammates get no hooks. `init` and `doctor` both tell you when that is the case, with the rule and the way out.
+
 Two things each teammate still does once, in their own clone:
 
-- **Trust the hooks**, where their agent asks. Claude Code asks through its workspace trust dialog. Codex asks twice: trust the project, then review the hooks with `/hooks`.
+- **Trust the hooks**, where their agent asks. Claude Code asks through its workspace trust dialog. Codex asks twice: trust the project, then review the hooks with `/hooks`. Gemini CLI runs a project's hooks only in a folder it trusts, and warns the first time that the project brings a hook named huddle.
 - **Run `node .huddle/huddle.mjs init`** if they want the plain git hooks. Those live in `.git/hooks`, which git does not share.
 
 ## What your agent sees
@@ -73,10 +75,12 @@ With plain git, the same warning is printed in the terminal when you commit a fi
 |---|---|---|
 | Claude Code | Hooks in `.claude/settings.json` | Briefing at session start, what changed at each prompt, a warning at an edit of a file someone else has in flight. Its intent is taken from your prompt. |
 | Codex | Hooks in `.codex/hooks.json` | The same. Written from Codex's documentation and its recorded payloads; **not yet run against a live Codex session**. |
+| Cursor | Hooks in `.cursor/hooks.json` | Cursor lets a hook speak to the agent after a tool call, and at the start of a session without waiting for the answer. So the briefing comes at the start or with the first edit or shell command, and what changed and the overlap warning come after an edit or shell command, not with the prompt. Written from Cursor's documentation; **not yet run against Cursor**. |
+| Gemini CLI | Hooks in `.gemini/settings.json` | Briefing at session start, what changed at each prompt. Gemini CLI does not let a hook speak to the model before an edit, so an overlap is shown to you before the edit and told to the agent right after it. Written from Gemini CLI's documentation and source; **not yet run against Gemini CLI**. |
 | Any agent that reads `AGENTS.md` | A block in `AGENTS.md` | Instructions to run `huddle status`, `huddle intent` and `huddle check` itself. Works as well as the agent follows instructions. |
 | Everything else, and people | git hooks | A commit, checkout or merge shows the clone as alive with its files in flight. A commit that touches a teammate's file prints the warning. |
 
-Adapters for Cursor, Gemini CLI and opencode are in progress.
+An adapter for opencode is in progress.
 
 ## Commands
 
@@ -130,9 +134,9 @@ Everyone who can read the repository on the remote can read all of this:
 
 Never file contents or diffs.
 
-Prompt capture is on by default because it is what makes the tool work with no cooperation from the agent. `huddle init --no-capture-intent` turns it off for the team; `init` says so every time it runs. Text that looks like a credential is replaced by `[redacted]` before it is stored, on a best-effort basis: do not rely on it.
+Prompt capture is on by default because it is what makes the tool work with no cooperation from the agent. `huddle init --no-capture-intent` turns it off for the team; `init` says so every time it runs. In an intent, text that looks like a credential is replaced by `[redacted]` before it is stored. A decision that holds such text is refused, because a decision is never removed. Both go by the look of the text, on a best-effort basis: do not rely on it.
 
-What huddle shows your agent was written by your teammates' tools. Every briefing is labelled as information and not instructions, each item is one line, and control characters are removed. huddle never executes anything it receives. A teammate can still write text that tries to instruct your agent; anyone who can do that can also push code to your repository.
+What huddle shows your agent was written by your teammates' tools. Every briefing is labelled as information and not instructions, each item is one line, control and invisible characters are removed, and `<` and `>` in a teammate's text are shown as `‹` and `›` so that it cannot write the tags an agent's context is framed with. huddle never executes anything it receives. A teammate can still write text that tries to instruct your agent; anyone who can do that can also push code to your repository.
 
 ## Limits
 
@@ -155,7 +159,8 @@ Known and not fixed. Read these before you depend on it.
 - Everyone needs push access to one remote. It does not work for fork-based projects.
 
 **Agents**
-- Claude Code reads hooks from the directory a session starts in: a session started in a subdirectory runs none of them.
+- Claude Code and Gemini CLI read hooks from the directory a session starts in: a session started in a subdirectory runs none of them.
+- Only the Claude Code hooks have been run in real sessions. The Codex, Cursor and Gemini CLI adapters are written from each agent's documentation or source and tested against recorded payloads.
 - The hooks need no permission, but a huddle command the agent runs itself does. Claude Code asks before `node .huddle/huddle.mjs status` unless you allow it, for example with `Bash(node .huddle/huddle.mjs:*)` under `permissions.allow` in `.claude/settings.json`. `init` does not add that rule for you.
 - Hooks need `node` on the PATH of whatever starts them. An editor or a graphical git client started outside a shell may not have it; the git hooks then do nothing and say nothing.
 - The git hooks run the copy of the bundle in whatever is checked out. Checking out a branch you do not trust runs its copy.
@@ -163,7 +168,7 @@ Known and not fixed. Read these before you depend on it.
 **Housekeeping**
 - Nothing is ever cleaned up on the remote: the refs of clones that are gone, and of finished tasks, stay.
 - A repository copied together with its `.git` directory publishes under the same identity as the original. `doctor` reports it; the cure is to delete `<git dir>/huddle/actor` in the copy.
-- There is no uninstall command. To remove huddle: delete `.huddle/`, the block in `AGENTS.md`, huddle's entries in `.claude/settings.json` and `.codex/hooks.json`, and the three marked lines in each git hook.
+- There is no uninstall command. To remove huddle: delete `.huddle/`, the block in `AGENTS.md`, huddle's entries in `.claude/settings.json`, `.codex/hooks.json`, `.cursor/hooks.json` and `.gemini/settings.json`, and the three marked lines in each git hook.
 
 ## Comparison
 
