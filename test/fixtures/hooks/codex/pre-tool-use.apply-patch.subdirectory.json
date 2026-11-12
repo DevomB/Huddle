@@ -1,0 +1,14 @@
+{
+  "session_id": "0199f3a2-6c1e-7d50-b8a4-2f9e61c0d7ab",
+  "transcript_path": "/home/dev/.codex/sessions/2026/11/12/rollout-2026-11-12T09-30-00-0199f3a2-6c1e-7d50-b8a4-2f9e61c0d7ab.jsonl",
+  "cwd": "/home/dev/acme/packages/api",
+  "model": "gpt-5-codex",
+  "permission_mode": "default",
+  "turn_id": "turn-2",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "apply_patch",
+  "tool_input": {
+    "command": "*** Begin Patch\n*** Update File: src/app.ts\n@@\n-const a = 1;\n+const a = 2;\n*** End Patch"
+  },
+  "tool_use_id": "call_sub"
+}
