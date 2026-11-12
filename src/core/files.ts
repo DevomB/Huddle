@@ -141,6 +141,14 @@ export function toRepoPath(paths: RepoPaths, cwd: string, path: string): string 
     const rel = relative(paths.worktree, candidate);
     return rel !== "" && !isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`) ? rel.split(sep).join("/") : null;
   };
+  if (process.platform === "win32") {
+    // Windows file systems ignore case and git does not: an agent may name
+    // src\Auth.ts as c:\repo\SRC\auth.ts, and the path must come out as git
+    // reports it, or no teammate's src/Auth.ts would match. The native realpath
+    // gives the case on disk (and long names for 8.3 short ones). A tail that
+    // does not exist yet keeps the case it was given.
+    return inside(resolveExisting(absolute, realpathSync.native)) ?? inside(absolute);
+  }
   // The worktree path from git has symlinks resolved; the path we were given
   // may not (macOS /tmp, a symlinked checkout). Try it as given, and only then
   // resolved: resolving asks the file system, and this runs before every edit.
