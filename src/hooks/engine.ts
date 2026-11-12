@@ -24,7 +24,8 @@
 //
 // Deadlines. Each event has one, counted from the moment the hook command
 // starts to run (node's own start-up comes on top). When it passes, the hook
-// prints nothing and exits 0; whatever was still running is abandoned. Every
+// prints nothing and exits 0; whatever was still running is abandoned, and a
+// git call that was among it is ended on the way out (commands/hook.ts). Every
 // write it could interrupt is an atomic rename or is covered by stale-lock
 // recovery (core/store.ts). Agents put no time limit on some hooks at all
 // (Claude Code on an async PostToolUse), so this is the only one there is.
@@ -479,8 +480,10 @@ function replacesIntent(session: LocalSession, intent: string): boolean {
 
 /**
  * Waits for one sync, for `budgetMs` at the most. Reaching that abandons the
- * wait and never the sync. syncWithin keeps to the budget itself when it can
- * run the sync in a process of its own; the timer here holds when it cannot.
+ * wait and not the sync. syncWithin keeps to the budget itself when it can
+ * run the sync in a process of its own, which goes on after the hook; the
+ * timer here holds when it cannot, and then the sync's git calls end with
+ * this process (commands/hook.ts).
  */
 async function syncFor(ctx: Ctx, budgetMs: number): Promise<void> {
   await before(deadlineIn(performance.now(), budgetMs), effects.syncWithin(ctx, budgetMs));

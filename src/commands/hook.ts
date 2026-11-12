@@ -1,5 +1,6 @@
 // T2.1. huddle hook <agent>: what an agent's hook configuration runs.
 
+import { endRunningGits } from "../core/git.ts";
 import { EXIT } from "../core/io.ts";
 import type { Io } from "../core/io.ts";
 import { lifetimeMs, noteCrash, runHook } from "../hooks/engine.ts";
@@ -19,6 +20,20 @@ function isHookProcess(): boolean {
 function recordCrashes(): void {
   process.prependListener("uncaughtException", noteCrash);
   process.prependListener("unhandledRejection", noteCrash);
+}
+
+/**
+ * A hook process leaves no git behind. At its deadline it exits without
+ * waiting for what it gave up on, and the timer that would end a git call
+ * that hangs goes with it; so on its way out it ends the calls that are still
+ * running (endRunningGits). The detached syncs it starts are not among them:
+ * those are huddle processes with timers of their own, and are meant to go on.
+ * A signal that would end the process (the agent's own time limit, Ctrl-C)
+ * ends it the same way, with exit code 0.
+ */
+function endGitsOnExit(): void {
+  process.once("exit", endRunningGits);
+  for (const signal of ["SIGHUP", "SIGINT", "SIGTERM"] as const) process.once(signal, () => process.exit(EXIT.OK));
 }
 
 /**
@@ -49,6 +64,7 @@ export function limitLifetime(ms: number, exit: (code: number) => void = (code) 
 export async function run(args: string[], io: Io): Promise<number> {
   if (isHookProcess()) {
     recordCrashes();
+    endGitsOnExit();
     limitLifetime(lifetimeMs(io));
   }
   return runHook(args, io);
