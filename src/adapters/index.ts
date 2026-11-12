@@ -3,10 +3,11 @@
 import { claudeCode } from "./claude-code.ts";
 import { codex } from "./codex.ts";
 import { cursor } from "./cursor.ts";
+import { geminiCli } from "./gemini-cli.ts";
 import { gitHooks } from "./git-hooks.ts";
 import type { Adapter } from "./types.ts";
 
-export const ADAPTERS: readonly Adapter[] = [claudeCode, codex, cursor, gitHooks];
+export const ADAPTERS: readonly Adapter[] = [claudeCode, codex, geminiCli, cursor, gitHooks];
 
 export function getAdapter(name: string): Adapter | undefined {
   return ADAPTERS.find((adapter) => adapter.name === name);

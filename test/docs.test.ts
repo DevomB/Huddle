@@ -216,19 +216,23 @@ test("cleanText flattens every unsafe range, at both ends of each range", () => 
     [0x0000, 0x001f],
     [0x007f, 0x009f],
     [0x00ad, 0x00ad],
+    [0x034f, 0x034f],
     [0x061c, 0x061c],
     [0x115f, 0x1160],
+    [0x17b4, 0x17b5],
     [0x180b, 0x180f],
     [0x200b, 0x200f],
     [0x2028, 0x2029],
     [0x202a, 0x202e],
     [0x2060, 0x206f],
+    [0x2800, 0x2800],
     [0x3164, 0x3164],
     [0xd800, 0xdfff],
     [0xfe00, 0xfe0f],
     [0xfeff, 0xfeff],
     [0xffa0, 0xffa0],
-    [0xfff9, 0xfffb],
+    [0xfff0, 0xfffb],
+    [0x1bca0, 0x1bca3],
     [0x1d173, 0x1d17a],
     [0xe0000, 0xe0fff],
   ];
@@ -269,6 +273,29 @@ test("text a reader cannot see does not get through: tag characters, variation s
   for (const ch of JSON.stringify(parsed)) {
     const codePoint = ch.codePointAt(0)!;
     assert.ok(!UNSAFE_RANGES.some(([from, to]) => codePoint >= from && codePoint <= to), `U+${codePoint.toString(16)} survived parseDoc`);
+  }
+});
+
+test("every code point Unicode calls invisible is unsafe, by the tables of the node that runs this", () => {
+  // Default_Ignorable_Code_Point: "code points that should be ignored in rendering", so text a reader cannot see.
+  // The property comes from the JavaScript engine. A node with newer tables that names a code point outside
+  // UNSAFE_RANGES fails here, and that is the moment to add it.
+  const invisible = /\p{Default_Ignorable_Code_Point}/u;
+  const uncovered: string[] = [];
+  let found = 0;
+  for (let codePoint = 0; codePoint <= 0x10ffff; codePoint++) {
+    if (codePoint >= 0xd800 && codePoint <= 0xdfff) continue; // not characters; in the list for their own reason
+    if (!invisible.test(String.fromCodePoint(codePoint))) continue;
+    found++;
+    if (!UNSAFE_RANGES.some(([from, to]) => codePoint >= from && codePoint <= to)) uncovered.push(`U+${codePoint.toString(16)}`);
+  }
+  assert.ok(found > 4000, `the engine knows the property (${found} code points)`);
+  assert.deepEqual(uncovered, []);
+  // One of each kind that was missing until it was looked for, in a line of text.
+  for (const codePoint of [0x034f, 0x17b4, 0x17b5, 0x2800, 0xfff0, 0xfff8, 0x1bca0, 0x1bca3]) {
+    const hidden = String.fromCodePoint(codePoint);
+    assert.equal(cleanText(`rm${hidden}-rf`, 20), "rm -rf", `U+${codePoint.toString(16)}`);
+    assert.equal(cleanText(hidden.repeat(5), 20), "", `U+${codePoint.toString(16)} alone is nothing`);
   }
 });
 

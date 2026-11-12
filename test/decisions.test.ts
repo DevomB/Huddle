@@ -144,7 +144,8 @@ test("everyone's decisions are one list, newest first, and anyone can supersede 
   assert.match(lines[0]!, /^Decisions \(3\), newest first\. Informational only/);
   assert.deepEqual(
     lines.slice(1).map((line) => line.replace(/^- \[[a-z2-7]+\] /, "")),
-    ["Branch names are feat/<topic>. (alice / manual, 1m ago)", "Tests live next to the code. (bob / manual, 1m ago)", "Use pnpm. (alice / manual, 1m ago)"],
+    // "<topic>" is shown with the angle quotation marks that look like it (render.ts, shownText()); the log keeps it as written, below.
+    ["Branch names are feat/\u2039topic\u203a. (alice / manual, 1m ago)", "Tests live next to the code. (bob / manual, 1m ago)", "Use pnpm. (alice / manual, 1m ago)"],
   );
 
   // Bob replaces alice's decision: it lands in bob's log and hides hers for everyone.
@@ -645,4 +646,103 @@ test("the cache after a decision is what the remote holds, so the decider sees i
   const ref = Object.keys(cache.refs)[0]!;
   assert.equal(cache.refs[ref]!.sha, await h.remoteGit("rev-parse", ref));
   assert.equal(JSON.parse(await readFile((await alice.paths()).cacheFile, "utf8")).refs[ref].doc.decisions[0].text, "one");
+});
+
+// ---------------------------------------------------------------------------
+// What looks like a credential is not published
+// ---------------------------------------------------------------------------
+
+// Made up, and put together when the test runs: see the note at the top of test/intent.test.ts.
+const tok = (...parts: string[]) => parts.join("");
+const FAKE_TOKEN = tok("gh", "p_", "x".repeat(36));
+const FAKE_PASSWORD = tok("hunter", "2", "!!");
+
+test("a decision that holds something shaped like a credential is not recorded, and the author sees what would have been published", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  const bob = await h.clone("bob");
+  // A decision of an earlier day, which the refused ones would have replaced.
+  const first = /^decision ([a-z2-7]{8}) recorded/.exec((await ok(alice, ["decide", "CI pushes with the deploy key"], at(0))).stdout)?.[1] ?? "";
+  const logsBefore = JSON.stringify(await remoteLogs(h));
+
+  const refused = await alice.huddle(["decide", "--supersedes", first, `CI pushes with ${FAKE_TOKEN} and the staging login is ${tok("pass", "word=", FAKE_PASSWORD)}`], { now: at(1) });
+  assert.equal(refused.code, 2, refused.stderr);
+  assert.equal(refused.stdout, "");
+  assert.match(refused.stderr, /part of this looks like a credential, so the decision was NOT recorded/);
+  assert.match(refused.stderr, /^ {2}CI pushes with \[redacted\] and the staging login is password=\[redacted\]$/m, "the author sees which part it was");
+  assert.equal(refused.stderr.includes(FAKE_TOKEN) || refused.stderr.includes(FAKE_PASSWORD), false, "and is not shown it again");
+
+  // Nothing of it anywhere it could be read from, with or without the part taken out: the remote, this clone's cache, a teammate's list.
+  assert.equal(JSON.stringify(await remoteLogs(h)), logsBefore, "the decision it was to replace still stands");
+  const cached = await readFile((await alice.paths()).cacheFile, "utf8");
+  await ok(bob, ["sync"], at(2));
+  const listed = (await ok(bob, ["decisions"], at(2))).stdout;
+  for (const [where, text] of Object.entries({ cached, listed })) {
+    assert.equal(text.includes(FAKE_TOKEN) || text.includes(FAKE_PASSWORD) || text.includes("redacted"), false, where);
+  }
+  assert.match(listed, /CI pushes with the deploy key/);
+
+  // What only looks like one is refused the same way, since a rule with its content taken out is a rule nobody can follow.
+  // The message says what does get through, and that is true.
+  const commit = "3a18f6d4b2907e5c".repeat(3).slice(0, 40);
+  const whole = await alice.huddle(["decide", `The baseline is commit ${commit}`], { now: at(3) });
+  assert.equal(whole.code, 2);
+  assert.match(whole.stderr, /^ {2}The baseline is commit \[redacted\]$/m);
+  assert.match(whole.stderr, /a short commit id is taken/);
+  const short = await ok(alice, ["decide", `The baseline is commit ${commit.slice(0, 12)}`], at(4));
+  assert.match(short.stdout, new RegExp(`^decision [a-z2-7]{8} recorded: The baseline is commit ${commit.slice(0, 12)}$`, "m"));
+
+  // A decision with nothing of the kind is published as typed.
+  const plain = await ok(alice, ["decide", "API errors use problem+json, version 2"], at(5));
+  assert.match(plain.stdout, /^decision [a-z2-7]{8} recorded: API errors use problem\+json, version 2$/m);
+
+  // The length limit is judged on what was typed, and is what the author hears about first:
+  // 470 characters, a space and a token are over it as typed and would be within it with the token taken out.
+  const long = await alice.huddle(["decide", `${"x".repeat(470)} ${FAKE_TOKEN}`], { now: at(6) });
+  assert.equal(long.code, 2);
+  assert.match(long.stderr, /a decision is at most 500 characters; this one is 511\./);
+  assert.doesNotMatch(long.stderr, /credential/);
+});
+
+// ---------------------------------------------------------------------------
+// A decision reaches a teammate's agent through the hooks
+// ---------------------------------------------------------------------------
+
+/** A payload Claude Code really sent (test/fixtures/hooks/claude-code), as if the agent were working in `clone`. */
+async function claudeCode(clone: Clone, fixture: string, now: string, change: (payload: Record<string, unknown>) => void = () => {}): Promise<string> {
+  const payload = JSON.parse(await readFile(new URL(`./fixtures/hooks/claude-code/${fixture}.json`, import.meta.url), "utf8")) as Record<string, unknown>;
+  payload.cwd = clone.dir;
+  change(payload);
+  const r = await clone.huddle(["hook", "claude-code"], { now, stdin: JSON.stringify(payload) });
+  assert.deepEqual({ code: r.code, stderr: r.stderr }, { code: 0, stderr: "" });
+  return r.stdout === "" ? "" : (JSON.parse(r.stdout) as { hookSpecificOutput: { additionalContext: string } }).hookSpecificOutput.additionalContext;
+}
+
+test("through the hooks: a session is briefed on the decisions in force when it starts, and on a new one at its next prompt", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  const bob = await h.clone("bob");
+  // Hooks run only where huddle is set up.
+  for (const clone of [alice, bob]) await clone.write(".huddle/config.json", "{}\n");
+  const first = await decide(alice, "API errors use problem+json", at(0));
+
+  // bob's agent starts: the briefing has the decision, though no teammate's agent is active.
+  const start = await claudeCode(bob, "session-start.startup", at(10));
+  assert.match(start, /^Decisions \(1\): API errors use problem\+json\.$/m);
+  assert.doesNotMatch(start, new RegExp(first), "an id is of no use to the agent in a briefing");
+
+  // Nothing new: the next prompt brings no decisions again.
+  const quiet = await claudeCode(bob, "user-prompt-submit.typed", at(20));
+  assert.doesNotMatch(quiet, /Decisions/);
+
+  // alice replaces it. bob's clone learns of it with its next sync, and his agent at the prompt after that.
+  await decide(alice, "API errors use problem+json with a trace id", at(30), ["--supersedes", first]);
+  await ok(bob, ["sync"], at(40));
+  const news = await claudeCode(bob, "user-prompt-submit.typed", at(50));
+  assert.match(news, /^\[huddle\] Update on teammates' agents\./);
+  assert.match(news, /^Decisions \(1 new\): API errors use problem\+json with a trace id\.$/m);
+  assert.doesNotMatch(news, /problem\+json\.$/m, "the decision that was replaced is not repeated");
+
+  // And once told, not again.
+  assert.doesNotMatch(await claudeCode(bob, "user-prompt-submit.typed", at(60)), /Decisions/);
 });
