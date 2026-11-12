@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
@@ -58,6 +58,15 @@ interface Bench {
   settled(hook: GitHook, count: number): Promise<Rec[]>;
 }
 
+/** A directory as the harness names its clones on Windows: the long form, as the file system has it. */
+function canonical(dir: string): string {
+  try {
+    return realpathSync.native(dir);
+  } catch {
+    return dir;
+  }
+}
+
 async function bench(t: TestContext): Promise<Bench> {
   const h = await createHarness(t);
   const file = join(h.root, "records.jsonl");
@@ -66,7 +75,8 @@ async function bench(t: TestContext): Promise<Bench> {
     const all = readFileSync(file, "utf8")
       .split("\n")
       .filter((line) => line !== "")
-      .map((line) => JSON.parse(line) as Rec);
+      .map((line) => JSON.parse(line) as Rec)
+      .map((rec) => (POSIX ? rec : { ...rec, cwd: canonical(rec.cwd) }));
     return hook === undefined ? all : all.filter((rec) => rec.args[2] === hook);
   };
   return {
@@ -94,6 +104,12 @@ async function withRecorder(clone: Clone): Promise<Clone> {
 
 function hookFile(clone: Clone, hook: string, dir = ".git/hooks"): string {
   return join(clone.dir, dir, hook);
+}
+
+/** Windows keeps no mode bits: there the check is left out, and everything else in the test still runs. */
+async function sameMode(file: string, mode: number): Promise<void> {
+  if (!POSIX) return;
+  assert.equal(await modeOf(file), mode, file);
 }
 
 async function modeOf(file: string): Promise<number> {
@@ -340,7 +356,7 @@ test("git format: an overlap warning goes to the terminal and the commit goes ah
 // install on a clone with no hooks
 // ---------------------------------------------------------------------------
 
-test("git install: a clone with no hooks gets four files that hold nothing but the block", { skip: !POSIX }, async (t) => {
+test("git install: a clone with no hooks gets four files that hold nothing but the block", async (t) => {
   const b = await bench(t);
   const alice = await withRecorder(await b.h.clone("alice"));
   const before = (await readdir(join(alice.dir, ".git/hooks"))).sort();
@@ -356,7 +372,7 @@ test("git install: a clone with no hooks gets four files that hold nothing but t
   assert.deepEqual(result.files, []);
   for (const hook of GIT_HOOKS) {
     assert.equal(await readFile(hookFile(alice, hook), "utf8"), `#!/bin/sh\n${hookBlock(hook, BUNDLE, true)}`);
-    assert.equal(await modeOf(hookFile(alice, hook)), 0o755);
+    await sameMode(hookFile(alice, hook), 0o755);
   }
   assert.deepEqual((await readdir(join(alice.dir, ".git/hooks"))).sort(), [...before, ...GIT_HOOKS].sort(), "no other file appeared, none went away");
 
@@ -366,7 +382,7 @@ test("git install: a clone with no hooks gets four files that hold nothing but t
   assert.equal(await alice.git("status", "--porcelain", "--", ".git"), "", "nothing git tracks was touched");
 });
 
-test("git hooks: a plain commit, a checkout and a merge each start huddle at the top of the worktree", { skip: !POSIX }, async (t) => {
+test("git hooks: a plain commit, a checkout and a merge each start huddle at the top of the worktree", async (t) => {
   const b = await bench(t);
   const alice = await withRecorder(await b.h.clone("alice"));
   await install(alice);
@@ -391,7 +407,7 @@ test("git hooks: a plain commit, a checkout and a merge each start huddle at the
   assert.deepEqual(await b.settled("post-merge", 1), [{ args: ["hook", "git", "post-merge"], cwd: alice.dir, stdin: "", session: null }]);
 });
 
-test("git hooks: pre-commit sees what this commit holds, however the commit was made", { skip: !POSIX }, async (t) => {
+test("git hooks: pre-commit sees what this commit holds, however the commit was made", async (t) => {
   const b = await bench(t);
   const alice = await withRecorder(await b.h.clone("alice"));
   await install(alice);
@@ -424,7 +440,7 @@ test("git hooks: pre-commit sees what this commit holds, however the commit was 
   await b.settled("post-commit", 4);
 });
 
-test("git hooks: while a merge is being concluded pre-commit stays out of it", { skip: !POSIX }, async (t) => {
+test("git hooks: while a merge is being concluded pre-commit stays out of it", async (t) => {
   const b = await bench(t);
   const alice = await withRecorder(await b.h.clone("alice"));
   await install(alice);
@@ -451,7 +467,7 @@ test("git hooks: while a merge is being concluded pre-commit stays out of it", {
   await b.settled("post-commit", 4);
 });
 
-test("git hooks: git does not wait for the post hooks, and neither does a program that reads git's output", { skip: !POSIX }, async (t) => {
+test("git hooks: git does not wait for the post hooks, and neither does a program that reads git's output", async (t) => {
   const b = await bench(t);
   const alice = await withRecorder(await b.h.clone("alice"));
   await install(alice);
@@ -467,7 +483,7 @@ test("git hooks: git does not wait for the post hooks, and neither does a progra
   await b.settled("post-commit", 1);
 });
 
-test("git hooks: nothing huddle does or lacks can stop a commit or change what git prints", { skip: !POSIX }, async (t) => {
+test("git hooks: nothing huddle does or lacks can stop a commit or change what git prints", async (t) => {
   const b = await bench(t);
   const alice = await withRecorder(await b.h.clone("alice"));
   await install(alice);
@@ -478,21 +494,46 @@ test("git hooks: nothing huddle does or lacks can stop a commit or change what g
   await b.settled("post-commit", 1);
 
   // No node on PATH.
-  const bin = join(b.h.root, "bin");
-  await mkdir(bin);
-  await symlink(await which("git"), join(bin, "git"));
-  const noNode = ok(await commitFile(b, alice, "two.txt", { PATH: bin }));
-  assert.equal(noNode.stderr, "");
-  assert.equal(b.records().length, 2, "huddle was not started");
+  const made = ["add one.txt"];
+  const bare = await pathWithGitAndNoNode(b);
+  if (bare === undefined) {
+    t.diagnostic("left out: a commit with no node on PATH. On this machine every directory of PATH that has git has node as well.");
+  } else {
+    const noNode = ok(await commitFile(b, alice, "two.txt", { PATH: bare }));
+    assert.equal(noNode.stderr, "");
+    assert.equal(b.records().length, 2, "huddle was not started");
+    made.unshift("add two.txt");
+  }
 
   // The bundle is not in this checkout (a branch from before huddle init).
   await rm(join(alice.dir, BUNDLE));
   const noBundle = ok(await commitFile(b, alice, "three.txt"));
   assert.equal(noBundle.stderr, "");
+  made.unshift("add three.txt");
   ok(await b.run(alice, ["checkout", "--quiet", "-b", "elsewhere"]));
   assert.equal(b.records().length, 2);
-  assert.equal(await alice.git("log", "--format=%s", "-3"), "add three.txt\nadd two.txt\nadd one.txt");
+  assert.equal(await alice.git("log", "--format=%s", `-${made.length}`), made.join("\n"));
 });
+
+/**
+ * A PATH on which git is found and node is not. Elsewhere that is a directory
+ * with a link to git and nothing else. Git for Windows finds its own files from
+ * where git.exe is, so a link to it does not run: there the directories that
+ * hold node are taken out of PATH, which leaves nothing to test with when git is
+ * in one of them (undefined).
+ */
+async function pathWithGitAndNoNode(b: Bench): Promise<string | undefined> {
+  if (POSIX) {
+    const bin = join(b.h.root, "bin");
+    await mkdir(bin);
+    await symlink(await which("git"), join(bin, "git"));
+    return bin;
+  }
+  const extensions = ["", ...(process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";")];
+  const holds = (dir: string, program: string): boolean => extensions.some((extension) => existsSync(join(dir, `${program}${extension}`)));
+  const dirs = (process.env.PATH ?? "").split(delimiter).filter((dir) => dir !== "" && !holds(dir, "node"));
+  return dirs.some((dir) => holds(dir, "git")) ? dirs.join(delimiter) : undefined;
+}
 
 async function which(name: string): Promise<string> {
   for (const dir of (process.env.PATH ?? "").split(delimiter)) {
@@ -503,13 +544,24 @@ async function which(name: string): Promise<string> {
   throw new Error(`${name} is not on PATH`);
 }
 
+/** Whether this account may make a symbolic link. On Windows that takes Developer Mode or an elevated process. */
+async function canLink(dir: string): Promise<boolean> {
+  try {
+    await symlink("nowhere", join(dir, "link-probe"));
+    await rm(join(dir, "link-probe"));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Hooks that are already there
 // ---------------------------------------------------------------------------
 
 const USER_HOOK = '#!/bin/sh\n# our own check\necho "user pre-commit ran" >> "$USER_MARKER"\nexec true\necho "never reached"\n';
 
-test("git install: an existing hook keeps every byte and still runs, with huddle's lines in front of it", { skip: !POSIX }, async (t) => {
+test("git install: an existing hook keeps every byte and still runs, with huddle's lines in front of it", async (t) => {
   const b = await bench(t);
   const alice = await withRecorder(await b.h.clone("alice"));
   const marker = join(b.h.root, "user-marker");
@@ -519,7 +571,7 @@ test("git install: an existing hook keeps every byte and still runs, with huddle
   assert.deepEqual(result.changed, GIT_HOOKS.map((hook) => `.git/hooks/${hook}`));
   const added = hookBlock("pre-commit", BUNDLE, false);
   assert.equal(await readFile(hookFile(alice, "pre-commit"), "utf8"), USER_HOOK.replace("#!/bin/sh\n", `#!/bin/sh\n${added}`));
-  assert.equal(await modeOf(hookFile(alice, "pre-commit")), 0o700, "the mode is the user's");
+  await sameMode(hookFile(alice, "pre-commit"), 0o700);
   assert.deepEqual((await install(alice)).changed, []);
 
   ok(await commitFile(b, alice, "a.txt", { USER_MARKER: marker }));
@@ -535,7 +587,7 @@ test("git install: an existing hook keeps every byte and still runs, with huddle
   assert.equal(b.records("pre-commit").length, 2);
 });
 
-test("git remove: gives back exactly what was there", { skip: !POSIX }, async (t) => {
+test("git remove: gives back exactly what was there", async (t) => {
   const b = await bench(t);
   const alice = await withRecorder(await b.h.clone("alice"));
   const before = (await readdir(join(alice.dir, ".git/hooks"))).sort();
@@ -548,7 +600,7 @@ test("git remove: gives back exactly what was there", { skip: !POSIX }, async (t
 
   assert.deepEqual(await removeGitHooks(alice.dir), GIT_HOOKS.map((hook) => `.git/hooks/${hook}`));
   assert.equal(await readFile(hookFile(alice, "pre-commit"), "utf8"), USER_HOOK);
-  assert.equal(await modeOf(hookFile(alice, "pre-commit")), 0o700);
+  await sameMode(hookFile(alice, "pre-commit"), 0o700);
   assert.equal(await readFile(hookFile(alice, "post-merge"), "utf8"), "npm install");
   assert.equal(await readFile(created, "utf8"), '#!/bin/sh\necho "mine"\n', "the user's line stays, in a file that still runs");
   assert.equal(existsSync(hookFile(alice, "post-checkout")), false, "a file huddle created and nobody added to is gone");
@@ -559,8 +611,9 @@ test("git remove: gives back exactly what was there", { skip: !POSIX }, async (t
   assert.deepEqual(b.records(), [], "huddle no longer runs");
 });
 
-test("git install: a hook huddle cannot add itself to is left exactly as it is, and named", { skip: !POSIX }, async (t) => {
+test("git install: a hook huddle cannot add itself to is left exactly as it is, and named", async (t) => {
   const b = await bench(t);
+  if (!(await canLink(b.h.root))) return t.skip("this account may not make a symbolic link (on Windows: Developer Mode, or an elevated process)");
   const alice = await withRecorder(await b.h.clone("alice"));
   const python = "#!/usr/bin/env python3\nprint('checking')\n";
   const binary = Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x00, 0x01, 0x02]);
@@ -576,7 +629,8 @@ test("git install: a hook huddle cannot add itself to is left exactly as it is, 
   assert.equal(await readFile(hookFile(alice, "pre-commit"), "utf8"), python);
   assert.deepEqual(await readFile(hookFile(alice, "post-commit")), binary);
   assert.ok((await lstat(hookFile(alice, "post-checkout"))).isSymbolicLink());
-  assert.equal(await readlink(hookFile(alice, "post-checkout")), "../../scripts/hook.sh");
+  // Windows hands the link back with its own separator.
+  assert.equal((await readlink(hookFile(alice, "post-checkout"))).replaceAll("\\", "/"), "../../scripts/hook.sh");
   assert.equal(await alice.read("scripts/hook.sh"), "#!/bin/sh\necho shared\n");
 
   const left = result.notes.find((note) => note.startsWith("huddle left 3 hooks alone")) ?? "";
@@ -593,7 +647,7 @@ test("git install: a hook huddle cannot add itself to is left exactly as it is, 
   assert.equal("broken" in check, false, "left alone on purpose is not broken");
 });
 
-test("git install: which first lines count as a shell script", { skip: !POSIX }, async (t) => {
+test("git install: which first lines count as a shell script", async (t) => {
   const b = await bench(t);
   const alice = await withRecorder(await b.h.clone("alice"));
   const file = hookFile(alice, "pre-commit");
@@ -611,17 +665,18 @@ test("git install: which first lines count as a shell script", { skip: !POSIX },
   }
 });
 
-test("git install: a hook file git would not run is not made to run", { skip: !POSIX }, async (t) => {
+test("git install: a hook file git would not run is not made to run", async (t) => {
   const b = await bench(t);
   const alice = await withRecorder(await b.h.clone("alice"));
   const disabled = "#!/bin/sh\necho switched off by removing the x bit\n";
   await script(hookFile(alice, "pre-commit"), disabled, 0o644);
   await mkdir(hookFile(alice, "post-merge"));
 
-  const result = await install(alice);
+  // The platform is passed in, so both answers are tested wherever this runs. A file on Windows never has the bit.
+  const result = await installGitHooks({ repoRoot: alice.dir, bundle: BUNDLE }, "linux");
   assert.deepEqual(result.changed, [".git/hooks/post-commit", ".git/hooks/post-checkout"]);
   assert.equal(await readFile(hookFile(alice, "pre-commit"), "utf8"), disabled);
-  assert.equal(await modeOf(hookFile(alice, "pre-commit")), 0o644);
+  await sameMode(hookFile(alice, "pre-commit"), 0o644);
   const left = result.notes.find((note) => note.startsWith("huddle left 2 hooks alone")) ?? "";
   assert.match(left, /\.git\/hooks\/pre-commit is not executable, so git does not run it/);
   assert.match(left, /\.git\/hooks\/post-merge is not a regular file/);
@@ -631,7 +686,7 @@ test("git install: a hook file git would not run is not made to run", { skip: !P
   assert.deepEqual((await installGitHooks({ repoRoot: alice.dir, bundle: BUNDLE }, "win32")).changed, [".git/hooks/pre-commit", ".git/hooks/post-merge"]);
 });
 
-test("git install: when no hook can be installed it says why and changes nothing", { skip: !POSIX }, async (t) => {
+test("git install: when no hook can be installed it says why and changes nothing", async (t) => {
   const b = await bench(t);
   const alice = await withRecorder(await b.h.clone("alice"));
   for (const hook of GIT_HOOKS) await script(hookFile(alice, hook), "#!/usr/bin/env node\nconsole.log(1)\n");
@@ -655,7 +710,7 @@ test("git install: when no hook can be installed it says why and changes nothing
   assert.deepEqual((await readdir(join(bob.dir, ".git/hooks"))).sort(), before);
 });
 
-test("git install: a hook manager that rewrites its files is pointed out", { skip: !POSIX }, async (t) => {
+test("git install: a hook manager that rewrites its files is pointed out", async (t) => {
   const b = await bench(t);
   const alice = await withRecorder(await b.h.clone("alice"));
   await script(hookFile(alice, "pre-commit"), '#!/bin/sh\n\nif [ "$LEFTHOOK" = "0" ]; then\n  exit 0\nfi\n\ncall_lefthook run "pre-commit" "$@"\n');
@@ -672,7 +727,7 @@ test("git install: a hook manager that rewrites its files is pointed out", { ski
 // check
 // ---------------------------------------------------------------------------
 
-test("git check: says what is missing, changed, switched off or pointing nowhere", { skip: !POSIX }, async (t) => {
+test("git check: says what is missing, changed, switched off or pointing nowhere", async (t) => {
   const b = await bench(t);
   const alice = await b.h.clone("alice");
   assert.deepEqual(await checkGitHooks(alice.dir), { installed: false, detail: "no huddle git hooks in .git/hooks. Run huddle init --agent git.", notes: [] });
@@ -701,12 +756,15 @@ test("git check: says what is missing, changed, switched off or pointing nowhere
   assert.equal((await checkGitHooks(alice.dir)).installed, true);
 
   await chmod(hookFile(alice, "post-commit"), 0o644);
-  assert.deepEqual(await checkGitHooks(alice.dir), {
-    installed: false,
-    broken: true,
-    detail: "git ignores the post-commit hook in .git/hooks: not executable. Run chmod +x on it.",
-    notes: [],
-  });
+  // Switched off is a state only a system with the x bit has: on Windows chmod changes nothing here.
+  if (POSIX) {
+    assert.deepEqual(await checkGitHooks(alice.dir), {
+      installed: false,
+      broken: true,
+      detail: "git ignores the post-commit hook in .git/hooks: not executable. Run chmod +x on it.",
+      notes: [],
+    });
+  }
   assert.equal((await checkGitHooks(alice.dir, "win32")).installed, true, "no such bit on Windows");
   await chmod(hookFile(alice, "post-commit"), 0o755);
 
@@ -738,7 +796,7 @@ test("git check: says what is missing, changed, switched off or pointing nowhere
   assert.equal(await readFile(twice, "utf8"), `#!/bin/sh\n${hookBlock("post-commit", BUNDLE, true)}`);
 });
 
-test("git install: moving the bundle updates the one block in each hook", { skip: !POSIX }, async (t) => {
+test("git install: moving the bundle updates the one block in each hook", async (t) => {
   const b = await bench(t);
   const alice = await withRecorder(await b.h.clone("alice"));
   await script(hookFile(alice, "pre-commit"), USER_HOOK);
@@ -754,7 +812,7 @@ test("git install: moving the bundle updates the one block in each hook", { skip
 // core.hooksPath, husky, linked worktrees
 // ---------------------------------------------------------------------------
 
-test("git install: core.hooksPath inside the repository is where the hooks go, and git runs them there", { skip: !POSIX }, async (t) => {
+test("git install: core.hooksPath inside the repository is where the hooks go, and git runs them there", async (t) => {
   const b = await bench(t);
   const alice = await withRecorder(await b.h.clone("alice"));
   await alice.git("config", "core.hooksPath", ".githooks");
@@ -788,7 +846,7 @@ test("git install: core.hooksPath inside the repository is where the hooks go, a
   assert.deepEqual(mixed.files, [".githooks/post-commit", ".githooks/post-checkout", ".githooks/post-merge"]);
 });
 
-test("git install: a hooks directory outside the repository is not huddle's to change", { skip: !POSIX }, async (t) => {
+test("git install: a hooks directory outside the repository is not huddle's to change", async (t) => {
   const b = await bench(t);
   const alice = await withRecorder(await b.h.clone("alice"));
   const shared = join(b.h.root, "shared-hooks");
@@ -825,7 +883,7 @@ async function husky9(clone: Clone, dir = ".husky"): Promise<void> {
   await clone.git("config", "core.hooksPath", `${dir}/_`);
 }
 
-test("git install: with husky 9 the hooks go next to the team's own, not into the directory husky rewrites", { skip: !POSIX }, async (t) => {
+test("git install: with husky 9 the hooks go next to the team's own, not into the directory husky rewrites", async (t) => {
   const b = await bench(t);
   const alice = await withRecorder(await b.h.clone("alice"));
   await husky9(alice);
@@ -840,7 +898,7 @@ test("git install: with husky 9 the hooks go next to the team's own, not into th
   assert.deepEqual(result.files, GIT_HOOKS.map((hook) => `.husky/${hook}`), "not the directory husky generates");
   assert.equal(await readFile(join(alice.dir, ".husky/_/pre-commit"), "utf8"), generated);
   assert.equal(await alice.read(".husky/pre-commit"), `${hookBlock("pre-commit", BUNDLE, false)}echo "husky ran" >> "$USER_MARKER"\n`);
-  assert.equal(await modeOf(join(alice.dir, ".husky/pre-commit")), 0o644);
+  await sameMode(join(alice.dir, ".husky/pre-commit"), 0o644);
   assert.deepEqual(result.files, [".husky/pre-commit", ".husky/post-commit", ".husky/post-checkout", ".husky/post-merge"]);
   assert.deepEqual(await checkGitHooks(alice.dir), { installed: true, detail: "4 git hooks in .husky", notes: result.notes, files: result.files });
 
@@ -859,7 +917,7 @@ test("git install: with husky 9 the hooks go next to the team's own, not into th
   assert.deepEqual((await readdir(join(alice.dir, ".husky"))).sort(), ["_", "pre-commit"]);
 });
 
-test("git install: husky 9 in a directory of another name is recognized by the runner it generates", { skip: !POSIX }, async (t) => {
+test("git install: husky 9 in a directory of another name is recognized by the runner it generates", async (t) => {
   const b = await bench(t);
   const alice = await withRecorder(await b.h.clone("alice"));
   await husky9(alice, "config/hooks");
@@ -869,7 +927,7 @@ test("git install: husky 9 in a directory of another name is recognized by the r
   await b.settled("post-commit", 1);
 });
 
-test("git install: in a husky 8 hook the block goes below the line that runs the hook a second time", { skip: !POSIX }, async (t) => {
+test("git install: in a husky 8 hook the block goes below the line that runs the hook a second time", async (t) => {
   const b = await bench(t);
   const alice = await withRecorder(await b.h.clone("alice"));
   const marker = join(b.h.root, "marker");
@@ -892,7 +950,7 @@ test("git install: in a husky 8 hook the block goes below the line that runs the
   await b.settled("post-commit", 1);
 });
 
-test("git install: a linked worktree shares the clone's hooks, and each worktree runs its own bundle", { skip: !POSIX }, async (t) => {
+test("git install: a linked worktree shares the clone's hooks, and each worktree runs its own bundle", async (t) => {
   const b = await bench(t);
   const alice = await b.h.clone("alice");
   const tree = await withRecorder(await alice.addWorktree("side tree", "side"));
@@ -972,7 +1030,7 @@ async function lastHookDone(b: Bench, clone: Clone): Promise<void> {
 
 const huddleRefs = (h: Harness): Promise<string> => h.remoteGit("for-each-ref", "--format=%(refname)", "refs/huddle/");
 
-test("git hooks, end to end: a plain commit by alice, no agent anywhere, shows her to bob; bob's commit of the same file is warned and goes ahead", { skip: !POSIX }, async (t) => {
+test("git hooks, end to end: a plain commit by alice, no agent anywhere, shows her to bob; bob's commit of the same file is warned and goes ahead", async (t) => {
   const b = await bench(t);
   const alice = await b.h.clone("alice");
   await vendor(alice);
@@ -1020,7 +1078,7 @@ test("git hooks, end to end: a plain commit by alice, no agent anywhere, shows h
   await lastHookDone(b, bob);
 });
 
-test("git hooks, end to end: post-commit alone starts the background sync that publishes the clone", { skip: !POSIX }, async (t) => {
+test("git hooks, end to end: post-commit alone starts the background sync that publishes the clone", async (t) => {
   const b = await bench(t);
   const carol = await b.h.clone("carol");
   await vendor(carol);
@@ -1043,7 +1101,7 @@ test("git hooks, end to end: post-commit alone starts the background sync that p
   await lastHookDone(b, carol);
 });
 
-test("git hooks, end to end: on a branch from before huddle was set up the hooks do nothing, and back on a branch that has it they work again", { skip: !POSIX }, async (t) => {
+test("git hooks, end to end: on a branch from before huddle was set up the hooks do nothing, and back on a branch that has it they work again", async (t) => {
   const b = await bench(t);
   const erin = await b.h.clone("erin");
   const before = await erin.git("rev-parse", "HEAD");
@@ -1097,7 +1155,7 @@ test("git adapter: registered, and an option that is asked for by name, never se
   assert.deepEqual(await gitHooks.check(nowhere), { installed: false, detail: "no git hooks: this is not a git repository with a working tree", notes: [] });
 });
 
-test("git hooks, end to end: a second commit a moment after the first, with nothing after it, still reaches teammates", { skip: !POSIX }, async (t) => {
+test("git hooks, end to end: a second commit a moment after the first, with nothing after it, still reaches teammates", async (t) => {
   const b = await bench(t);
   const carol = await b.h.clone("carol");
   await mkdir(join(carol.dir, ".huddle"), { recursive: true });
