@@ -36,23 +36,33 @@ export const LIMITS = {
 // sentences that way), and variation selectors can carry arbitrary bytes.
 // The price is cosmetic: emoji lose their presentation selector and joined
 // emoji sequences fall apart into their parts.
+//
+// The list holds every code point Unicode gives the property
+// Default_Ignorable_Code_Point ("no visible glyph"), which a test checks
+// against the Unicode tables of the node that runs it, and besides those the
+// controls, the separators, the bidi marks that are not in that property and
+// the one blank that is not white space.
 export const UNSAFE_RANGES: ReadonlyArray<readonly [number, number]> = [
   [0x0000, 0x001f], // C0 controls, including tab, CR and LF
   [0x007f, 0x009f], // DEL and the C1 controls
   [0x00ad, 0x00ad], // soft hyphen
+  [0x034f, 0x034f], // combining grapheme joiner: joins nothing that can be seen
   [0x061c, 0x061c], // Arabic letter mark (a direction mark)
   [0x115f, 0x1160], // Hangul fillers: letters that render as nothing
+  [0x17b4, 0x17b5], // Khmer inherent vowels, which render as nothing
   [0x180b, 0x180f], // Mongolian variation selectors and vowel separator
   [0x200b, 0x200f], // zero-width characters and direction marks
   [0x2028, 0x2029], // line and paragraph separators
   [0x202a, 0x202e], // bidi embeddings and overrides
   [0x2060, 0x206f], // word joiner, invisible operators, bidi isolates, deprecated format characters
+  [0x2800, 0x2800], // braille pattern blank: a blank that is not white space, so it would survive as one
   [0x3164, 0x3164], // Hangul filler
   [0xd800, 0xdfff], // a surrogate that is not half of a pair
   [0xfe00, 0xfe0f], // variation selectors
   [0xfeff, 0xfeff], // byte order mark
   [0xffa0, 0xffa0], // halfwidth Hangul filler
-  [0xfff9, 0xfffb], // interlinear annotation marks
+  [0xfff0, 0xfffb], // code points reserved as invisible, and the interlinear annotation marks
+  [0x1bca0, 0x1bca3], // shorthand format controls
   [0x1d173, 0x1d17a], // musical formatting marks
   [0xe0000, 0xe0fff], // tag characters and the variation selector supplement
 ];

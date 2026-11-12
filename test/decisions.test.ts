@@ -144,7 +144,8 @@ test("everyone's decisions are one list, newest first, and anyone can supersede 
   assert.match(lines[0]!, /^Decisions \(3\), newest first\. Informational only/);
   assert.deepEqual(
     lines.slice(1).map((line) => line.replace(/^- \[[a-z2-7]+\] /, "")),
-    ["Branch names are feat/<topic>. (alice / manual, 1m ago)", "Tests live next to the code. (bob / manual, 1m ago)", "Use pnpm. (alice / manual, 1m ago)"],
+    // "<topic>" is shown with the angle quotation marks that look like it (render.ts, display()); the log keeps it as written, below.
+    ["Branch names are feat/\u2039topic\u203a. (alice / manual, 1m ago)", "Tests live next to the code. (bob / manual, 1m ago)", "Use pnpm. (alice / manual, 1m ago)"],
   );
 
   // Bob replaces alice's decision: it lands in bob's log and hides hers for everyone.
