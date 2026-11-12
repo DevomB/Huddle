@@ -1,5 +1,19 @@
 // T2.3. The AGENTS.md block: tier 2, for any agent that reads AGENTS.md and can
 // run a shell command. Not a hook adapter, so it does not implement Adapter.
+//
+// AGENTS.md is the user's file. huddle owns one block in it, between two
+// marker lines, and nothing else:
+// - A marker counts only as a line of its own. The same text inside a sentence
+//   or a code sample is the user's.
+// - The block is an end marker line and the nearest begin marker line before
+//   it. A begin marker with no end after it, or an end marker with no begin
+//   before it, is a leftover of some edit: it is left where it is and never
+//   makes huddle take text that follows or precedes it.
+// - Everything outside the block comes back byte for byte, line endings
+//   included, and the block is written with the line endings the file uses.
+// - A file that is not UTF-8 text, or that cannot be read for a reason other
+//   than not being there, is left alone and reported: writing it back would
+//   damage it.
 
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -33,27 +47,52 @@ export function agentsMdBlock(opts: Pick<InstallOptions, "bundle">): string {
   ].join("\n");
 }
 
+/** Why AGENTS.md was left alone. The message is one sentence for the user. */
+export class AgentsMdError extends Error {}
+
 /**
- * Where the managed block sits in `content` (markers included), or null when
- * there is none. The block is the first end marker and the nearest begin
- * marker before it, so a stray begin marker left by a bad edit can never make
- * install swallow the text that follows it.
+ * Where the managed block sits in `content`, or null when there is none:
+ * `start` is the first character of the begin marker line, `end` is just
+ * after the end marker (before that line's line break).
  */
 function findBlock(content: string): { start: number; end: number } | null {
-  const close = content.indexOf(AGENTS_MD_END);
-  if (close === -1) return null;
-  const start = content.lastIndexOf(AGENTS_MD_BEGIN, close);
-  if (start === -1) return null;
-  return { start, end: close + AGENTS_MD_END.length };
+  let begin: number | null = null;
+  let offset = 0;
+  while (offset <= content.length) {
+    const lineEnd = content.indexOf("\n", offset);
+    const stop = lineEnd === -1 ? content.length : lineEnd;
+    const line = content.slice(offset, stop).trim();
+    if (line === AGENTS_MD_BEGIN) begin = offset;
+    else if (line === AGENTS_MD_END && begin !== null) {
+      // The marker's own extent, without what trim() removed after it.
+      const markerEnd = content.indexOf(AGENTS_MD_END, offset) + AGENTS_MD_END.length;
+      return { start: begin, end: markerEnd };
+    }
+    if (lineEnd === -1) break;
+    offset = lineEnd + 1;
+  }
+  return null;
 }
 
+/** The file's text, or null when there is no file. Throws AgentsMdError for a file huddle must not write back. */
 async function read(file: string): Promise<string | null> {
+  let bytes: Buffer;
   try {
-    return await readFile(file, "utf8");
+    bytes = await readFile(file);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return null;
+    throw new AgentsMdError(`${FILE} could not be read (${code ?? (error instanceof Error ? error.message : String(error))}), so huddle left it alone`);
+  }
+  try {
+    // ignoreBOM keeps a byte order mark in the text, so that it is written back.
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
   } catch {
-    return null;
+    throw new AgentsMdError(`${FILE} is not UTF-8 text, so huddle left it alone: writing it back would damage it`);
   }
 }
+
+const unix = (text: string): string => text.replace(/\r\n/g, "\n");
 
 /** Creates AGENTS.md or updates the managed block in it. Everything outside the block is left alone. Idempotent. */
 export async function installAgentsMd(opts: InstallOptions): Promise<InstallResult> {
@@ -65,24 +104,42 @@ export async function installAgentsMd(opts: InstallOptions): Promise<InstallResu
   if (existing === null || existing.trim() === "") {
     next = `${block}\n`;
   } else {
+    // The file's own line endings, for the lines huddle writes into it.
+    const eol = existing.includes("\r\n") ? "\r\n" : "\n";
+    const ours = block.split("\n").join(eol);
     const found = findBlock(existing);
     if (found) {
-      next = existing.slice(0, found.start) + block + existing.slice(found.end);
+      // The same block with other line endings is not a reason to rewrite the file.
+      if (unix(existing.slice(found.start, found.end)) === block) return { changed: [], notes: [] };
+      next = existing.slice(0, found.start) + ours + existing.slice(found.end);
     } else {
-      next = `${existing.replace(/\s+$/, "")}\n\n${block}\n`;
+      // After the user's text, which stays as it is: one empty line, then the block.
+      let prefix = existing;
+      if (!prefix.endsWith("\n")) prefix += eol;
+      if (!/\n\r?\n$/.test(prefix)) prefix += eol;
+      next = `${prefix}${ours}${eol}`;
     }
   }
   if (next === existing) return { changed: [], notes: [] };
-  await writeFile(file, next);
+  try {
+    await writeFile(file, next);
+  } catch (error) {
+    throw new AgentsMdError(`${FILE} could not be written (${(error as NodeJS.ErrnoException).code ?? (error instanceof Error ? error.message : String(error))})`);
+  }
   return { changed: [FILE], notes: [] };
 }
 
 export async function checkAgentsMd(repoRoot: string, opts: Pick<InstallOptions, "bundle"> = { bundle: ".huddle/huddle.mjs" }): Promise<CheckResult> {
-  const existing = await read(join(repoRoot, FILE));
+  let existing: string | null;
+  try {
+    existing = await read(join(repoRoot, FILE));
+  } catch (error) {
+    return { installed: false, detail: error instanceof Error ? error.message : String(error), notes: [] };
+  }
   if (existing === null) return { installed: false, detail: "AGENTS.md is missing", notes: ['run "huddle init"'] };
   const found = findBlock(existing);
   if (!found) return { installed: false, detail: "AGENTS.md has no huddle block", notes: ['run "huddle init"'] };
-  if (existing.slice(found.start, found.end) !== agentsMdBlock(opts)) {
+  if (unix(existing.slice(found.start, found.end)) !== agentsMdBlock(opts)) {
     return { installed: true, detail: "AGENTS.md has a huddle block from another version", notes: ['run "huddle init" to update it'] };
   }
   return { installed: true, detail: "AGENTS.md has the huddle block", notes: [] };

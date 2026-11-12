@@ -7,14 +7,15 @@ import { parse } from "../core/args.ts";
 import { ageMs } from "../core/clock.ts";
 import { openContext } from "../core/context.ts";
 import type { Ctx } from "../core/context.ts";
+import { newId } from "../core/docs.ts";
 import { resolveBase } from "../core/files.ts";
 import { git } from "../core/git.ts";
 import { EXIT, NotImplementedError, UsageError } from "../core/io.ts";
 import type { Io } from "../core/io.ts";
 import { loadConfigReport } from "../core/paths.ts";
-import { toActorDoc } from "../core/session.ts";
 import { readCache, readLocal } from "../core/store.ts";
 import { actorRef, REF_PATTERN } from "../core/types.ts";
+import type { ActorDoc } from "../core/types.ts";
 import { BUNDLE, bundleVersion } from "./init.ts";
 
 export const summary = "Check that huddle can work here: remote, push access, hooks, last sync";
@@ -38,12 +39,19 @@ interface Check {
 const check = (name: string, level: Level, detail: string, notes: string[] = []): Check => ({ name, level, detail, notes });
 
 /**
- * Text with the credentials taken out of any URL in it (`https://user:token@host/…`).
- * Doctor output gets pasted into issues and chat, and both a remote URL and
- * git's own error messages can carry a token.
+ * Text with the credentials taken out of any URL in it. Doctor output gets
+ * pasted into issues and chat, and both a remote URL and git's own error
+ * messages can carry a token.
+ *
+ * Two places: the part before the host (`https://user:token@host/…`, up to
+ * the last "@" before the first "/", because a password may hold an "@"), and
+ * the value of a query parameter whose name says it is a secret
+ * (`?access_token=…`).
  */
 export function redactUrl(text: string): string {
-  return text.replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^/@\s'"]+@/gi, "$1***@");
+  return text
+    .replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^/\s'"]*@/gi, "$1***@")
+    .replace(/([?&][^=&\s'"]*(?:token|key|secret|password|passwd|auth|sig)[^=&\s'"]*=)[^&\s'"]+/gi, "$1***");
 }
 
 function formatAge(ms: number): string {
@@ -101,6 +109,13 @@ async function bundle(ctx: Ctx): Promise<Check> {
   const tracked = await git(["ls-files", "--error-unmatch", "--", BUNDLE], { cwd: ctx.paths.worktree });
   if (!tracked.ok) {
     return check("bundle", "warn", `${BUNDLE} (huddle ${version}) is not committed`, [`git add .huddle && git commit: teammates get huddle by pulling it`]);
+  }
+  // Tracked says only that some version of the file is committed, not that this one is.
+  const dirty = await git(["status", "--porcelain", "--", BUNDLE], { cwd: ctx.paths.worktree });
+  if (dirty.ok && dirty.stdout.trim() !== "") {
+    return check("bundle", "warn", `${BUNDLE} (huddle ${version}) has changes that are not committed`, [
+      `git add ${BUNDLE} && git commit: until then teammates run the copy from the last commit`,
+    ]);
   }
   const running = bundleVersion((await readText(ctx.io.self)) ?? "");
   if (running !== null && running !== version) {
@@ -198,23 +213,29 @@ async function remote(ctx: Ctx): Promise<Check[]> {
 }
 
 /**
- * Push access is tested by really pushing this clone's own document, which is
- * the only way to know: rulesets and push rules are enforced on the server.
- * Two pushes, because creating a ref and replacing one are separate
- * permissions and huddle needs both: every update of a document is a forced,
- * non-fast-forward push.
+ * Push access is tested by really pushing, which is the only way to know:
+ * rulesets and push rules are enforced on the server. Two pushes, because
+ * creating a ref and replacing one are separate permissions and huddle needs
+ * both: every update of a document is a forced, non-fast-forward push.
+ *
+ * What is pushed is a document of its own: an actor document with no sessions,
+ * under an id made up for this run, removed again at the end. This clone's
+ * real document is never touched, so a sync running at the same moment, here
+ * or in a teammate's clone, sees nothing it could take for a second writer,
+ * and nothing it publishes can be replaced by the test. Teammates who fetch in
+ * between see an actor with no sessions, which shows nowhere.
  */
 async function pushAccess(ctx: Ctx): Promise<Check> {
   const { paths, config: c, transport } = ctx;
-  const local = await readLocal(paths);
-  const doc = toActorDoc(ctx.identity, local.sessions, ctx.now, c.ttlMinutes);
-  const ref = actorRef(ctx.identity.actor);
+  const probe = newId();
+  const ref = actorRef(probe);
+  const doc: ActorDoc = { v: 0, kind: "actor", actor: probe, user: ctx.identity.user, host: ctx.identity.host, updatedAt: ctx.now.toISOString(), sessions: [] };
   const byHand = `Check by hand with: git push ${c.remote} HEAD:refs/huddle/probe && git push ${c.remote} :refs/huddle/probe`;
+  const flaky = (): Check =>
+    check("push", "fail", "the remote stopped answering during the push test", ["try again; if it keeps happening the remote is slow or flaky", `details are in ${paths.logFile}`]);
 
-  const first = await transport.publish(ref, { ...doc, updatedAt: new Date(ctx.now.getTime() - 1).toISOString() }, "own");
-  if (!first.ok && first.reason === "offline") {
-    return check("push", "fail", "the remote stopped answering during the push test", ["try again; if it keeps happening the remote is slow or flaky", `details are in ${paths.logFile}`]);
-  }
+  const first = await transport.publish(ref, { ...doc, updatedAt: new Date(ctx.now.getTime() - 1).toISOString() }, "absent");
+  if (!first.ok && first.reason === "offline") return flaky();
   if (!first.ok) {
     return check("push", "fail", `the remote refused a push to refs/huddle/* (${first.reason})`, [
       "huddle stores its state in refs under refs/huddle/ on this remote, so everyone on the team needs to be able to push there.",
@@ -225,17 +246,21 @@ async function pushAccess(ctx: Ctx): Promise<Check> {
   }
 
   const second = await transport.publish(ref, doc, "own");
-  // A clone with nothing to announce that never published leaves no trace behind.
-  const leaveNoTrace = doc.sessions.length === 0 && local.published === null;
-  if (leaveNoTrace) await transport.remove(ref, second.ok ? second.sha : first.sha);
-  if (second.ok) return check("push", "ok", "can create and replace refs under refs/huddle/ on this remote");
-  if (second.reason === "offline") {
-    return check("push", "fail", "the remote stopped answering during the push test", ["try again; if it keeps happening the remote is slow or flaky", `details are in ${paths.logFile}`]);
+  const removed = await transport.remove(ref, second.ok ? second.sha : first.sha);
+  const leftover = removed.ok ? [] : [`the test left ${ref} on the remote (it could not be deleted: ${removed.reason}). It is harmless; remove it with: git push ${c.remote} :${ref}`];
+  if (second.ok) {
+    if (removed.ok) return check("push", "ok", "can create and replace refs under refs/huddle/ on this remote");
+    return check("push", "warn", "can create and replace refs under refs/huddle/ on this remote, but not delete them", [
+      ...leftover,
+      "huddle works without deleting refs; the documents of clones that are gone then stay on the remote.",
+    ]);
   }
+  if (second.reason === "offline") return { ...flaky(), notes: [...flaky().notes, ...leftover] };
   return check("push", "fail", `the remote accepts new refs under refs/huddle/ but refuses to replace them (${second.reason})`, [
     "huddle replaces a document by force-pushing its ref, so the remote must allow non-fast-forward updates under refs/huddle/.",
     "Usual causes: a server-side hook that rejects forced updates for every ref instead of only for branches; a per-ref permission that allows creating but not force-pushing (Gerrit's Force Push). git's own receive.denyNonFastForwards is not the cause: it only covers refs/heads/.",
     `git's own message is in ${paths.logFile}`,
+    ...leftover,
   ]);
 }
 
@@ -244,7 +269,8 @@ async function hooks(ctx: Ctx): Promise<Check[]> {
   for (const adapter of ADAPTERS) {
     try {
       const result = await adapter.check(ctx.paths.worktree);
-      checks.push(check(`hooks: ${adapter.title}`, result.installed ? "ok" : "info", result.detail, result.notes));
+      // Hooks that are there and cannot work are a problem; an agent nobody set up here is not.
+      checks.push(check(`hooks: ${adapter.title}`, result.installed ? "ok" : result.broken ? "warn" : "info", result.detail, result.notes));
     } catch (error) {
       if (error instanceof NotImplementedError) {
         checks.push(check(`hooks: ${adapter.title}`, "info", "not available in this version of huddle"));

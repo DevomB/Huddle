@@ -89,10 +89,22 @@ export interface InstallResult {
   changed: string[];
   /** Things the user still has to do by hand (trust a project, review hooks, ...). */
   notes: string[];
+  /**
+   * Optional: every file of this adapter that the team commits, repo-relative,
+   * whether this run changed it or not. `huddle init` uses it to name what is
+   * still to be committed. Without it, init goes by `changed`.
+   */
+  files?: string[];
 }
 
 export interface CheckResult {
   installed: boolean;
+  /**
+   * Optional: true when hooks are there but cannot work as they are (some are
+   * missing, a settings file is not valid). `huddle doctor` warns about that;
+   * an adapter that was simply never installed is only mentioned.
+   */
+  broken?: boolean;
   /** One line for `huddle doctor`. */
   detail: string;
   /** Manual steps the user may still need, shown by doctor. */

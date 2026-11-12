@@ -2,11 +2,11 @@
 
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
-import { AGENTS_MD_BEGIN, AGENTS_MD_END, agentsMdBlock, checkAgentsMd, installAgentsMd } from "../src/adapters/agents-md.ts";
-import { bundleVersion, run as init } from "../src/commands/init.ts";
+import { AGENTS_MD_BEGIN, AGENTS_MD_END, AgentsMdError, agentsMdBlock, checkAgentsMd, installAgentsMd } from "../src/adapters/agents-md.ts";
+import { bundleVersion, compareVersions, run as init } from "../src/commands/init.ts";
 import { CliError } from "../src/core/io.ts";
 import type { Io } from "../src/core/io.ts";
 import { DEFAULT_CONFIG } from "../src/core/types.ts";
@@ -86,6 +86,124 @@ test("a stray begin marker never makes install delete the text after it", async 
   assert.equal(text.split(AGENTS_MD_END).length - 1, 1, "exactly one managed block");
 });
 
+/** How many managed blocks a text holds: marker lines, not mentions of the markers. */
+const blocks = (text: string) => text.split(/\r?\n/).filter((line) => line.trim() === AGENTS_MD_END).length;
+
+test("a stray end marker does not make every install add another block", async (t) => {
+  const h = await createHarness(t);
+  const clone = await h.clone("alice");
+  const broken = `# Agents\n\n(someone deleted the begin marker)\n${AGENTS_MD_END}\n\n## Important\n\nNever force-push.\n`;
+  await clone.write("AGENTS.md", broken);
+  assert.deepEqual((await installAgentsMd(opts(clone))).changed, ["AGENTS.md"]);
+  const once = await clone.read("AGENTS.md");
+  assert.ok(once.startsWith(broken), "the user's text was altered");
+  assert.equal(once, `${broken}\n${agentsMdBlock(opts(clone))}\n`);
+  // The second and third run find the block the first one wrote.
+  assert.deepEqual(await installAgentsMd(opts(clone)), { changed: [], notes: [] });
+  assert.deepEqual(await installAgentsMd(opts(clone)), { changed: [], notes: [] });
+  assert.equal(await clone.read("AGENTS.md"), once);
+  assert.equal((await checkAgentsMd(clone.dir)).detail, "AGENTS.md has the huddle block");
+});
+
+test("the markers count only as lines of their own: a sentence that mentions them is the user's", async (t) => {
+  const h = await createHarness(t);
+  const clone = await h.clone("alice");
+  const mine = `# Agents\n\nThe part between ${AGENTS_MD_BEGIN} and ${AGENTS_MD_END} is written by a tool. Do not edit it.\n`;
+  await clone.write("AGENTS.md", mine);
+  assert.match((await checkAgentsMd(clone.dir)).detail, /no huddle block/);
+  await installAgentsMd(opts(clone));
+  const text = await clone.read("AGENTS.md");
+  assert.equal(text, `${mine}\n${agentsMdBlock(opts(clone))}\n`, "the sentence was cut, or the block was put somewhere else");
+  assert.deepEqual(await installAgentsMd(opts(clone)), { changed: [], notes: [] });
+  assert.equal(blocks(await clone.read("AGENTS.md")), 1);
+
+  // An indented marker line is still a marker line, and what stands around the block stays.
+  const indented = `# Agents\n\n  ${AGENTS_MD_BEGIN}\n  old\n  ${AGENTS_MD_END}\n\ntail\n`;
+  await clone.write("AGENTS.md", indented);
+  await installAgentsMd(opts(clone));
+  assert.equal(await clone.read("AGENTS.md"), `# Agents\n\n${agentsMdBlock(opts(clone))}\n\ntail\n`);
+
+  // A mention never pairs up with a leftover marker line either: neither of
+  // these files has a block, so both get one appended and lose nothing.
+  const mentionThenEnd = `# Agents\n\nThe block used to start with ${AGENTS_MD_BEGIN} here.\n\nKeep this.\n${AGENTS_MD_END}\n`;
+  const beginThenMention = `# Agents\n\n${AGENTS_MD_BEGIN}\n(the end marker, ${AGENTS_MD_END}, was deleted by hand)\n\nKeep this.\n`;
+  for (const leftover of [mentionThenEnd, beginThenMention]) {
+    await clone.write("AGENTS.md", leftover);
+    assert.match((await checkAgentsMd(clone.dir)).detail, /no huddle block/);
+    await installAgentsMd(opts(clone));
+    assert.equal(await clone.read("AGENTS.md"), `${leftover}\n${agentsMdBlock(opts(clone))}\n`);
+    assert.deepEqual(await installAgentsMd(opts(clone)), { changed: [], notes: [] });
+  }
+});
+
+test("a file with Windows line endings keeps them, and the block is written the same way", async (t) => {
+  const h = await createHarness(t);
+  const clone = await h.clone("alice");
+  const crlf = (text: string) => text.replace(/\n/g, "\r\n");
+  const mine = crlf("# Agents\n\nUse pnpm.\n\n\n");
+  await writeFile(join(clone.dir, "AGENTS.md"), mine);
+  await installAgentsMd(opts(clone));
+  const text = await readFile(join(clone.dir, "AGENTS.md"), "utf8");
+  assert.ok(text.startsWith(mine), "the user's text, trailing empty lines included, was altered");
+  assert.equal(text, `${mine}${crlf(agentsMdBlock(opts(clone)))}\r\n`);
+  assert.equal(/[^\r]\n/.test(text), false, "a bare line feed in a CRLF file");
+  assert.deepEqual(await installAgentsMd(opts(clone)), { changed: [], notes: [] });
+  assert.equal((await checkAgentsMd(clone.dir)).detail, "AGENTS.md has the huddle block");
+
+  // A stale block in a CRLF file is replaced with CRLF lines, and the rest is untouched.
+  await writeFile(join(clone.dir, "AGENTS.md"), crlf(`top\n${AGENTS_MD_BEGIN}\nold\n${AGENTS_MD_END}\nbottom\n`));
+  await installAgentsMd(opts(clone));
+  assert.equal(await readFile(join(clone.dir, "AGENTS.md"), "utf8"), crlf(`top\n${agentsMdBlock(opts(clone))}\nbottom\n`));
+
+  // Mixed line endings, inside the block too: what doctor calls up to date, init does not rewrite.
+  const mixed = `# Agents\r\n\n${agentsMdBlock(opts(clone)).replace("\n", "\r\n")}\n\npasted from Windows\r\n`;
+  await writeFile(join(clone.dir, "AGENTS.md"), mixed);
+  assert.equal((await checkAgentsMd(clone.dir)).detail, "AGENTS.md has the huddle block");
+  assert.deepEqual(await installAgentsMd(opts(clone)), { changed: [], notes: [] });
+  assert.equal(await readFile(join(clone.dir, "AGENTS.md"), "utf8"), mixed);
+
+  // A byte order mark stays where it was.
+  await writeFile(join(clone.dir, "AGENTS.md"), "\uFEFF# Agents\n");
+  await installAgentsMd(opts(clone));
+  assert.ok((await readFile(join(clone.dir, "AGENTS.md"), "utf8")).startsWith("\uFEFF# Agents\n\n" + AGENTS_MD_BEGIN));
+});
+
+test("a file that is not UTF-8, or that cannot be read, is left exactly as it is", async (t) => {
+  const h = await createHarness(t);
+  const clone = await h.clone("alice");
+  const file = join(clone.dir, "AGENTS.md");
+  // Latin-1: "café" with the é as the single byte 0xE9, which is not valid UTF-8.
+  const latin1 = Buffer.concat([Buffer.from("# Agents\n\ncaf"), Buffer.from([0xe9]), Buffer.from("\n")]);
+  await writeFile(file, latin1);
+  await assert.rejects(installAgentsMd(opts(clone)), (error: unknown) => error instanceof AgentsMdError && /is not UTF-8 text, so huddle left it alone/.test(error.message));
+  assert.deepEqual(await readFile(file), latin1);
+  const checked = await checkAgentsMd(clone.dir);
+  assert.deepEqual([checked.installed, /not UTF-8/.test(checked.detail)], [false, true]);
+
+  // init goes on with everything else, says what it could not do, and exits 1.
+  const r = await clone.huddle(["init"]);
+  assert.equal(r.code, 1, r.stdout + r.stderr);
+  assert.match(r.stdout, /huddle is partly set up\. Files written:\n {2}\.huddle\/huddle\.mjs/);
+  assert.match(r.stderr, /huddle: not done: AGENTS\.md is not UTF-8 text, so huddle left it alone/);
+  assert.match(r.stderr, /init did not finish/);
+  assert.doesNotMatch(r.stdout, /git add [^\n]*AGENTS\.md/, "a file huddle did not write is not offered for the commit");
+  assert.deepEqual(await readFile(file), latin1);
+});
+
+test("AGENTS.md that cannot be read for another reason than not existing is never replaced", { skip: process.platform === "win32" ? "reads a directory as a file" : false }, async (t) => {
+  const h = await createHarness(t);
+  const clone = await h.clone("alice");
+  await mkdir(join(clone.dir, "AGENTS.md"));
+  await writeFile(join(clone.dir, "AGENTS.md", "notes.txt"), "mine\n");
+  await assert.rejects(installAgentsMd(opts(clone)), (error: unknown) => error instanceof AgentsMdError && /could not be read \(EISDIR\)/.test(error.message));
+  const r = await clone.huddle(["init"]);
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /not done: AGENTS\.md could not be read \(EISDIR\), so huddle left it alone/);
+  assert.equal(await clone.read("AGENTS.md/notes.txt"), "mine\n");
+  // The rest of the setup is there and usable.
+  assert.deepEqual(JSON.parse(await clone.read(".huddle/config.json")), { ...DEFAULT_CONFIG });
+});
+
 test("checkAgentsMd tells missing, absent, outdated and current apart", async (t) => {
   const h = await createHarness(t);
   const clone = await h.clone("alice");
@@ -112,12 +230,15 @@ test("init vendors the running bundle, writes the config with every default, and
   assert.equal(await clone.read(".huddle/huddle.mjs"), await readFile(BUNDLE, "utf8"), "the vendored bundle is not the running bundle");
   assert.ok(((await stat(join(clone.dir, ".huddle", "huddle.mjs"))).mode & 0o111) !== 0, "the vendored bundle is not executable");
   assert.deepEqual(JSON.parse(await clone.read(".huddle/config.json")), { ...DEFAULT_CONFIG });
-  assert.equal(await clone.read(".huddle/.gitattributes"), "huddle.mjs linguist-generated=true\n");
+  // Never converted by git, and not hidden from review as a generated file would be.
+  assert.match(await clone.read(".huddle/.gitattributes"), /^huddle\.mjs -text linguist-vendored$/m);
+  assert.doesNotMatch(await clone.read(".huddle/.gitattributes"), /linguist-generated/);
   assert.match(await clone.read("AGENTS.md"), /huddle:begin/);
+  assert.deepEqual((await readdir(join(clone.dir, ".huddle"))).filter((name) => name.endsWith(".tmp")), [], "a temporary file was left behind");
 
   assert.match(r.stdout, /huddle is set up\. Files written:/);
   assert.match(r.stdout, new RegExp(`\\.huddle/huddle\\.mjs \\(huddle ${pkg.version.replace(/\./g, "\\.")}\\)`));
-  assert.match(r.stdout, /git add \.huddle AGENTS\.md/);
+  assert.match(r.stdout, /git add \.huddle\/huddle\.mjs \.huddle\/config\.json \.huddle\/\.gitattributes AGENTS\.md/);
   assert.match(r.stdout, /first 200 characters of each prompt/, "prompt capture must be disclosed at setup");
   assert.match(r.stdout, /node \.huddle\/huddle\.mjs doctor/);
 });
@@ -178,6 +299,149 @@ test("init replaces an older vendored bundle and says which versions", async (t)
   assert.equal(r.code, 0, r.stderr);
   assert.match(r.stdout, new RegExp(`huddle 0\\.0\\.1 -> ${pkg.version.replace(/\./g, "\\.")}`));
   assert.equal(await clone.read(".huddle/huddle.mjs"), current);
+});
+
+test("init does not replace a newer vendored bundle with an older one unless told to", async (t) => {
+  const h = await createHarness(t);
+  const clone = await h.clone("alice");
+  await clone.huddle(["init"]);
+  const current = await clone.read(".huddle/huddle.mjs");
+  const newer = current.replace(`// git-huddle ${pkg.version}`, "// git-huddle 99.9.9");
+  await clone.write(".huddle/huddle.mjs", newer);
+  const before = await clone.git("status", "--porcelain", "--untracked-files=all");
+
+  const refused = await clone.huddle(["init"]);
+  assert.equal(refused.code, 1, refused.stdout);
+  assert.equal(refused.stdout, "");
+  assert.match(refused.stderr, new RegExp(`\\.huddle/huddle\\.mjs is huddle 99\\.9\\.9, which is newer than the huddle ${pkg.version.replace(/\./g, "\\.")} you are running\\. Nothing was changed\\.`));
+  assert.match(refused.stderr, /node \.huddle\/huddle\.mjs init.*--downgrade/);
+  assert.equal(await clone.read(".huddle/huddle.mjs"), newer);
+  assert.equal(await clone.git("status", "--porcelain", "--untracked-files=all"), before, "a refused init wrote something");
+
+  const forced = await clone.huddle(["init", "--downgrade"]);
+  assert.equal(forced.code, 0, forced.stderr);
+  assert.match(forced.stdout, new RegExp(`huddle 99\\.9\\.9 -> ${pkg.version.replace(/\./g, "\\.")}`));
+  assert.equal(await clone.read(".huddle/huddle.mjs"), current);
+});
+
+test("compareVersions orders releases and pre-releases, and says null for anything else", () => {
+  assert.equal(compareVersions("0.1.0", "0.1.0"), 0);
+  assert.equal(compareVersions("0.1.0", "0.2.0"), -1);
+  assert.equal(compareVersions("1.0.0", "0.9.9"), 1);
+  assert.equal(compareVersions("0.10.0", "0.9.0"), 1, "numbers, not text");
+  assert.equal(compareVersions("1.0.0-beta.2", "1.0.0"), -1);
+  assert.equal(compareVersions("1.0.0", "1.0.0-beta.2"), 1);
+  assert.equal(compareVersions("1.0.0-beta.2", "1.0.0-beta.10"), -1);
+  assert.equal(compareVersions("1.0.0+build5", "1.0.0"), 0);
+  assert.equal(compareVersions("unknown", "1.0.0"), null);
+  assert.equal(compareVersions("1.0", "1.0.0"), null);
+});
+
+test("a checkout that converts line endings still has a working, unchanged setup", async (t) => {
+  // Git for Windows sets core.autocrlf=true by default: text files arrive with CRLF.
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  const bob = await h.clone("bob");
+  assert.equal((await alice.huddle(["init"])).code, 0);
+  await alice.commit("Set up huddle");
+  await alice.push();
+  await bob.git("config", "core.autocrlf", "true");
+  await bob.git("pull", "--quiet");
+
+  // The bundle is the same bytes everywhere; AGENTS.md is the user's text file and was converted.
+  const bundle = await readFile(join(bob.dir, ".huddle", "huddle.mjs"));
+  assert.deepEqual(bundle, await readFile(BUNDLE), "git converted the bundle");
+  assert.match(await bob.read("AGENTS.md"), /\r\n/, "setup: AGENTS.md should have arrived with CRLF");
+
+  assert.deepEqual(await vendored(bob, ["--version"]), { code: 0, stdout: `${pkg.version}\n`, stderr: "" });
+  const doctor = await vendored(bob, ["doctor", "--offline"]);
+  assert.match(doctor.stdout, /ok {4}bundle: \.huddle\/huddle\.mjs is huddle \S+ and committed/);
+  assert.match(doctor.stdout, /ok {4}AGENTS\.md: AGENTS\.md has the huddle block/);
+  for (const from of [() => vendored(bob, ["init"]), () => bob.huddle(["init"])]) {
+    const again = await from();
+    assert.equal(again.code, 0, again.stderr);
+    assert.match(again.stdout, /already set up here; nothing changed/);
+    assert.doesNotMatch(again.stdout, /Next: commit/);
+  }
+  assert.equal(await bob.git("status", "--porcelain"), "");
+});
+
+test("bundleVersion reads a bundle whose line endings were converted", async () => {
+  const text = await readFile(BUNDLE, "utf8");
+  assert.equal(bundleVersion(text.replace(/\n/g, "\r\n")), pkg.version);
+});
+
+test("the files to commit are named one by one, and only huddle's", async (t) => {
+  const h = await createHarness(t);
+  const clone = await h.clone("alice");
+  // Things of the user's own next to huddle's files, none of them committed.
+  await clone.write(".claude/settings.local.json", "{}\n");
+  await clone.write(".claude/worktrees/x/file.txt", "x\n");
+  await clone.write(".huddle/notes.txt", "mine\n");
+  await clone.write("my file.txt", "x\n");
+  const r = await clone.huddle(["init", "--agent", "claude-code"]);
+  assert.equal(r.code, 0, r.stderr);
+  const add = /^ {2}git add (.+)$/m.exec(r.stdout)?.[1];
+  assert.ok(add, r.stdout);
+  const named = add.split(" ");
+  assert.deepEqual(named, [".huddle/huddle.mjs", ".huddle/config.json", ".huddle/.gitattributes", "AGENTS.md", ".claude/settings.json"]);
+  // Running exactly what was printed stages exactly those files.
+  const staged = (await clone.git("add", "--dry-run", ...named)).split("\n").map((line) => /^add '(.+)'$/.exec(line)?.[1]).sort();
+  assert.deepEqual(staged, [...named].sort());
+
+  // Once they are committed there is nothing to say, whatever else lies around untracked.
+  await clone.git("add", ...named);
+  await clone.git("commit", "--quiet", "-m", "Set up huddle");
+  const again = await clone.huddle(["init", "--agent", "claude-code"]);
+  assert.match(again.stdout, /already set up here; nothing changed/);
+  assert.doesNotMatch(again.stdout, /Next: commit/);
+
+  // A change of the user's to the team config is named again; their other files never are.
+  await clone.write(".huddle/config.json", JSON.stringify({ ...DEFAULT_CONFIG, ttlMinutes: 30 }, null, 2) + "\n");
+  const edited = await clone.huddle(["init", "--agent", "claude-code"]);
+  assert.equal(/^ {2}git add (.+)$/m.exec(edited.stdout)?.[1], ".huddle/config.json");
+});
+
+test("an agent asked for by name whose hooks cannot be installed makes init exit 1, and its file is not offered for the commit", async (t) => {
+  const h = await createHarness(t);
+  const clone = await h.clone("alice");
+  await clone.write(".codex/hooks.json", "{ this is not JSON");
+  const r = await clone.huddle(["init", "--agent", "codex"]);
+  assert.equal(r.code, 1, r.stdout + r.stderr);
+  assert.match(r.stderr, /huddle: not done: Codex: could not install hooks: /);
+  assert.match(r.stdout, /huddle is partly set up\. Files written:/);
+  assert.match(r.stdout, /Hooks: none installed/);
+  assert.doesNotMatch(r.stdout, /git add [^\n]*\.codex/);
+  assert.equal(await clone.read(".codex/hooks.json"), "{ this is not JSON");
+
+  // The same broken file found by detection is a note, not a failure: nobody asked for Codex.
+  const detected = await clone.huddle(["init", "--all"]);
+  assert.equal(detected.code, 0, detected.stderr);
+  assert.match(detected.stdout, /Note: Codex: could not install hooks: /);
+});
+
+test("a team config that cannot be used is pointed out by init", async (t) => {
+  const h = await createHarness(t);
+  const clone = await h.clone("alice");
+  await clone.write(".huddle/config.json", '<<<<<<< HEAD\n{ "ttlMinutes": 20 }\n=======\n{ "ttlMinutes": 30 }\n>>>>>>> theirs\n');
+  const r = await clone.huddle(["init"]);
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stdout, /Note: .*\.huddle\/config\.json.*Until it is fixed huddle runs on defaults, with prompt capture off\./);
+  assert.doesNotMatch(r.stdout, /first 200 characters of each prompt are shared/, "capture is off while the config is unusable");
+  assert.match(await clone.read(".huddle/config.json"), /^<<<<<<< HEAD/, "the file is the user's to fix");
+});
+
+test("an older .gitattributes is brought up to date, and other lines in it are kept", async (t) => {
+  const h = await createHarness(t);
+  const clone = await h.clone("alice");
+  await clone.write(".huddle/.gitattributes", "huddle.mjs linguist-generated=true\nnotes.txt text\n");
+  const r = await clone.huddle(["init"]);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(await clone.read(".huddle/.gitattributes"), "huddle.mjs -text linguist-vendored\nnotes.txt text\n");
+  await clone.write(".huddle/.gitattributes", "notes.txt text\n");
+  await clone.huddle(["init"]);
+  assert.equal(await clone.read(".huddle/.gitattributes"), "notes.txt text\nhuddle.mjs -text linguist-vendored\n");
+  assert.match((await clone.huddle(["init"])).stdout, /already set up here; nothing changed/);
 });
 
 test("init never overwrites an existing config; flags change only the keys they name", async (t) => {
@@ -243,7 +507,7 @@ test("init from a subdirectory sets up the repository root", async (t) => {
   const r = await clone.huddle(["init"], { cwd: "packages/app" });
   assert.equal(r.code, 0, r.stderr);
   assert.match(await clone.read(".huddle/config.json"), /syncIntervalSeconds/);
-  assert.match(r.stdout, /git -C \.\.\/\.\. add \.huddle AGENTS\.md/);
+  assert.match(r.stdout, /git -C \.\.\/\.\. add \.huddle\/huddle\.mjs /);
 });
 
 test("init refuses to vendor anything that is not a built bundle", async (t) => {

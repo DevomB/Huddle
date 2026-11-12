@@ -97,6 +97,52 @@ test("the push test keeps a live session's document on the remote, and teammates
   assert.match((await bob.huddle(["status", "--cached"])).stdout, /alice .*"build auth"/);
 });
 
+test("the push test never touches this clone's own document, so no sync can take it for a second writer", async (t) => {
+  const { h, alice } = await setUp(t);
+  const paths = await alice.paths();
+  assert.equal((await alice.huddle(["intent", "build auth"], { session: "s1" })).code, 0);
+  assert.equal((await alice.huddle(["sync", "--force"], { session: "s1" })).code, 0);
+  const own = await h.remoteGit("for-each-ref", "--format=%(refname) %(objectname)", "refs/huddle/actors");
+
+  // The intent changes and no sync has published it yet (a prompt hook whose sync was throttled):
+  // what is on the remote is behind local state. Written to local.json directly, standing in for the hook.
+  const local = JSON.parse(await readFile(paths.localFile, "utf8")) as { sessions: { id: string; intent: string }[] };
+  for (const session of local.sessions) session.intent = "changed since the last publish";
+  await writeFile(paths.localFile, JSON.stringify(local));
+
+  const { code, report } = await doctorJson(alice);
+  assert.equal(code, 0);
+  assert.equal(find(report, "push").level, "ok");
+  assert.equal(await h.remoteGit("for-each-ref", "--format=%(refname) %(objectname)", "refs/huddle/actors"), own, "doctor pushed to, or left something next to, this clone's document");
+
+  // The session ends before the next sync has fetched. That sync must find nothing strange.
+  local.sessions = [];
+  await writeFile(paths.localFile, JSON.stringify(local));
+  assert.equal((await alice.huddle(["sync", "--force"])).code, 0);
+  const log = await readFile(paths.logFile, "utf8").catch(() => "");
+  assert.doesNotMatch(log, /another clone is publishing as this one/);
+  const after = await doctorJson(alice);
+  assert.equal(after.report.checks.some((c) => c.name === "actor id"), false, "doctor now warns about a second writer that does not exist");
+});
+
+test("a remote that does not let refs be deleted: a warning that names the ref left behind", { skip: posixOnly }, async (t) => {
+  const { h, alice } = await setUp(t);
+  const zero = "0000000000000000000000000000000000000000";
+  await serverHook(h, `case "$1" in refs/huddle/*) if [ "$3" = ${zero} ]; then echo "no deletions" >&2; exit 1; fi;; esac`);
+  const { code, report } = await doctorJson(alice);
+  assert.equal(code, 0, "huddle works without deleting refs");
+  const push = find(report, "push");
+  assert.equal(push.level, "warn");
+  assert.match(push.detail, /can create and replace refs under refs\/huddle\/ on this remote, but not delete them/);
+  const left = await huddleRefs(h);
+  assert.match(left, /^refs\/huddle\/actors\/[a-z2-7]{8}$/);
+  assert.ok(push.notes.join("\n").includes(`git push origin :${left}`), push.notes.join("\n"));
+  // What is left is an actor with no sessions: nobody sees it.
+  const bob = await h.clone("bob");
+  assert.equal((await bob.huddle(["sync", "--force"])).code, 0);
+  assert.match((await bob.huddle(["status", "--cached"])).stdout, /No teammates' agents are live/);
+});
+
 test("an unreachable remote fails with git's reason and how to fix it", async (t) => {
   const { h, alice } = await setUp(t);
   await alice.git("remote", "set-url", "origin", join(h.root, "no-such-remote.git"));
@@ -272,6 +318,17 @@ test("a vendored bundle that is not committed, or is not a bundle, is reported",
   const clone = await h.clone("alice");
   assert.equal((await clone.huddle(["init"])).code, 0);
   assert.match((await clone.huddle(["doctor", "--offline"])).stdout, /warn {2}bundle: \.huddle\/huddle\.mjs \(huddle \S+\) is not committed/);
+  // Committed, then changed (an upgrade by init that was never committed): tracked is not the same as committed.
+  await clone.commit("Set up huddle");
+  assert.match((await clone.huddle(["doctor", "--offline"])).stdout, /ok {4}bundle: \.huddle\/huddle\.mjs is huddle \S+ and committed/);
+  const bundle = await clone.read(".huddle/huddle.mjs");
+  await clone.write(".huddle/huddle.mjs", `${bundle}\n// a local change\n`);
+  const changed = await clone.huddle(["doctor", "--offline"]);
+  assert.match(changed.stdout, /warn {2}bundle: \.huddle\/huddle\.mjs \(huddle \S+\) has changes that are not committed/);
+  assert.match(changed.stdout, /until then teammates run the copy from the last commit/);
+  await clone.git("add", ".huddle/huddle.mjs");
+  assert.match((await clone.huddle(["doctor", "--offline"])).stdout, /has changes that are not committed/, "staged is not committed either");
+
   await clone.write(".huddle/huddle.mjs", "console.log('not huddle')\n");
   const r = await clone.huddle(["doctor", "--offline"]);
   assert.equal(r.code, 1);
@@ -344,4 +401,19 @@ test("redactUrl removes credentials from URLs and leaves everything else alone",
   );
   assert.equal(redactUrl("two https://a:b@x.example/1 and http://c@y.example/2"), "two https://***@x.example/1 and http://***@y.example/2");
   assert.equal(redactUrl("mail me at someone@example.com about https://example.com/a@b"), "mail me at someone@example.com about https://example.com/a@b");
+
+  // A password may hold an "@": everything up to the last one before the host goes. Built from parts,
+  // so that this file holds nothing a secret scanner could take for a real credential.
+  const at = "@";
+  const login = ["user", ["p", "ss", "word"].join(at)].join(":");
+  assert.equal(redactUrl(`https://${login}${at}host.example/x.git`), "https://***@host.example/x.git");
+  assert.equal(redactUrl(`fetch https://${login}${at}host.example/x.git failed, see https://docs.example/a${at}b`), `fetch https://***@host.example/x.git failed, see https://docs.example/a${at}b`);
+
+  // A secret in the query string, by the name of its parameter.
+  const value = ["abc", "def", "123"].join("");
+  for (const name of ["access_token", "private_token", "token", "api_key", "password", "X-Amz-Signature", "auth"]) {
+    assert.equal(redactUrl(`https://host.example/x.git?${name}=${value}&ref=main`), `https://host.example/x.git?${name}=***&ref=main`, name);
+    assert.equal(redactUrl(`https://host.example/x?ref=main&${name}=${value}`), `https://host.example/x?ref=main&${name}=***`, name);
+  }
+  assert.equal(redactUrl("https://host.example/x?page=2&sort=name"), "https://host.example/x?page=2&sort=name");
 });
