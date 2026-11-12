@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { chmod, mkdir, readFile, utimes, writeFile } from "node:fs/promises";
-import { delimiter, join } from "node:path";
+import { delimiter, join, resolve } from "node:path";
 import { test } from "node:test";
 import type { TestContext } from "node:test";
 import { STOP_GRACE_MS, endRunningGits, git, GitError, gitEnv, gitOut, hardenSshCommand } from "../src/core/git.ts";
@@ -85,9 +85,10 @@ test("inherited GIT_DIR, GIT_WORK_TREE and GIT_INDEX_FILE do not redirect a call
   process.env.GIT_DIR = join(bob.dir, ".git");
   process.env.GIT_WORK_TREE = bob.dir;
   process.env.GIT_INDEX_FILE = join(bob.dir, ".git", "index");
-  assert.equal(await gitOut(["rev-parse", "--show-toplevel"], { cwd: alice.dir }), alice.dir);
+  // resolve(): Git for Windows prints C:/x/y where node:path gives C:\x\y. Same directory.
+  assert.equal(resolve(await gitOut(["rev-parse", "--show-toplevel"], { cwd: alice.dir })), alice.dir);
   // An explicit env entry is still honored.
-  assert.equal(await gitOut(["rev-parse", "--show-toplevel"], { cwd: alice.dir, env: { GIT_DIR: join(bob.dir, ".git"), GIT_WORK_TREE: bob.dir } }), bob.dir);
+  assert.equal(resolve(await gitOut(["rev-parse", "--show-toplevel"], { cwd: alice.dir, env: { GIT_DIR: join(bob.dir, ".git"), GIT_WORK_TREE: bob.dir } })), bob.dir);
 });
 
 test("every call runs with gc and maintenance off, no prompts, no optional locks, unlocalized output", async (t) => {
@@ -341,10 +342,12 @@ test("a network call really runs the repo's core.sshCommand in batch mode", asyn
   const h = await createHarness(t);
   const clone = await h.clone("alice");
   const record = join(h.root, "ssh-args");
-  const fakeSsh = join(h.root, "fake-ssh");
-  await writeFile(fakeSsh, `#!/bin/sh\necho "$@" > "${record}"\nexit 255\n`);
-  await chmod(fakeSsh, 0o755);
-  await clone.git("config", "core.sshCommand", `${fakeSsh} -p 2222`);
+  // A stand-in for ssh in Node, so the same test runs on Windows: Git for Windows runs core.sshCommand
+  // with its own sh too, which takes forward slashes. Each path is quoted as one word (harness paths hold a space).
+  const fakeSsh = join(h.root, "fake-ssh.mjs");
+  await writeFile(fakeSsh, `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(record)}, process.argv.slice(2).join(" "));\nprocess.exit(255);\n`);
+  const word = (path: string) => `'${path.replace(/\\/g, "/").replace(/'/g, `'\\''`)}'`;
+  await clone.git("config", "core.sshCommand", `${word(process.execPath)} ${word(fakeSsh)} -p 2222`);
 
   const r = await git(["ls-remote", "ssh://git@example.invalid/x.git"], { cwd: clone.dir, network: true });
   assert.equal(r.ok, false);

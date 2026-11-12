@@ -7,7 +7,7 @@
 // so a reader sees the previous file or the new one, never a partial one.
 
 import { randomBytes } from "node:crypto";
-import { mkdir, readFile, readdir, rename, rm, rmdir, stat, utimes, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, readdir, rename, rm, rmdir, stat, utimes, writeFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -60,17 +60,35 @@ function errno(error: unknown): string {
 // Atomic writes and tolerant reads
 // ---------------------------------------------------------------------------
 
-/** rename() over an existing file. On Windows a scanner or a reader can make it fail for a moment. */
+/**
+ * Waits between attempts at a Windows file operation that failed because the
+ * file was in use: 5, 10, 20, 40, 80 ms, then 150 ms each, about 2 s in all.
+ * On Windows, replacing a file fails with EPERM, EACCES or EBUSY while another
+ * process has it (or the temp file) open without sharing delete access: a
+ * virus scanner or indexer looking at a file just written, or another huddle
+ * process replacing the same file at the same moment (several sessions of one
+ * clone write local.json, the actor id and the cache at once). That lasts
+ * milliseconds, sometimes a second on a busy machine, so a short budget made
+ * a hook or a sync fail for nothing.
+ */
+export const WINDOWS_BUSY_DELAYS_MS: readonly number[] = [5, 10, 20, 40, 80, ...Array<number>(12).fill(150)];
+
+/** True for the error codes Windows gives a file operation on a file that is in use. */
+function windowsBusy(error: unknown): boolean {
+  const code = errno(error);
+  return WINDOWS && (code === "EPERM" || code === "EACCES" || code === "EBUSY");
+}
+
+/** rename() over an existing file, retried while Windows reports the file in use (see WINDOWS_BUSY_DELAYS_MS). */
 async function replaceFile(tmp: string, file: string): Promise<void> {
   for (let attempt = 0; ; attempt++) {
     try {
       await rename(tmp, file);
       return;
     } catch (error) {
-      const code = errno(error);
-      const transient = WINDOWS && (code === "EPERM" || code === "EACCES" || code === "EBUSY");
-      if (!transient || attempt >= 10) throw error;
-      await sleep(5 * (attempt + 1));
+      const delay = WINDOWS_BUSY_DELAYS_MS[attempt];
+      if (!windowsBusy(error) || delay === undefined) throw error;
+      await sleep(delay);
     }
   }
 }
@@ -100,17 +118,15 @@ type Loaded = { kind: "missing" } | { kind: "corrupt" } | { kind: "ok"; value: u
  * readFile, retried a few times on Windows when the file is in use for a
  * moment: a writer's rename, an indexer or a scanner can hold it with a
  * sharing mode that makes a read fail with EBUSY, EPERM or EACCES. Readers
- * never take a lock, so they meet this. About 150 ms at most, then the error.
+ * never take a lock, so they meet this. About 155 ms at most, then the error.
  */
 async function readFileRetrying(file: string): Promise<string> {
   for (let attempt = 0; ; attempt++) {
     try {
       return await readFile(file, "utf8");
     } catch (error) {
-      const code = errno(error);
-      const transient = WINDOWS && (code === "EPERM" || code === "EACCES" || code === "EBUSY");
-      if (!transient || attempt >= 5) throw error;
-      await sleep(10 * (attempt + 1));
+      if (!windowsBusy(error) || attempt >= 5) throw error;
+      await sleep(WINDOWS_BUSY_DELAYS_MS[attempt]!);
     }
   }
 }
@@ -272,19 +288,27 @@ async function ownerIsStale(ownerPath: string, staleMs: number): Promise<boolean
 async function recoverIfStale(lockDir: string, staleMs: number): Promise<boolean> {
   let entries: string[];
   try {
+    // Asked first rather than read from readdir's error: Windows does not report ENOTDIR for a file there.
+    const found = await lstat(lockDir);
+    if (!found.isDirectory()) {
+      // Something that is not a directory sits at the lock path. Remove it once it is old.
+      try {
+        if (Date.now() - found.mtimeMs <= staleMs) return false;
+        await rm(lockDir, { force: true });
+      } catch {
+        // Raced with another process; the next attempt sorts it out.
+      }
+      return true;
+    }
     entries = await readdir(lockDir);
   } catch (error) {
     const code = errno(error);
     if (code === "ENOENT") return true;
-    if (code !== "ENOTDIR") throw error;
-    // Something that is not a directory sits at the lock path. Remove it once it is old.
-    try {
-      if (Date.now() - (await stat(lockDir)).mtimeMs <= staleMs) return false;
-      await rm(lockDir, { force: true });
-    } catch {
-      // Raced with another process; the next attempt sorts it out.
-    }
-    return true;
+    if (code === "ENOTDIR") return false; // replaced by a file just now: the next attempt sorts it out
+    // Windows: a lock directory that its holder is removing at this moment cannot be opened (EPERM)
+    // until the removal completes. Not free yet; the next attempt sees it gone.
+    if (windowsBusy(error)) return false;
+    throw error;
   }
   for (const entry of entries) {
     // Only owner files can hold the lock. Anything else in here is debris.

@@ -39,6 +39,7 @@ import { randomBytes } from "node:crypto";
 import type { Dirent } from "node:fs";
 import { lstat, mkdir, readdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { LIMITS, parseDoc, serializeDoc } from "./docs.ts";
 import { git } from "./git.ts";
 import type { GitResult } from "./git.ts";
@@ -129,7 +130,7 @@ export const OBJECT_MAX_AGE_MS = 60 * 60_000;
 /** Loose objects sit two levels down and packs one; the staging directory of a batched fsync adds a level. */
 const PRUNE_DEPTH = 4;
 
-type Fail = { ok: false; reason: FailReason };
+type Fail = { ok: false; reason: FailReason; sent?: boolean };
 
 function fail(reason: FailReason): Fail {
   return { ok: false, reason };
@@ -364,7 +365,8 @@ export function createTransport(opts: TransportOptions): Transport {
     try {
       if (!REMOTE_RE.test(session.remote)) {
         await session.note(`${what}: "${session.remote}" is not a remote name`);
-        return fail("offline");
+        // Nothing ran. For a write, say so: the caller may then report "nothing changed".
+        return what === "fetchAll" ? fail("offline") : { ok: false, reason: "offline", sent: false };
       }
       return await run();
     } catch (error) {
@@ -458,31 +460,69 @@ async function prune(s: Session): Promise<void> {
 // publish and remove
 // ---------------------------------------------------------------------------
 
+/** A failure from before anything was sent: the remote cannot have applied it. */
+function notSent(reason: FailReason): PublishResult {
+  return { ok: false, reason, sent: false };
+}
+
+/**
+ * How often a force-update of our own ref is tried again when the remote
+ * could not take the ref's lock, and how long to wait first (plus up to as
+ * much again at random). Every session of a clone publishes the clone's one
+ * actor ref, so on a busy clone two of those pushes meet at the remote, and
+ * the one that finds the ref locked is rejected. Its document is as current
+ * as the winner's, so it is pushed again rather than reported as a failure.
+ */
+const OWN_LOCK_RETRIES = 3;
+const OWN_LOCK_WAIT_MS = 50;
+
+/** True when a push was rejected because the remote's ref was locked by another push at that moment. */
+export function lockedOut(result: Pick<GitResult, "ok" | "timedOut" | "stdout" | "stderr">, ref: Ref): boolean {
+  if (result.ok || result.timedOut) return false;
+  const status = parsePushStatus(result.stdout, ref);
+  const said = `${status?.summary ?? ""}\n${result.stderr}`;
+  return /failed to lock|cannot lock ref|unable to create '[^']*\.lock'|failed to update ref/i.test(said) && !saysRefMoved(status?.summary ?? "");
+}
+
 async function publish(s: Session, ref: Ref, doc: Doc, expect: Expect): Promise<PublishResult> {
   if (!parseRef(ref) || (expect !== "own" && expect !== "absent" && !SHA_RE.test(expect))) {
     await s.note(`publish ${ref}: invalid ref or expectation`);
-    return fail("denied");
+    return notSent("denied");
   }
   let text: string;
   try {
     text = serializeDoc(doc);
   } catch (error) {
-    await s.note(`publish ${ref}: not a valid document`, error);
-    return fail("denied");
+    await s.note(`publish ${ref}: not a document a reader would accept`, error);
+    return notSent("denied");
   }
 
-  const commit = await writeDocCommit(s, text);
+  let commit: Sha;
+  try {
+    commit = await writeDocCommit(s, text);
+  } catch (error) {
+    // Local plumbing only: nothing has talked to the remote yet.
+    await s.note(`publish ${ref}: could not build the document commit`, error);
+    return notSent("offline");
+  }
   // "own": plain force. Otherwise the lease is the compare-and-swap: an empty
   // expected value means "the ref must not exist".
   const lease = expect === "own" ? [] : [`--force-with-lease=${ref}:${expect === "absent" ? "" : expect}`];
-  const pushed = await push(s, ref, lease, `${expect === "own" ? "+" : ""}${commit}:${ref}`);
-  return settlePush(s, "publish", pushed, ref, expect, commit);
+  for (let attempt = 0; ; attempt++) {
+    const pushed = await push(s, ref, lease, `${expect === "own" ? "+" : ""}${commit}:${ref}`);
+    if (expect === "own" && attempt < OWN_LOCK_RETRIES && lockedOut(pushed, ref)) {
+      await s.note(`publish ${ref}: the remote ref was locked by another push; trying again`);
+      await sleep(OWN_LOCK_WAIT_MS * (attempt + 1) * (1 + Math.random()));
+      continue;
+    }
+    return settlePush(s, "publish", pushed, ref, expect, commit);
+  }
 }
 
 async function remove(s: Session, ref: Ref, expect: Sha): Promise<PublishResult> {
   if (!parseRef(ref) || !SHA_RE.test(expect)) {
     await s.note(`remove ${ref}: invalid ref or expectation`);
-    return fail("denied");
+    return notSent("denied");
   }
   const pushed = await push(s, ref, [`--force-with-lease=${ref}:${expect}`], `:${ref}`);
   return settlePush(s, "remove", pushed, ref, expect, null);
