@@ -10,9 +10,13 @@
 //   README.md, LICENSE
 //
 // The archive is reproducible: fixed owner, fixed modes, every entry dated by
-// the last commit, text with LF line ends whatever the checkout did (CRLF only
-// in the .cmd file, where cmd.exe wants it), and a fixed gzip header. The same
-// source gives the same bytes on Linux and Windows.
+// the last commit (or SOURCE_DATE_EPOCH), text with LF line ends whatever the
+// checkout did (CRLF only in the .cmd file, where cmd.exe wants it), and a
+// fixed gzip header. The tar inside is the same bytes on every platform. The
+// .tar.gz is too wherever Node uses the same zlib (the official Node 22 builds
+// on Linux and Windows do); a Node linked against another zlib, such as
+// zlib-ng in some Linux distributions, compresses the same tar differently.
+// Compare builds by the "tar sha256" line.
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -127,7 +131,8 @@ for (const entry of entries) {
   }
 }
 blocks.push(Buffer.alloc(1024, 0));
-const gz = gzipSync(Buffer.concat(blocks), { level: 9 });
+const tarball = Buffer.concat(blocks);
+const gz = gzipSync(tarball, { level: 9 });
 gz[9] = 3; // gzip OS field: zlib's build decides it otherwise; fixed so every platform writes the same bytes
 
 mkdirSync(out, { recursive: true });
@@ -137,5 +142,6 @@ const sha = createHash("sha256").update(gz).digest("hex");
 writeFileSync(`${file}.sha256`, `${sha}  ${top}.tar.gz\n`);
 const bundleSha = createHash("sha256").update(bundle).digest("hex");
 console.log(`${file}`);
-console.log(`sha256 ${sha}  ${gz.length} bytes`);
+console.log(`sha256 ${sha}  ${gz.length} bytes (zlib ${process.versions.zlib})`);
+console.log(`tar sha256 ${createHash("sha256").update(tarball).digest("hex")}`);
 console.log(`huddle.mjs sha256 ${bundleSha}  ${bundle.length} bytes`);
