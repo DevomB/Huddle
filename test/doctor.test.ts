@@ -42,11 +42,22 @@ async function serverHook(h: Harness, body: string): Promise<void> {
   await chmod(file, 0o755);
 }
 
+/**
+ * `git add -A && git commit` that runs no git hooks. With the git adapter
+ * registered, `huddle init` installs real hooks in the clone. They are not
+ * the subject here, and one that fired would announce the clone in the middle
+ * of a test, with the real clock.
+ */
+async function commitAll(h: Harness, clone: Clone, message: string): Promise<void> {
+  await clone.git("add", "-A");
+  await clone.git("-c", `core.hooksPath=${join(h.root, "no-hooks")}`, "commit", "--quiet", "-m", message);
+}
+
 async function setUp(t: Parameters<typeof createHarness>[0]): Promise<{ h: Harness; alice: Clone }> {
   const h = await createHarness(t);
   const alice = await h.clone("alice");
   assert.equal((await alice.huddle(["init"])).code, 0);
-  await alice.commit("Set up huddle");
+  await commitAll(h, alice, "Set up huddle");
   await alice.push();
   return { h, alice };
 }
@@ -319,7 +330,7 @@ test("a vendored bundle that is not committed, or is not a bundle, is reported",
   assert.equal((await clone.huddle(["init"])).code, 0);
   assert.match((await clone.huddle(["doctor", "--offline"])).stdout, /warn {2}bundle: \.huddle\/huddle\.mjs \(huddle \S+\) is not committed/);
   // Committed, then changed (an upgrade by init that was never committed): tracked is not the same as committed.
-  await clone.commit("Set up huddle");
+  await commitAll(h, clone, "Set up huddle");
   assert.match((await clone.huddle(["doctor", "--offline"])).stdout, /ok {4}bundle: \.huddle\/huddle\.mjs is huddle \S+ and committed/);
   const bundle = await clone.read(".huddle/huddle.mjs");
   await clone.write(".huddle/huddle.mjs", `${bundle}\n// a local change\n`);

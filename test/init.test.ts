@@ -11,7 +11,7 @@ import { CliError } from "../src/core/io.ts";
 import type { Io } from "../src/core/io.ts";
 import { DEFAULT_CONFIG } from "../src/core/types.ts";
 import { BUNDLE, createHarness, TEST_ENV } from "./harness.ts";
-import type { Clone } from "./harness.ts";
+import type { Clone, Harness } from "./harness.ts";
 
 const pkg = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")) as { version: string };
 const opts = (clone: Clone) => ({ repoRoot: clone.dir, bundle: ".huddle/huddle.mjs" });
@@ -27,6 +27,30 @@ function vendored(clone: Clone, args: string[], stdin = ""): Promise<{ code: num
     );
     child.stdin?.end(stdin);
   });
+}
+
+/**
+ * `git add -A && git commit` that runs no git hooks. With the git adapter
+ * registered, `huddle init` installs real hooks in the clone. They are not
+ * the subject here, and one that fired would announce the clone in the middle
+ * of a test, with the real clock.
+ */
+async function commitAll(h: Harness, clone: Clone, message: string): Promise<void> {
+  await clone.git("add", "-A");
+  await clone.git("-c", `core.hooksPath=${join(h.root, "no-hooks")}`, "commit", "--quiet", "-m", message);
+}
+
+/**
+ * The files an init run says it wrote, without those under .git/: a clone's
+ * own git hooks live there, are never committed, and are written by the first
+ * init in each clone once the git adapter is registered.
+ */
+function writtenForTheTeam(stdout: string): string[] {
+  return stdout
+    .split("\n")
+    .filter((line) => /^ {2}\S/.test(line))
+    .map((line) => line.trim())
+    .filter((file) => !file.startsWith(".git/"));
 }
 
 // ----------------------------------------------------------------- AGENTS.md
@@ -264,7 +288,7 @@ test("exit test, first half: alice inits, commits and pushes; bob pulls and runs
   const bob = await h.clone("bob");
 
   assert.equal((await alice.huddle(["init"])).code, 0);
-  await alice.commit("Set up huddle");
+  await commitAll(h, alice, "Set up huddle");
   await alice.push();
   assert.equal((await alice.huddle(["init"])).stdout.includes("Next: commit"), false, "nothing left to commit after committing");
 
@@ -282,11 +306,14 @@ test("exit test, first half: alice inits, commits and pushes; bob pulls and runs
   assert.match(status.stdout, /build auth/);
   assert.equal((await vendored(bob, ["check", "src/auth.ts"])).code, 3);
 
-  // Running init from the vendored copy does not rewrite the copy it is running from.
+  // Running init from the vendored copy does not rewrite the copy it is running from, and writes
+  // nothing the team commits. All it may add is this clone's own git hooks, which live under .git/.
   const reinit = await vendored(bob, ["init"]);
   assert.equal(reinit.code, 0, reinit.stderr);
-  assert.match(reinit.stdout, /already set up here; nothing changed/);
+  assert.deepEqual(writtenForTheTeam(reinit.stdout), [], reinit.stdout);
+  assert.doesNotMatch(reinit.stdout, /Next: commit/);
   assert.equal(await bob.git("status", "--porcelain"), "");
+  assert.match((await vendored(bob, ["init"])).stdout, /already set up here; nothing changed/);
 });
 
 test("init replaces an older vendored bundle and says which versions", async (t) => {
@@ -343,7 +370,7 @@ test("a checkout that converts line endings still has a working, unchanged setup
   const alice = await h.clone("alice");
   const bob = await h.clone("bob");
   assert.equal((await alice.huddle(["init"])).code, 0);
-  await alice.commit("Set up huddle");
+  await commitAll(h, alice, "Set up huddle");
   await alice.push();
   await bob.git("config", "core.autocrlf", "true");
   await bob.git("pull", "--quiet");
@@ -357,12 +384,14 @@ test("a checkout that converts line endings still has a working, unchanged setup
   const doctor = await vendored(bob, ["doctor", "--offline"]);
   assert.match(doctor.stdout, /ok {4}bundle: \.huddle\/huddle\.mjs is huddle \S+ and committed/);
   assert.match(doctor.stdout, /ok {4}AGENTS\.md: AGENTS\.md has the huddle block/);
+  // Neither copy of huddle rewrites anything the team shares: not the bundle, not AGENTS.md.
   for (const from of [() => vendored(bob, ["init"]), () => bob.huddle(["init"])]) {
     const again = await from();
     assert.equal(again.code, 0, again.stderr);
-    assert.match(again.stdout, /already set up here; nothing changed/);
+    assert.deepEqual(writtenForTheTeam(again.stdout), [], again.stdout);
     assert.doesNotMatch(again.stdout, /Next: commit/);
   }
+  assert.match((await bob.huddle(["init"])).stdout, /already set up here; nothing changed/);
   assert.equal(await bob.git("status", "--porcelain"), "");
 });
 
