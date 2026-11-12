@@ -587,6 +587,10 @@ function run(program: string, args: string[], options: { cwd: string; env: NodeJ
     child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
     child.on("error", reject);
     child.on("close", (code) => resolve({ code, stdout, stderr }));
+    // A command may exit without reading its stdin (the one for a machine
+    // without node does). Writing to the pipe it closed then fails with EPIPE,
+    // which is no failure of the command: what it did is in the exit code.
+    child.stdin.on("error", () => {});
     child.stdin.end(options.stdin ?? "");
   });
 }

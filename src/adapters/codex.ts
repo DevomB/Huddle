@@ -1,7 +1,8 @@
 // T3.1. Codex hooks, installed into <repo>/.codex/hooks.json.
 //
 // Written against https://developers.openai.com/codex/hooks as it read on
-// 2026-11-12, and against Codex's own source at the release current then
+// 2026-11-12 (the address now redirects to https://learn.chatgpt.com/docs/hooks,
+// same text), and against Codex's own source at the release current then
 // (tag rust-v0.167.0): the generated wire schemas in codex-rs/hooks/schema,
 // the command runner in codex-rs/hooks/src/engine, and the hook tests in
 // codex-rs/core/tests/suite/hooks.rs. Read the docs again before changing how
