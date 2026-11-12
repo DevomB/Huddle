@@ -1,0 +1,458 @@
+// T1.4: sync and the first commands, on the harness with real clones.
+// The first test is the exit test from plan.md §5.
+
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+import { test } from "node:test";
+import { contentHash, shouldPublish } from "../src/core/sync.ts";
+import { DEFAULT_CONFIG } from "../src/core/types.ts";
+import type { ActorDoc, LocalState, Session } from "../src/core/types.ts";
+import { createHarness } from "./harness.ts";
+import type { Clone, Harness } from "./harness.ts";
+
+const T0 = Date.parse("2026-01-01T00:00:00Z");
+const at = (seconds: number) => new Date(T0 + seconds * 1000).toISOString();
+const MIN = 60;
+
+/** The huddle refs on the remote, as "ref sha" lines. */
+const remoteRefs = (h: Harness) => h.remoteGit("for-each-ref", "--format=%(refname) %(objectname)", "refs/huddle");
+
+async function actorDocs(h: Harness): Promise<ActorDoc[]> {
+  const refs = (await h.remoteGit("for-each-ref", "--format=%(refname)", "refs/huddle/actors")).split("\n").filter(Boolean);
+  return Promise.all(refs.map(async (ref) => JSON.parse(await h.remoteGit("cat-file", "-p", `${ref}:doc.json`)) as ActorDoc));
+}
+
+async function ok(clone: Clone, args: string[], now: string, env: Record<string, string> = {}) {
+  const r = await clone.huddle(args, { now, env });
+  assert.equal(r.code, 0, `huddle ${args.join(" ")} in ${clone.name} exited ${r.code}: ${r.stderr}${r.stdout}`);
+  return r;
+}
+
+test("exit test: alice announces and edits, bob sees her, check names her, and she ages out", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  const bob = await h.clone("bob");
+
+  await alice.git("checkout", "--quiet", "-b", "feat/auth");
+  await ok(alice, ["intent", "build auth"], at(0));
+  await alice.write("src/auth.ts", "export const auth = true;\n");
+  const aliceBefore = await alice.snapshot();
+  await ok(alice, ["sync"], at(10));
+  assert.deepEqual(await alice.snapshot(), aliceBefore, "sync changed alice's refs, FETCH_HEAD, index or working tree");
+
+  const bobBefore = await bob.snapshot();
+  await ok(bob, ["sync"], at(20));
+
+  const status = await ok(bob, ["status"], at(25));
+  assert.match(status.stdout, /alice/, "status names alice");
+  assert.match(status.stdout, /feat\/auth/, "status shows her branch");
+  assert.match(status.stdout, /build auth/, "status shows her intent");
+  assert.match(status.stdout, /src\/auth\.ts/, "status shows her file");
+
+  const check = await bob.huddle(["check", "src/auth.ts"], { now: at(30) });
+  assert.equal(check.code, 3, `check should exit 3 on overlap: ${check.stdout}${check.stderr}`);
+  assert.match(check.stdout, /alice/, "check names alice");
+  assert.match(check.stdout, /src\/auth\.ts/);
+
+  const clear = await bob.huddle(["check", "src/unrelated.ts"], { now: at(30) });
+  assert.equal(clear.code, 0, clear.stderr);
+  assert.doesNotMatch(clear.stdout, /alice/);
+
+  assert.deepEqual(await bob.snapshot(), bobBefore, "sync, status and check changed bob's refs, FETCH_HEAD, index or working tree");
+
+  // Alice was last active at T0+10s. One second short of the TTL she is still listed...
+  const almost = await ok(bob, ["status"], at(10 + 15 * MIN - 1));
+  assert.match(almost.stdout, /alice/);
+  // ...and at the TTL she is gone, from status and from check.
+  const after = await ok(bob, ["status"], at(10 + 15 * MIN));
+  assert.doesNotMatch(after.stdout, /alice/, "alice is past the TTL and must not be listed");
+  assert.doesNotMatch(after.stdout, /src\/auth\.ts/);
+  const checkAfter = await bob.huddle(["check", "src/auth.ts"], { now: at(10 + 15 * MIN) });
+  assert.equal(checkAfter.code, 0, "no overlap with a session that is no longer live");
+});
+
+test("what is published: paths, branch and intent, never file contents or the worktree path", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  await ok(alice, ["intent", "refactor the parser"], at(0));
+  await alice.write("src/parser.ts", "const SECRET_TOKEN = 'hunter2';\n");
+  await ok(alice, ["sync"], at(5));
+
+  const docs = await actorDocs(h);
+  assert.equal(docs.length, 1);
+  const doc = docs[0]!;
+  assert.equal(doc.v, 0);
+  assert.equal(doc.kind, "actor");
+  assert.equal(doc.user, "alice");
+  assert.match(doc.actor, /^[a-z2-7]{8}$/);
+  assert.equal(doc.sessions.length, 1);
+  const session = doc.sessions[0]!;
+  assert.equal(session.agent, "manual");
+  assert.equal(session.branch, "main");
+  assert.equal(session.intent, "refactor the parser");
+  assert.equal(session.intentSource, "manual");
+  assert.deepEqual(session.files, ["src/parser.ts"]);
+  assert.deepEqual(Object.keys(session).sort(), ["agent", "branch", "claims", "files", "id", "intent", "intentSource", "seenAt", "startedAt"]);
+
+  const raw = JSON.stringify(doc);
+  assert.doesNotMatch(raw, /hunter2|SECRET_TOKEN/, "file contents were published");
+  assert.ok(!raw.includes(alice.dir), "the local worktree path was published");
+  // The ref is named after the actor and holds exactly one file.
+  const refs = (await remoteRefs(h)).split("\n");
+  assert.equal(refs.length, 1);
+  assert.ok(refs[0]!.startsWith(`refs/huddle/actors/${doc.actor} `));
+  assert.equal(await h.remoteGit("ls-tree", "--name-only", `refs/huddle/actors/${doc.actor}`), "doc.json");
+  assert.equal(await h.remoteGit("rev-list", "--count", `refs/huddle/actors/${doc.actor}`), "1", "the commit has no parent");
+});
+
+test("a sync with nothing new does not push; a change does; the heartbeat does after activity", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  await ok(alice, ["intent", "first"], at(0));
+  await ok(alice, ["sync"], at(1));
+  const first = await remoteRefs(h);
+
+  // Background syncs do not count as activity, so nothing about the doc changes.
+  await ok(alice, ["sync", "--background", "--force"], at(30));
+  assert.equal(await remoteRefs(h), first, "an unchanged doc was pushed again");
+
+  // Past the heartbeat interval but with no activity since the last publish: still nothing to say.
+  await ok(alice, ["sync", "--background", "--force"], at(4 * MIN));
+  assert.equal(await remoteRefs(h), first, "a heartbeat was sent for a session that did nothing");
+
+  // A new file in flight is a content change.
+  await alice.write("new.ts", "x\n");
+  await ok(alice, ["sync", "--background", "--force"], at(4 * MIN + 5));
+  const second = await remoteRefs(h);
+  assert.notEqual(second, first, "a changed doc was not pushed");
+
+  // Activity (a manual sync touches the session) inside the heartbeat interval: seenAt alone is not worth a push.
+  await ok(alice, ["sync"], at(4 * MIN + 60));
+  assert.equal(await remoteRefs(h), second, "seenAt alone caused a push inside the heartbeat interval");
+
+  // The same activity once the heartbeat interval has passed: publish, so teammates see she is still there.
+  await ok(alice, ["sync"], at(8 * MIN));
+  const third = await remoteRefs(h);
+  assert.notEqual(third, second, "no heartbeat after the interval despite activity");
+  assert.equal((await actorDocs(h))[0]!.sessions[0]!.seenAt, at(8 * MIN).replace("Z", ".000Z"));
+});
+
+test("background syncs are throttled to one per syncIntervalSeconds; --force and manual syncs are not", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  await ok(alice, ["intent", "one"], at(0));
+  await ok(alice, ["sync"], at(0));
+  const first = await remoteRefs(h);
+
+  await ok(alice, ["intent", "two"], at(5));
+  await ok(alice, ["sync", "--background"], at(5));
+  assert.equal(await remoteRefs(h), first, "a background sync ran 5 s after the last one");
+
+  await ok(alice, ["sync", "--background"], at(15));
+  const second = await remoteRefs(h);
+  assert.notEqual(second, first, "a background sync 15 s after the last one should run");
+  assert.equal((await actorDocs(h))[0]!.sessions[0]!.intent, "two");
+
+  await ok(alice, ["intent", "three"], at(16));
+  await ok(alice, ["sync", "--background", "--force"], at(16));
+  assert.equal((await actorDocs(h))[0]!.sessions[0]!.intent, "three", "--force ignores the throttle");
+});
+
+test("when the remote is unreachable, sync says so and exits 1; status still shows the cached team", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  const bob = await h.clone("bob");
+  await ok(alice, ["intent", "build auth"], at(0));
+  await ok(alice, ["sync"], at(1));
+  await ok(bob, ["sync"], at(2));
+
+  await bob.git("remote", "set-url", "origin", join(h.root, "gone.git"));
+  const before = await bob.snapshot();
+  const sync = await bob.huddle(["sync"], { now: at(60) });
+  assert.equal(sync.code, 1);
+  assert.match(sync.stderr, /could not reach remote "origin"/);
+
+  const status = await bob.huddle(["status"], { now: at(120) });
+  assert.equal(status.code, 0, status.stderr);
+  assert.match(status.stdout, /alice/, "the cached team is still shown");
+  assert.match(status.stdout, /build auth/);
+  assert.match(status.stderr, /could not reach remote "origin"/);
+
+  const background = await bob.huddle(["sync", "--background", "--force"], { now: at(180) });
+  assert.deepEqual({ code: background.code, stdout: background.stdout, stderr: background.stderr }, { code: 0, stdout: "", stderr: "" });
+  assert.deepEqual(await bob.snapshot(), before);
+  const log = await readFile((await bob.paths()).logFile, "utf8");
+  assert.match(log, /offline/, "the failure is in the debug log");
+});
+
+test("claims: a claimed glob is an overlap for teammates until it is released", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  const bob = await h.clone("bob");
+
+  const claimed = await ok(alice, ["claim", "src/payments/**", "docs/api.md"], at(0));
+  assert.match(claimed.stdout, /src\/payments\/\*\*/);
+  assert.equal((await ok(alice, ["claim"], at(1))).stdout, "src/payments/**\ndocs/api.md\n");
+  await ok(alice, ["sync"], at(2));
+  await ok(bob, ["sync"], at(3));
+
+  const hit = await bob.huddle(["check", "src/payments/stripe/client.ts"], { now: at(4) });
+  assert.equal(hit.code, 3, hit.stdout + hit.stderr);
+  assert.match(hit.stdout, /alice/);
+  assert.match(hit.stdout, /src\/payments\/\*\*/, "the warning says which claim matched");
+  assert.equal((await bob.huddle(["check", "src/billing/invoice.ts"], { now: at(4) })).code, 0);
+  assert.equal((await bob.huddle(["check", "docs/api.md", "src/billing/invoice.ts"], { now: at(4) })).code, 3, "any overlapping path is enough");
+
+  // Releasing one claim keeps the other.
+  const partial = await ok(alice, ["release", "src/payments/**"], at(5));
+  assert.match(partial.stdout, /still claimed: docs\/api\.md/);
+  await ok(alice, ["sync"], at(6));
+  await ok(bob, ["sync"], at(7));
+  assert.equal((await bob.huddle(["check", "src/payments/stripe/client.ts"], { now: at(8) })).code, 0);
+  assert.equal((await bob.huddle(["check", "docs/api.md"], { now: at(8) })).code, 3);
+
+  assert.match((await ok(alice, ["release"], at(9))).stdout, /released all claims/);
+  await ok(alice, ["sync"], at(10));
+  await ok(bob, ["sync"], at(11));
+  assert.equal((await bob.huddle(["check", "docs/api.md"], { now: at(12) })).code, 0);
+  assert.equal((await ok(alice, ["claim"], at(13))).stdout, "(no claims)\n");
+});
+
+test("claim and release reject what they cannot do, with exit code 2", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  const outside = await alice.huddle(["claim", "../elsewhere/**"], { now: at(0) });
+  assert.equal(outside.code, 2);
+  assert.match(outside.stderr, /outside this repository/);
+  await ok(alice, ["claim", "src/**"], at(1));
+  const unknown = await alice.huddle(["release", "docs/**"], { now: at(2) });
+  assert.equal(unknown.code, 2);
+  assert.match(unknown.stderr, /not claimed by this session: docs\/\*\*/);
+  assert.equal((await ok(alice, ["claim"], at(3))).stdout, "src/**\n", "a failed release changes nothing");
+  // Typed in a subdirectory, a glob is relative to it.
+  await alice.write("src/auth/x.ts", "x\n");
+  const sub = await alice.huddle(["claim", "*.ts"], { now: at(4), cwd: "src/auth" });
+  assert.equal(sub.code, 0, sub.stderr);
+  assert.match(sub.stdout, /src\/auth\/\*\.ts/);
+});
+
+test("check with no path checks this worktree's own files in flight", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  const bob = await h.clone("bob");
+  await alice.write("src/auth.ts", "alice's version\n");
+  await ok(alice, ["sync"], at(0));
+  await ok(bob, ["sync"], at(1));
+
+  const clean = await bob.huddle(["check"], { now: at(2) });
+  assert.equal(clean.code, 0, clean.stdout + clean.stderr);
+  assert.match(clean.stdout, /no overlap: checked 0 paths/);
+
+  await bob.write("src/auth.ts", "bob's version\n");
+  await bob.write("src/other.ts", "x\n");
+  const collide = await bob.huddle(["check"], { now: at(3) });
+  assert.equal(collide.code, 3, collide.stdout + collide.stderr);
+  assert.match(collide.stdout, /src\/auth\.ts/);
+  assert.match(collide.stdout, /alice/);
+  assert.doesNotMatch(collide.stdout, /src\/other\.ts/);
+
+  const json = await bob.huddle(["check", "--json"], { now: at(3) });
+  assert.equal(json.code, 3);
+  const parsed = JSON.parse(json.stdout) as { checked: number; overlaps: { path: string; sessions: { user: string; via: string }[] }[] };
+  assert.equal(parsed.checked, 2);
+  assert.deepEqual(parsed.overlaps.map((o) => o.path), ["src/auth.ts"]);
+  assert.equal(parsed.overlaps[0]!.sessions[0]!.user, "alice");
+  assert.equal(parsed.overlaps[0]!.sessions[0]!.via, "file");
+
+  const outside = await bob.huddle(["check", "/etc/passwd"], { now: at(4) });
+  assert.equal(outside.code, 2);
+});
+
+test("intent: set, show, replace, clear; long text is cut to 200 characters on one line", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  assert.equal((await ok(alice, ["intent"], at(0))).stdout, "(no intent set)\n");
+  assert.equal((await ok(alice, ["intent", "build", "the", "login", "page"], at(1))).stdout, "intent: build the login page\n");
+  assert.equal((await ok(alice, ["intent"], at(2))).stdout, "build the login page\n");
+  await ok(alice, ["intent", "line one\nline two"], at(3));
+  assert.equal((await ok(alice, ["intent"], at(4))).stdout, "line one line two\n");
+  await ok(alice, ["intent", "x".repeat(500)], at(5));
+  const shown = (await ok(alice, ["intent"], at(6))).stdout.trimEnd();
+  assert.equal(Array.from(shown).length, 200);
+  assert.equal((await ok(alice, ["intent", "--clear"], at(7))).stdout, "intent cleared\n");
+  assert.equal((await ok(alice, ["intent"], at(8))).stdout, "(no intent set)\n");
+
+  const empty = await alice.huddle(["intent", "   "], { now: at(9) });
+  assert.equal(empty.code, 2);
+  const both = await alice.huddle(["intent", "--clear", "text"], { now: at(9) });
+  assert.equal(both.code, 2);
+  const flag = await alice.huddle(["intent", "--nope"], { now: at(9) });
+  assert.equal(flag.code, 2);
+  assert.match(flag.stderr, /Usage: huddle intent/);
+});
+
+test("two worktrees of one clone are two sessions of one actor, and see each other without a sync", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  const second = await alice.addWorktree("feature");
+
+  await ok(alice, ["intent", "main checkout work"], at(0));
+  await ok(second, ["intent", "feature work"], at(1));
+  await second.write("src/feature.ts", "f\n");
+
+  // No sync yet: the other session comes from this clone's own local state.
+  const local = await ok(alice, ["status", "--cached"], at(2));
+  assert.match(local.stdout, /feature work/);
+  assert.match(local.stdout, /same clone/);
+  assert.doesNotMatch(local.stdout.split("\n").slice(1).join("\n"), /main checkout work/, "a session does not list itself as a teammate");
+
+  await ok(second, ["sync"], at(3));
+  const docs = await actorDocs(h);
+  assert.equal(docs.length, 1, "one clone is one actor");
+  assert.deepEqual(docs[0]!.sessions.map((s) => s.intent).sort(), ["feature work", "main checkout work"]);
+  assert.deepEqual(docs[0]!.sessions.map((s) => s.branch).sort(), ["feature", "main"]);
+  assert.notEqual(docs[0]!.sessions[0]!.id, docs[0]!.sessions[1]!.id);
+
+  const check = await alice.huddle(["check", "src/feature.ts"], { now: at(4) });
+  assert.equal(check.code, 3, "a file in flight in another worktree of the same clone is still an overlap");
+});
+
+test("HUDDLE_SESSION selects the session; without it a command joins the live session of its worktree", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  // An agent's hook created this session (simulated by naming it).
+  await ok(alice, ["intent", "from the agent"], at(0), { HUDDLE_SESSION: "agent-session-1" });
+  // The same agent later runs a bare command from its shell: it must land in that session.
+  await ok(alice, ["claim", "src/**"], at(5));
+  await ok(alice, ["sync"], at(6));
+  let docs = await actorDocs(h);
+  assert.equal(docs[0]!.sessions.length, 1, "a second session was created for the same agent");
+  assert.equal(docs[0]!.sessions[0]!.id, "agent-session-1");
+  assert.equal(docs[0]!.sessions[0]!.intent, "from the agent");
+  assert.deepEqual(docs[0]!.sessions[0]!.claims, ["src/**"]);
+
+  // An explicit, different HUDDLE_SESSION is a different session.
+  await ok(alice, ["intent", "second agent"], at(7), { HUDDLE_SESSION: "agent-session-2" });
+  await ok(alice, ["sync"], at(8), { HUDDLE_SESSION: "agent-session-2" });
+  docs = await actorDocs(h);
+  assert.deepEqual(docs[0]!.sessions.map((s) => s.id).sort(), ["agent-session-1", "agent-session-2"]);
+});
+
+test("a session past the TTL is dropped from local state and from the published doc", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  await ok(alice, ["intent", "old work"], at(0), { HUDDLE_SESSION: "old" });
+  await ok(alice, ["sync"], at(1), { HUDDLE_SESSION: "old" });
+  await ok(alice, ["intent", "new work"], at(20 * MIN), { HUDDLE_SESSION: "new" });
+  await ok(alice, ["sync"], at(20 * MIN + 1), { HUDDLE_SESSION: "new" });
+
+  const docs = await actorDocs(h);
+  assert.deepEqual(docs[0]!.sessions.map((s) => s.id), ["new"]);
+  const local = JSON.parse(await readFile((await alice.paths()).localFile, "utf8")) as LocalState;
+  assert.deepEqual(local.sessions.map((s) => s.id), ["new"]);
+});
+
+test("the remote losing this clone's ref is repaired by the next sync", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  await ok(alice, ["intent", "still here"], at(0));
+  await ok(alice, ["sync"], at(1));
+  const ref = (await remoteRefs(h)).split(" ")[0]!;
+  await h.remoteGit("update-ref", "-d", ref);
+  assert.equal(await remoteRefs(h), "");
+
+  // Nothing changed locally and the heartbeat is not due, but the doc is gone from the remote.
+  await ok(alice, ["sync", "--background", "--force"], at(30));
+  assert.match(await remoteRefs(h), new RegExp(`^${ref} [0-9a-f]{40}$`));
+});
+
+test("status --json is machine-readable and carries the whole view", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  const bob = await h.clone("bob");
+  await ok(alice, ["intent", "build auth"], at(0));
+  await ok(alice, ["sync"], at(1));
+  const r = await ok(bob, ["status", "--json"], at(2));
+  const view = JSON.parse(r.stdout) as { you: { user: string }; sessions: { user: string; intent: string }[]; fetchedAt: string };
+  assert.equal(view.you.user, "bob");
+  assert.equal(view.sessions.length, 1);
+  assert.equal(view.sessions[0]!.user, "alice");
+  assert.equal(view.sessions[0]!.intent, "build auth");
+  assert.equal(view.fetchedAt, at(2).replace("Z", ".000Z"), "status refreshed the cache itself");
+});
+
+test("status does not announce the caller: looking is not presence", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  const r = await ok(alice, ["status"], at(0));
+  assert.match(r.stdout, /Not announced yet/);
+  assert.equal(await remoteRefs(h), "", "a status call published a session");
+});
+
+test("outside a git repository every command fails cleanly with exit 1", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  for (const command of ["sync", "status", "intent", "claim", "release", "check"]) {
+    const r = await alice.huddle([command], { cwd: "..", now: at(0) });
+    assert.equal(r.code, 1, `${command}: ${r.stderr}`);
+    assert.equal(r.stderr, "huddle: not inside a git repository\n");
+    assert.equal(r.stdout, "");
+  }
+  const background = await alice.huddle(["sync", "--background"], { cwd: "..", now: at(0) });
+  assert.deepEqual({ code: background.code, stdout: background.stdout, stderr: background.stderr }, { code: 0, stdout: "", stderr: "" });
+});
+
+// ---------------------------------------------------------------------------
+// The publish rule, as a pure function.
+// ---------------------------------------------------------------------------
+
+const session = (over: Partial<Session> = {}): Session => ({
+  id: "s1",
+  agent: "manual",
+  branch: "main",
+  intent: "work",
+  intentSource: "manual",
+  files: ["b.ts", "a.ts"],
+  claims: [],
+  startedAt: at(0),
+  seenAt: at(0),
+  ...over,
+});
+
+const doc = (sessions: Session[], updatedAt = at(0)): ActorDoc => ({ v: 0, kind: "actor", actor: "abcd2345", user: "alice", host: "laptop", updatedAt, sessions });
+
+test("contentHash ignores timestamps and list order, and nothing else", () => {
+  const base = contentHash(doc([session()]));
+  assert.equal(contentHash(doc([session({ seenAt: at(500) })], at(500))), base, "seenAt and updatedAt");
+  assert.equal(contentHash(doc([session({ files: ["a.ts", "b.ts"] })])), base, "file order");
+  assert.equal(
+    contentHash(doc([session({ id: "s2" }), session()])),
+    contentHash(doc([session(), session({ id: "s2" })])),
+    "session order",
+  );
+  assert.notEqual(contentHash(doc([session({ intent: "other" })])), base);
+  assert.notEqual(contentHash(doc([session({ branch: "feat" })])), base);
+  assert.notEqual(contentHash(doc([session({ files: ["a.ts"] })])), base);
+  assert.notEqual(contentHash(doc([session({ claims: ["src/**"] })])), base);
+  assert.notEqual(contentHash(doc([])), base);
+});
+
+test("shouldPublish: changes always, heartbeats only after activity, silence when there is nothing to say", () => {
+  const config = { ...DEFAULT_CONFIG };
+  const d = doc([session({ seenAt: at(0) })]);
+  const hash = contentHash(d);
+  const published = { at: at(0), hash, sha: "0".repeat(40) };
+
+  assert.equal(shouldPublish(null, d, hash, new Date(at(0)), config), true, "first publish");
+  assert.equal(shouldPublish(null, doc([]), contentHash(doc([])), new Date(at(0)), config), false, "nothing to announce");
+  assert.equal(shouldPublish({ ...published, hash: "different" }, d, hash, new Date(at(1)), config), true, "content changed");
+  assert.equal(shouldPublish(published, d, hash, new Date(at(60)), config), false, "unchanged, inside the heartbeat");
+  assert.equal(shouldPublish(published, d, hash, new Date(at(3 * MIN)), config), false, "heartbeat due but idle since the last publish");
+
+  const active = doc([session({ seenAt: at(100) })]);
+  assert.equal(shouldPublish(published, active, hash, new Date(at(3 * MIN - 1)), config), false, "active, one second before the heartbeat");
+  assert.equal(shouldPublish(published, active, hash, new Date(at(3 * MIN)), config), true, "active and the heartbeat is due");
+  assert.equal(shouldPublish({ ...published, at: at(999) }, d, hash, new Date(at(0)), config), true, "a publish time in the future is not trusted");
+  assert.equal(shouldPublish({ ...published, at: "garbage" }, d, hash, new Date(at(0)), config), true);
+});
