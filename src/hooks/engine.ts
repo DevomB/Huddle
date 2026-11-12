@@ -28,11 +28,12 @@
 // recovery (core/store.ts). Agents put no time limit on some hooks at all
 // (Claude Code on an async PostToolUse), so this is the only one there is.
 //
-// Syncs. A background sync is throttled to one per syncIntervalSeconds, and a
-// throttled one is skipped, not delayed. So the events after which teammates
-// have something new to learn ask for a sync that is not throttled: a session
-// that appeared, moved to another worktree, changed its intent or left, and
-// the end of a turn, after which nothing else might run for minutes.
+// Syncs. A background sync is throttled to one per syncIntervalSeconds. What
+// becomes of one that comes too early is decided in core/sync.ts; either way
+// it does not run now. So the events after which teammates have something new
+// to learn ask for a sync that is not throttled: a session that appeared,
+// moved to another worktree, changed its intent or left, and the end of a
+// turn, after which nothing else might run for minutes.
 //
 // Subagents share their parent's session id. Their events keep the session
 // alive and are warned before an edit, and that is all: they never move the
@@ -856,10 +857,12 @@ function exitCodeOf(code: unknown): number {
 
 /**
  * `huddle hook <agent> [args...]`: read stdin, let the adapter parse it, run
- * the event, print what the adapter formats. Returns the exit code, which is
- * 0 on every internal error and when the event's deadline passes: a hook
- * never breaks the agent. (The adapter may ask for another exit code where
- * its agent's protocol needs one; none does today.)
+ * the event, print what the adapter formats, and only then record it as shown
+ * (not at all when the adapter says it had no way to show it:
+ * HookOutput.unshown). Returns the exit code, which is 0 on every internal
+ * error and when the event's deadline passes: a hook never breaks the agent.
+ * (The adapter may ask for another exit code where its agent's protocol needs
+ * one; none does today.)
  */
 export async function runHook(args: string[], io: Io): Promise<number> {
   const started = performance.now();
@@ -892,7 +895,8 @@ export async function runHook(args: string[], io: Io): Promise<number> {
     await before(deadline, appendLines(output.appendLines));
     if (typeof output.stdout === "string" && output.stdout !== "") io.out(output.stdout);
     if (typeof output.stderr === "string" && output.stderr !== "") io.err(output.stderr);
-    await commit(prepared.value, deadline, trace, event.type);
+    // What the adapter had no way to show is not recorded as shown: it comes up again at the next event.
+    if (output.unshown !== true) await commit(prepared.value, deadline, trace, event.type);
     return exitCodeOf(output.exitCode);
   } catch (error) {
     log(trace.paths, "hook", "the hook failed", error);
