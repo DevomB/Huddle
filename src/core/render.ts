@@ -176,11 +176,24 @@ function sessionLine(session: ViewSession, nowMs: number, detail: Level): string
   return line;
 }
 
+/**
+ * " CONFLICT: …" for a decision that competes with another one in force
+ * (ViewDecision.conflictsWith), "" otherwise. huddle does not pick one, so
+ * both are shown, and each says so.
+ */
+function conflictNote(decision: ViewDecision): string {
+  const others = decision.conflictsWith ?? [];
+  if (others.length === 0) return "";
+  const ids = others.map((id) => `[${shownText(id, 40)}]`).join(", ");
+  const replaced = shownText(decision.supersedes ?? "", 40);
+  return ` CONFLICT: this and ${ids} both replace [${replaced}], and huddle does not pick one. Settle it together, then replace the one that should go: huddle decide --supersedes <its id> "<the rule>"`;
+}
+
 function decisionLines(decisions: ViewDecision[], fresh: boolean, detail: Level): string[] {
   if (decisions.length === 0) return [];
   const head = `Decisions (${decisions.length}${fresh ? " new" : ""})`;
   if (detail.decisions <= 0) return [`${head}: run \`huddle decisions\` to read them.`];
-  const shown = decisions.slice(0, detail.decisions).map((decision) => sentence(shownText(decision.text, detail.decisionChars)));
+  const shown = decisions.slice(0, detail.decisions).map((decision) => sentence(shownText(decision.text, detail.decisionChars)) + conflictNote(decision));
   const more = decisions.length - shown.length;
   if (shown.length === 1 && more === 0) return [`${head}: ${shown[0]}`];
   const lines = [`${head}:`, ...shown.map((line) => `- ${line}`)];
@@ -254,7 +267,8 @@ function itemsOf(view: TeamView): Record<string, string> {
     const shown = JSON.stringify([session.user, session.agent, session.branch, session.intent, [...session.files].sort(), [...session.claims].sort()]);
     items[sessionItem(session)] = `${fingerprint(shown)} ${who(session)} (${branchOf(session)})`;
   }
-  for (const decision of view.decisions) items[decisionItem(decision)] = fingerprint(decision.text);
+  // A decision that becomes conflicted (or stops being) is news again.
+  for (const decision of view.decisions) items[decisionItem(decision)] = fingerprint(`${decision.text}${conflictNote(decision)}`);
   items[TASKS_ITEM] = taskSummary(view);
   return items;
 }
@@ -422,7 +436,7 @@ function decisionLog(view: TeamView, notice: boolean): string[] {
   const nowMs = Date.parse(view.now);
   const lines = [`Decisions (${view.decisions.length}), newest first.${notice ? ` ${NOTICE}` : ""}`];
   for (const decision of view.decisions) {
-    lines.push(`- [${shownText(decision.id, 40)}] ${sentence(shownText(decision.text, 500))} (${who(decision)}, ${ageOf(decision.at, nowMs)})`);
+    lines.push(`- [${shownText(decision.id, 40)}] ${sentence(shownText(decision.text, 500))} (${who(decision)}, ${ageOf(decision.at, nowMs)})${conflictNote(decision)}`);
   }
   return lines;
 }

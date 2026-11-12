@@ -22,6 +22,15 @@ export interface ViewSession extends Session {
 export interface ViewDecision extends Decision {
   actor: string;
   user: string;
+  /**
+   * Set when another decision in force replaces the same decision as this one
+   * (audit A04: two replacements made at the same moment both land, because
+   * each author's log is compare-and-swapped on its own). Those are its ids.
+   * huddle does not pick one: both stay listed, each marked as conflicting.
+   * The team settles it with the existing `huddle decide --supersedes` on the
+   * one that should go.
+   */
+  conflictsWith?: string[];
 }
 
 /**
@@ -187,6 +196,17 @@ export function buildView(cache: Cache, self: Self, now: Date, opts: ViewOptions
   view.decisions = decisions
     .filter((decision) => !superseded.has(decision.id))
     .sort((a, b) => Date.parse(b.at) - Date.parse(a.at) || compareText(a.actor, b.actor) || compareText(a.id, b.id));
+  // Decisions in force that replace the same decision compete: mark each with the others. No clock picks one.
+  const rivals = new Map<string, ViewDecision[]>();
+  for (const decision of view.decisions) {
+    if (decision.supersedes === undefined || decision.supersedes === decision.id) continue;
+    rivals.set(decision.supersedes, [...(rivals.get(decision.supersedes) ?? []), decision]);
+  }
+  view.decisions = view.decisions.map((decision) => {
+    const group = decision.supersedes === undefined ? undefined : rivals.get(decision.supersedes);
+    if (group === undefined || group.length < 2) return decision;
+    return { ...decision, conflictsWith: group.filter((other) => other !== decision).map((other) => other.id).sort(compareText) };
+  });
 
   const presence = (task: TaskDoc): OwnerPresence | null => {
     if (task.status !== "claimed" || task.owner === null) return null;

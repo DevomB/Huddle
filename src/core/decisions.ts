@@ -100,8 +100,20 @@ function logOf(identity: Identity, decisions: Decision[]): DecisionDoc {
   return { v: 0, kind: "decisions", actor: identity.actor, user: identity.user, decisions };
 }
 
+/**
+ * Whether `decisions` make a log that can be published and read back. Over the
+ * byte budget serializeDoc throws DocTooLargeError (docs.ts, CONTRACT 4.1),
+ * which means "does not fit"; it is matched by name so that this also holds
+ * with a docs.ts that still returns the long text.
+ */
 function fits(identity: Identity, decisions: Decision[]): boolean {
-  return decisions.length <= LIMITS.decisions && Buffer.byteLength(serializeDoc(logOf(identity, decisions)), "utf8") <= LIMITS.docBytes;
+  if (decisions.length > LIMITS.decisions) return false;
+  try {
+    return Buffer.byteLength(serializeDoc(logOf(identity, decisions)), "utf8") <= LIMITS.docBytes;
+  } catch (error) {
+    if (error instanceof Error && (error.name === "DocTooLargeError" || error.constructor.name === "DocTooLargeError")) return false;
+    throw error;
+  }
 }
 
 /**
