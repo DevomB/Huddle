@@ -11,7 +11,7 @@ import { getAdapter } from "../src/adapters/index.ts";
 import { SILENT } from "../src/adapters/types.ts";
 import type { HookEvent, HookEventType, HookInput } from "../src/adapters/types.ts";
 import { CliError } from "../src/core/io.ts";
-import { createHarness } from "./harness.ts";
+import { createHarness, posixOnly } from "./harness.ts";
 
 // The fixtures are payloads recorded from Claude Code 2.1.322; see the README next to them.
 const FIXTURES = fileURLToPath(new URL("./fixtures/hooks/claude-code/", import.meta.url));
@@ -1019,7 +1019,7 @@ test("install: the file keeps its indentation, line endings, final newline and b
   }
 });
 
-test("install: writes through a symlinked settings file and keeps the file's mode", { skip: process.platform === "win32" }, async (t) => {
+test("install: writes through a symlinked settings file and keeps the file's mode", posixOnly("a symbolic link and a file mode"), async (t) => {
   const { root, file } = await scratchRepo(t);
   const real = join(root, "dotfiles-settings.json");
   await writeFile(real, '{\n  "model": "opus"\n}\n', { mode: 0o600 });
