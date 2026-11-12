@@ -31,13 +31,16 @@ test("git is isolated from the developer's own configuration", async (t) => {
   const clone = await h.clone("alice");
   assert.equal(process.env.GIT_CONFIG_GLOBAL, TEST_ENV.GIT_CONFIG_GLOBAL);
   assert.equal(process.env.GIT_CONFIG_NOSYSTEM, "1");
-  const origins = await clone.git("config", "--list", "--show-origin");
-  for (const line of origins.split("\n")) {
-    assert.ok(
-      line.startsWith(`file:${TEST_ENV.GIT_CONFIG_GLOBAL}\t`) || line.startsWith("file:.git/config\t") || line.startsWith("command line:\t"),
-      `config from outside the harness: ${line}`,
-    );
+  // -z: git prints each origin as it is. Without it a path with a space, a backslash or a letter outside
+  // ASCII comes back quoted and escaped, and the harness's own directories have all of those in them.
+  const listed = (await clone.git("config", "--list", "--show-origin", "-z")).split("\0");
+  const allowed = new Set([`file:${TEST_ENV.GIT_CONFIG_GLOBAL}`, "file:.git/config", "command line:"]);
+  let settings = 0;
+  for (let i = 0; i + 1 < listed.length; i += 2) {
+    assert.ok(allowed.has(listed[i] ?? ""), `config from outside the harness: ${listed[i]} ${JSON.stringify(listed[i + 1])}`);
+    settings++;
   }
+  assert.ok(settings >= 5, `expected the harness's own settings to be listed, saw ${settings}`);
   assert.equal(await clone.git("config", "--get", "commit.gpgsign"), "false");
 });
 

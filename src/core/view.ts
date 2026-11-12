@@ -24,9 +24,25 @@ export interface ViewDecision extends Decision {
   user: string;
 }
 
+/**
+ * Where a claimed task's owner stands (CONTRACT 4.3):
+ * - "live": the owner's session is live.
+ * - "expired": the owner's actor document is readable and the session is not
+ *   in it, or it was last seen ttlMinutes ago or more. Activity-based
+ *   reclamation: the task may be claimed again. This is not an execution lock;
+ *   a quiet owner can look expired while still working.
+ * - "unknown": nothing readable says either way: the cache was never fetched
+ *   (or could not be read), the owner's actor ref is missing or holds a
+ *   document this version cannot read, or the session's seenAt is too far in
+ *   the future to mean anything. Never taken as expired.
+ */
+export type OwnerPresence = "live" | "expired" | "unknown";
+
 export interface ViewTask extends TaskDoc {
-  /** status "claimed" and the owner's session is live. A claimed task that is not ownerLive may be claimed again. */
+  /** ownerPresence === "live". Kept for readers that know only this field. */
   ownerLive: boolean;
+  /** For a claimed task with an owner, where that owner stands; null otherwise. Only "expired" may be claimed again. */
+  ownerPresence: OwnerPresence | null;
 }
 
 export interface TeamView {
@@ -104,6 +120,8 @@ export function buildView(cache: Cache, self: Self, now: Date, opts: ViewOptions
 
   const live = new Set<string>();
   if (self.session !== undefined) live.add(sessionKey(self.actor, self.session)); // the viewer is running right now
+  // Every actor ref in the cache: its sessions by id (latest stamp wins), or null when its document cannot be read.
+  const actors = new Map<string, Map<string, Session> | null>();
   const decisions: ViewDecision[] = [];
   const tasks: TaskDoc[] = [];
 
@@ -111,18 +129,27 @@ export function buildView(cache: Cache, self: Self, now: Date, opts: ViewOptions
   for (const ref of Object.keys(refs).sort()) {
     const where = parseRef(ref);
     const doc = refs[ref]?.doc;
+
+    if (where?.kind === "actor" && (doc === null || doc === undefined || doc.kind !== "actor" || doc.actor !== where.id)) {
+      actors.set(where.id, null);
+      continue;
+    }
     if (where === null || doc === null || doc === undefined) continue;
 
     if (where.kind === "actor" && doc.kind === "actor" && doc.actor === where.id) {
       // One entry per session id; if a doc repeats an id, the most recently seen wins.
       const latest = new Map<string, Session>();
+      const stamps = new Map<string, Session>();
       for (const session of doc.sessions) {
+        const previousStamp = stamps.get(session.id);
+        if (previousStamp === undefined || Date.parse(session.seenAt) > Date.parse(previousStamp.seenAt)) stamps.set(session.id, session);
         // Skipped here, not below, so that a stamp from the far future cannot
         // win over a believable entry for the same id.
         if (Date.parse(session.seenAt) - nowMs > MAX_CLOCK_SKEW_MS) continue;
         const previous = latest.get(session.id);
         if (previous === undefined || Date.parse(session.seenAt) > Date.parse(previous.seenAt)) latest.set(session.id, session);
       }
+      actors.set(doc.actor, stamps);
       for (const session of latest.values()) {
         if (!(nowMs - Date.parse(session.seenAt) < ttlMs)) continue;
         live.add(sessionKey(doc.actor, session.id));
@@ -160,13 +187,28 @@ export function buildView(cache: Cache, self: Self, now: Date, opts: ViewOptions
     .filter((decision) => !superseded.has(decision.id))
     .sort((a, b) => Date.parse(b.at) - Date.parse(a.at) || compareText(a.actor, b.actor) || compareText(a.id, b.id));
 
+  const presence = (task: TaskDoc): OwnerPresence | null => {
+    if (task.status !== "claimed" || task.owner === null) return null;
+    if (live.has(sessionKey(task.owner.actor, task.owner.session))) return "live";
+    if (view.fetchedAt === null) return "unknown"; // never fetched, or the cache could not be read
+    const sessions = actors.get(task.owner.actor);
+    if (sessions === undefined || sessions === null) return "unknown";
+    const session = sessions.get(task.owner.session);
+    if (session === undefined) return "expired"; // the owner's clone says the session is over
+    // Not live: either last seen a TTL ago or more, or stamped too far ahead to mean anything.
+    return Date.parse(session.seenAt) - nowMs > MAX_CLOCK_SKEW_MS || Number.isNaN(Date.parse(session.seenAt)) ? "unknown" : "expired";
+  };
   view.tasks = tasks
-    .map((task) => ({
-      ...task,
-      owner: task.owner === null ? null : { ...task.owner },
-      createdBy: { ...task.createdBy },
-      ownerLive: task.status === "claimed" && task.owner !== null && live.has(sessionKey(task.owner.actor, task.owner.session)),
-    }))
+    .map((task) => {
+      const ownerPresence = presence(task);
+      return {
+        ...task,
+        owner: task.owner === null ? null : { ...task.owner },
+        createdBy: { ...task.createdBy },
+        ownerLive: ownerPresence === "live",
+        ownerPresence,
+      };
+    })
     .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt) || compareText(a.id, b.id));
 
   return view;
@@ -174,18 +216,22 @@ export function buildView(cache: Cache, self: Self, now: Date, opts: ViewOptions
 
 /**
  * open: nobody has it. taken: claimed by a live session. stale: claimed, but
- * the owner's session is gone, so it may be claimed again. done.
+ * the owner's session has expired, so it may be claimed again. unclear:
+ * claimed, and nothing readable says whether the owner is still there; it may
+ * not be claimed. done.
  */
-export type TaskState = "open" | "taken" | "stale" | "done";
+export type TaskState = "open" | "taken" | "stale" | "unclear" | "done";
 
 export function taskState(task: ViewTask): TaskState {
   if (task.status === "open") return "open";
   if (task.status === "done") return "done";
-  return task.ownerLive ? "taken" : "stale";
+  // A document from before ownerPresence existed has only ownerLive.
+  const presence = task.ownerPresence ?? (task.ownerLive ? "live" : "expired");
+  return presence === "live" ? "taken" : presence === "expired" ? "stale" : "unclear";
 }
 
 export function countTasks(view: TeamView): Record<TaskState, number> {
-  const counts: Record<TaskState, number> = { open: 0, taken: 0, stale: 0, done: 0 };
+  const counts: Record<TaskState, number> = { open: 0, taken: 0, stale: 0, unclear: 0, done: 0 };
   for (const task of view.tasks) counts[taskState(task)]++;
   return counts;
 }

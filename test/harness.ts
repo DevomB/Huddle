@@ -12,11 +12,17 @@
 // user config, a throwaway HOME, and no inherited GIT_DIR. That covers tests
 // that call src/ modules in-process as well as the spawned CLI. `npm test`
 // builds the bundle first; huddle() runs dist/huddle.mjs, the file that ships.
+//
+// The harness runs unchanged on Linux and on native Windows (Git for Windows,
+// no WSL). Every directory it makes has a space and a letter outside ASCII in
+// its name, so each test that uses it also covers such paths on both. A test
+// whose mechanism exists only on POSIX says so with posixOnly(), and whatever
+// it protects needs a portable test next to it.
 
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -60,7 +66,47 @@ export const BUNDLE_NODE = process.env.HUDDLE_TEST_NODE || process.execPath;
 // Process-wide isolation, set up once on import.
 // ---------------------------------------------------------------------------
 
-const isolation = realpathSync(mkdtempSync(join(tmpdir(), "huddle-env-")));
+/** True on native Windows. Not under WSL, which is Linux to node. */
+export const WINDOWS = process.platform === "win32";
+
+/**
+ * Options for a test whose mechanism exists only on POSIX: a mode bit, a
+ * signal, a script that stands in for a program. It runs everywhere else and
+ * is skipped on Windows with the reason shown in the report.
+ *
+ *   test("a hooks file its owner made read-only is left alone", posixOnly("chmod"), async (t) => { ... });
+ */
+export function posixOnly(mechanism: string): { skip: string | false } {
+  return { skip: WINDOWS ? `POSIX-only: ${mechanism}` : false };
+}
+
+/**
+ * What every temp directory of the harness starts with: a space and a letter
+ * outside ASCII (precomposed, so that it is the same bytes on every file
+ * system these tests run on).
+ */
+export const TEMP_PREFIX = "huddle t\u00e9st ";
+
+/**
+ * A new temp directory, as the operating system itself names it. The native
+ * realpath matters on Windows: the temp directory is often handed out in its
+ * short form (C:\Users\RUNNER~1\...), and git and node's own realpath
+ * disagree about that form.
+ */
+export function tempDirSync(label: string): string {
+  return realpathSync.native(mkdtempSync(join(tmpdir(), `${TEMP_PREFIX}${label}-`)));
+}
+
+export async function tempDir(label: string): Promise<string> {
+  return realpathSync.native(await mkdtemp(join(tmpdir(), `${TEMP_PREFIX}${label}-`)));
+}
+
+/** Removes a test's directory. Windows keeps a directory busy for a moment after the last process in it has gone. */
+export function removeDir(dir: string): Promise<void> {
+  return rm(dir, { recursive: true, force: true, maxRetries: WINDOWS ? 20 : 3, retryDelay: 100 });
+}
+
+const isolation = tempDirSync("env");
 mkdirSync(join(isolation, "home"), { recursive: true });
 writeFileSync(
   join(isolation, "gitconfig"),
@@ -76,6 +122,8 @@ writeFileSync(
     "\tgpgsign = false",
     "[core]",
     "\tautocrlf = false",
+    // Only read by Git for Windows: fixtures with paths at the protocol's limit are longer than MAX_PATH.
+    "\tlongpaths = true",
     "[advice]",
     "\tdetachedHead = false",
     "",
@@ -94,6 +142,8 @@ export const TEST_ENV: Readonly<Record<string, string>> = Object.freeze({
   GIT_CONFIG_GLOBAL: join(isolation, "gitconfig"),
   GIT_CONFIG_NOSYSTEM: "1",
   HOME: join(isolation, "home"),
+  // What node's os.homedir() and Git for Windows go by on Windows; unused elsewhere.
+  USERPROFILE: join(isolation, "home"),
   XDG_CONFIG_HOME: join(isolation, "home", ".config"),
   // No detached background syncs: they would outlive the test and write into a
   // directory that is being removed. A test of the background path sets this to "".
@@ -213,9 +263,9 @@ export interface CleanupHost {
 // ---------------------------------------------------------------------------
 
 export async function createHarness(t?: CleanupHost): Promise<Harness> {
-  const root = await realpath(await mkdtemp(join(tmpdir(), "huddle-test-")));
+  const root = await tempDir("repo");
   const remote = join(root, "remote.git");
-  const cleanup = () => rm(root, { recursive: true, force: true, maxRetries: 3 });
+  const cleanup = () => removeDir(root);
   t?.after(cleanup);
 
   await gitOut(["init", "--quiet", "--bare", "--initial-branch=main", remote], { cwd: root });
@@ -227,7 +277,7 @@ export async function createHarness(t?: CleanupHost): Promise<Harness> {
   await gitOut(["add", "-A"], { cwd: seed });
   await gitOut(["commit", "--quiet", "-m", "Initial commit"], { cwd: seed });
   await gitOut(["push", "--quiet", "origin", "HEAD:refs/heads/main"], { cwd: seed });
-  await rm(seed, { recursive: true, force: true });
+  await removeDir(seed);
 
   return {
     root,

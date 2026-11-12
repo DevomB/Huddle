@@ -38,6 +38,20 @@ export interface Session {
   startedAt: Iso;
   /** Last activity. */
   seenAt: Iso;
+  /**
+   * Present only when `files` is not this session's complete exact set: more
+   * files were in flight than the document carries. Additive to v0. A reader
+   * that does not know the field ignores it and still warns, because every
+   * `cover` glob is also one of `claims`.
+   */
+  partial?: SessionPartial;
+}
+
+export interface SessionPartial {
+  /** How many files were in flight when this was published, before anything was cut. */
+  total: number;
+  /** The entries of `claims` that huddle generated to cover the files not listed. Never a claim the user made. */
+  cover: string[];
 }
 
 export interface DecisionDoc {
@@ -87,7 +101,12 @@ export type Expect = "own" | "absent" | Sha;
 
 export type FailReason = "lost-race" | "offline" | "denied";
 
-export type PublishResult = { ok: true; sha: Sha } | { ok: false; reason: FailReason };
+/**
+ * On a failure, `sent` is false only when the transport knows that nothing
+ * left this machine. Absent or true: the write may have reached the remote
+ * and been applied, so the outcome is unknown until the ref is read again.
+ */
+export type PublishResult = { ok: true; sha: Sha } | { ok: false; reason: FailReason; sent?: boolean };
 
 /**
  * `doc` is null when the ref exists but its content is not a valid v0 document

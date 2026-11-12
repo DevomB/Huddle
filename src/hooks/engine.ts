@@ -24,10 +24,14 @@
 //
 // Deadlines. Each event has one, counted from the moment the hook command
 // starts to run (node's own start-up comes on top). When it passes, the hook
-// prints nothing and exits 0; whatever was still running is abandoned. Every
+// prints nothing and exits 0; whatever was still running is abandoned, and a
+// git call that was among it is ended on the way out (commands/hook.ts). Every
 // write it could interrupt is an atomic rename or is covered by stale-lock
 // recovery (core/store.ts). Agents put no time limit on some hooks at all
 // (Claude Code on an async PostToolUse), so this is the only one there is.
+// A machine that is too slow for these numbers can have all of them made
+// longer with HUDDLE_HOOK_PATIENCE (see patienceOf). And whatever gets around
+// an event's deadline meets the limit on the whole process: lifetimeMs().
 //
 // Syncs. A background sync is throttled to one per syncIntervalSeconds. What
 // becomes of one that comes too early is decided in core/sync.ts; either way
@@ -61,7 +65,7 @@
 // is not repeated before every edit of the same file.
 
 import { createHash } from "node:crypto";
-import { appendFile, mkdir, readFile, realpath, stat } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rm } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { ADAPTERS, getAdapter } from "../adapters/index.ts";
 import type { HookEvent, HookEventType, HookOutcome, HookOutput } from "../adapters/types.ts";
@@ -73,16 +77,16 @@ import { getIdentity, getIdentityFast } from "../core/identity.ts";
 import { EXIT } from "../core/io.ts";
 import type { Io } from "../core/io.ts";
 import { log } from "../core/log.ts";
-import { ensureStateDir, loadConfig, locateRepo } from "../core/paths.ts";
+import { ensureStateDir, isSetUp, loadConfig, locateRepo, sameDirectory } from "../core/paths.ts";
 import type { RepoPaths } from "../core/paths.ts";
-import { DEFAULT_BRIEFING_CHARS, formatAge, renderBriefing, renderOverlaps } from "../core/render.ts";
+import { DEFAULT_BRIEFING_CHARS, formatAge, renderBriefing, renderOverlaps, shownText } from "../core/render.ts";
 import { currentView, resolveSession } from "../core/session.ts";
 import { readCache, readLocal, readSeen, removeSeen, removeSession, updateLocal, writeFileAtomic, writeSeen } from "../core/store.ts";
 import { spawnBackgroundSync, syncWithin } from "../core/sync.ts";
 import { createTransport } from "../core/transport.ts";
 import type { Config, Identity, LocalSession, LocalState, Seen } from "../core/types.ts";
 import { overlaps } from "../core/view.ts";
-import type { TeamView } from "../core/view.ts";
+import type { Overlap, TeamView } from "../core/view.ts";
 import { isBareWord, toIntent } from "./intent.ts";
 
 /**
@@ -116,7 +120,14 @@ const CHECK_RESERVE_MS = 150;
 const STDIN_WAIT_MS = 300;
 /** What session-start keeps back from its deadline for everything that comes after the sync. */
 const BRIEFING_RESERVE_MS = 300;
-/** A store lock is not waited for longer than this, nor into the last moments before the deadline. */
+/** The longest session-start waits for that sync: the rest of its deadline, which patience does not make longer. */
+const SYNC_WAIT_MS = DEADLINE_MS["session-start"] - BRIEFING_RESERVE_MS;
+/**
+ * A store lock is not waited for longer than this, nor into the last moments
+ * before the deadline. Patience does not make it longer: it caps the time
+ * spent queueing behind another process of this clone, and what patience adds
+ * to a deadline is meant for the work, not for the queue.
+ */
 const MAX_STORE_WAIT_MS = 1000;
 const STORE_MARGIN_MS = 30;
 /**
@@ -142,8 +153,6 @@ const MIN_UPDATE_CHARS = 500;
 const BRIEFED = "briefed";
 const WARNED = "w:";
 
-const CUT_NOTE = "[huddle] Cut short to fit: run `huddle check` for the rest.";
-
 /**
  * The two ways the engine reaches the network. A seam for tests, which replace
  * them to see what was asked for; nothing else should.
@@ -164,14 +173,59 @@ function deadlineIn(startedMs: number, budgetMs: number): Deadline {
   return { left: () => end - performance.now() };
 }
 
-/** How long this event may take. Takes whatever it is given: an event that is not one gets the shortest deadline there is. */
-function deadlineFor(event: HookEvent | null | undefined): number {
+/**
+ * The most HUDDLE_HOOK_PATIENCE may be. A committed settings file can set the
+ * variable for a whole team, and at 100 one hook that hangs would hold every
+ * agent for 15 s at each edit and for minutes at a session start. 20 is what
+ * the slowest machine these hooks were timed on needed.
+ */
+const MAX_PATIENCE = 20;
+
+/**
+ * HUDDLE_HOOK_PATIENCE, a number from 1 to 20: the deadline of every hook
+ * event, and what an event keeps back from it for its own work, is that many
+ * times as long. It is for a machine on which hooks keep giving up at their
+ * deadlines, which the debug log shows: a slow disk, a scanner that reads
+ * every file first, a container on a busy host. It buys time for the machine
+ * and none for the network: how long a hook waits for a sync stays as it is
+ * (see sessionStart and refreshFirst), and so does the wait for a store lock
+ * (MAX_STORE_WAIT_MS). Anything that is not such a number counts as 1. Takes
+ * whatever it is given.
+ */
+function patienceOf(io: Io | null | undefined): number {
+  const env: unknown = io?.env;
+  const raw = Number(typeof env === "object" && env !== null ? (env as NodeJS.ProcessEnv).HUDDLE_HOOK_PATIENCE : undefined);
+  return raw >= 1 && raw <= MAX_PATIENCE ? raw : 1;
+}
+
+/**
+ * How long this event may take, with `patience`. Takes whatever it is given:
+ * an event that is not one gets the shortest deadline there is.
+ */
+function deadlineFor(event: HookEvent | null | undefined, patience: number): number {
+  return patience * baseDeadline(event);
+}
+
+function baseDeadline(event: HookEvent | null | undefined): number {
   const type: unknown = event?.type;
   if (typeof type !== "string" || !Object.hasOwn(DEADLINE_MS, type)) return DEADLINE_MS["pre-edit"];
   if (type === "pre-edit" && event?.ambient === true) return PATIENT_PRE_EDIT_MS;
   // It does a prompt's work, and for its agent it is the only event that brings news: a prompt's time.
   if (type === "post-edit" && event?.brief === true) return DEADLINE_MS.prompt;
   return DEADLINE_MS[type as HookEventType];
+}
+
+/** What comes on top of the longest deadline before a hook process is ended from outside the event (see lifetimeMs). */
+const LIFETIME_MARGIN_MS = 500;
+
+/**
+ * The longest a hook process may live, for the timer that commands/hook.ts
+ * sets: the longest deadline there is, and a little more. Every event has a
+ * deadline of its own, after which the process exits. This is the limit for
+ * whatever gets around that.
+ */
+export function lifetimeMs(io: Io | null | undefined): number {
+  return patienceOf(io) * Math.max(PATIENT_PRE_EDIT_MS, ...Object.values(DEADLINE_MS)) + LIFETIME_MARGIN_MS;
 }
 
 type Settled<T> = { done: true; value: T } | { done: false };
@@ -233,24 +287,6 @@ interface Where {
   away: boolean;
 }
 
-/** `huddle init` was run here (or someone made the directory by hand to opt this clone in). */
-async function isSetUp(paths: RepoPaths): Promise<boolean> {
-  try {
-    return (await stat(paths.teamDir)).isDirectory();
-  } catch {
-    return false;
-  }
-}
-
-async function sameDirectory(a: string, b: string): Promise<boolean> {
-  if (a === b) return true;
-  try {
-    return (await realpath(a)) === (await realpath(b));
-  } catch {
-    return false;
-  }
-}
-
 /**
  * The repository an event is about, or null when there is none huddle may
  * touch. It is the one the agent is working in (event.cwd) when that is set
@@ -301,6 +337,12 @@ interface Run {
   /** Fixed for the event; honors HUDDLE_NOW in io.env. */
   now: Date;
   deadline: Deadline;
+  /**
+   * What the deadline was multiplied by (patienceOf). The two reserves that are
+   * kept back from a deadline for the work after a sync are multiplied by it
+   * as well: see sessionStart and refreshFirst.
+   */
+  patience: number;
 }
 
 interface Prepared {
@@ -453,8 +495,10 @@ function replacesIntent(session: LocalSession, intent: string): boolean {
 
 /**
  * Waits for one sync, for `budgetMs` at the most. Reaching that abandons the
- * wait and never the sync. syncWithin keeps to the budget itself when it can
- * run the sync in a process of its own; the timer here holds when it cannot.
+ * wait and not the sync. syncWithin keeps to the budget itself when it can
+ * run the sync in a process of its own, which goes on after the hook; the
+ * timer here holds when it cannot, and then the sync's git calls end with
+ * this process (commands/hook.ts).
  */
 async function syncFor(ctx: Ctx, budgetMs: number): Promise<void> {
   await before(deadlineIn(performance.now(), budgetMs), effects.syncWithin(ctx, budgetMs));
@@ -532,7 +576,8 @@ async function sessionStart(run: Run): Promise<Prepared> {
   try {
     const [identity, touched] = await Promise.all([getIdentity(run.home), touch(run)]);
     const ctx = contextFor(run, identity);
-    const budget = deadline.left() - BRIEFING_RESERVE_MS;
+    // The remote gets what it always gets. Patience is for this machine: it makes the reserve longer, not the wait.
+    const budget = Math.min(SYNC_WAIT_MS, deadline.left() - BRIEFING_RESERVE_MS * run.patience);
     if (budget > 0) await syncFor(ctx, budget);
     else effects.spawnBackgroundSync(run.home, io.self, { force: true });
     const view = await currentView(ctx, id, undefined, viewerOf(run, touched));
@@ -588,42 +633,81 @@ function shortHash(text: string): string {
   return createHash("sha256").update(text).digest("hex").slice(0, 10);
 }
 
-function clip(text: string, max: number): string {
-  if (text.length <= max) return text;
-  const room = max - CUT_NOTE.length - 1;
-  const lineEnd = text.lastIndexOf("\n", room);
-  let end = lineEnd > 0 ? lineEnd : room;
-  const last = text.charCodeAt(end - 1);
-  if (lineEnd <= 0 && last >= 0xd800 && last <= 0xdbff) end--; // do not split a surrogate pair
-  return `${text.slice(0, end)}\n${CUT_NOTE}`;
+/** What stands for a session in the memory of a warning. */
+function markOf(overlap: Overlap): string {
+  return shortHash(`${overlap.session.actor}/${overlap.session.id}`);
 }
 
+function marksOf(found: Overlap[]): string {
+  return found.map(markOf).sort().join(",");
+}
+
+/** A path of an edit with sessions on it that there is something to say about. */
+interface Contested {
+  key: string;
+  path: string;
+  /** Every session that overlaps the path: the ones this session has not been told about first, then the others. */
+  found: Overlap[];
+  /** How many of them, from the first, it has not been told about. */
+  fresh: number;
+}
+
+/** The last line of a warning that has no room for every path. A path that is not edited yet is not in flight, so `huddle check` needs to be given it. */
 function moreNote(count: number): string {
-  return `[huddle] ${count} more of the paths in this edit overlap teammates' work as well: run \`huddle check\`.`;
+  return `[huddle] ${count} more of the paths in this edit overlap teammates' work as well: run \`huddle check\` with those paths.`;
+}
+
+/** The line after the block of a path that has more sessions on it than the block names. The path is shown as the block's first line shows it. */
+function unnamedNote(count: number, path: string): string {
+  return `[huddle] ${count} more ${count === 1 ? "session overlaps" : "sessions overlap"} ${shownText(path, 200)} as well: run \`huddle check\` with the path as it is in the repository to see them all.`;
 }
 
 /**
- * One text from the warnings of an edit, one block per path, that is never
- * longer than MAX_WARNING_CHARS. `shown` is how many of the blocks are in it,
- * from the first: at most MAX_WARNING_PATHS, and fewer when they do not fit.
- * The rest are counted in a last line. The first block is always in, cut
- * short if it has to be.
+ * One text from the warnings of an edit, one block per path, that keeps to
+ * MAX_WARNING_CHARS. `named` has one entry for each path that got a block,
+ * from the first: how many of the path's sessions the block names, from the
+ * first. At most MAX_WARNING_PATHS paths get one, and fewer when they do not
+ * fit; the rest are counted in a last line.
+ *
+ * The first path is always in. When its block is too long, it names the
+ * sessions that are new to this session, as many of them as fit, and counts
+ * the others. One session always fits: what a line is made of is cut to
+ * lengths that see to it (core/render.ts).
  */
-function composeWarning(blocks: string[]): { text: string; shown: number } {
-  const first = blocks[0];
-  if (first === undefined) return { text: "", shown: 0 };
-  /** Room for the line that counts the blocks left out, when `rest` of them are. */
+function composeWarning(contested: Contested[], now: Date): { text: string; named: number[] } {
+  const first = contested[0];
+  if (first === undefined) return { text: "", named: [] };
+  /** Room for the line that counts the paths left out, when `rest` of them are. */
   const roomFor = (rest: number): number => MAX_WARNING_CHARS - (rest > 0 ? moreNote(rest).length + 1 : 0);
-  let text = clip(first, roomFor(blocks.length - 1));
-  let shown = 1;
-  while (shown < Math.min(blocks.length, MAX_WARNING_PATHS)) {
-    const longer = `${text}\n${blocks[shown] ?? ""}`;
-    if (longer.length > roomFor(blocks.length - shown - 1)) break;
-    text = longer;
-    shown++;
+  const block = (one: Contested, count: number): string => {
+    const rest = one.found.length - count;
+    return lines(renderOverlaps(one.path, one.found.slice(0, count), now), rest > 0 ? unnamedNote(rest, one.path) : "");
+  };
+
+  const room = roomFor(contested.length - 1);
+  let count = first.found.length;
+  if (block(first, count).length > room) {
+    // Not all of them, then: the ones that are new, or as many of those as fit. A block grows with each session it
+    // names, so the search can halve.
+    let fits = 1;
+    let over = Math.min(first.fresh + 1, count);
+    while (over - fits > 1) {
+      const middle = Math.floor((fits + over) / 2);
+      if (block(first, middle).length <= room) fits = middle;
+      else over = middle;
+    }
+    count = fits;
   }
-  const rest = blocks.length - shown;
-  return { text: rest > 0 ? `${text}\n${moreNote(rest)}` : text, shown };
+  let text = block(first, count);
+  const named = [count];
+  for (const next of contested.slice(1, MAX_WARNING_PATHS)) {
+    const longer = `${text}\n${block(next, next.found.length)}`;
+    if (longer.length > roomFor(contested.length - named.length - 1)) break;
+    text = longer;
+    named.push(next.found.length);
+  }
+  const rest = contested.length - named.length;
+  return { text: rest > 0 ? `${text}\n${moreNote(rest)}` : text, named };
 }
 
 /** Drops the oldest remembered warnings once there are more than MAX_WARNED_PATHS. Edits `items`. */
@@ -640,9 +724,13 @@ function capWarned(items: Record<string, string>): Record<string, string> {
  * A path is warned about when a session overlaps it that this session has not
  * been told about for that path yet. So ten edits of one contested file give
  * one warning, a second teammate arriving on the file gives another, and a
- * session-start (a new or compacted context) starts over. Told means spelled
- * out: a path that was only counted, because the edit named more overlapping
- * paths than one warning holds, is warned about again at the next edit.
+ * session-start (a new or compacted context) starts over. The sessions it has
+ * not been told about come first in the warning.
+ *
+ * Told means spelled out. A path that was only counted, because the edit
+ * named more overlapping paths than one warning holds, is warned about again
+ * at the next edit. So is a path with more sessions on it than its block had
+ * room to name: the next warning names the ones that were only counted.
  *
  * A subagent is always warned and nothing is remembered for it: its context is
  * not the session's, and it does not last. The same goes for an event that
@@ -664,9 +752,10 @@ async function overlapWarning(run: Run, targets: string[], brief = false): Promi
   const mine = run.away ? local.sessions.find((session) => session.id === id) : undefined;
   const view = await currentView(contextFor(run, identity), id, local, mine?.worktree ?? paths.worktree);
 
+  // Nothing is remembered for an event that does not speak for the session, so to it every session is new.
   const items: Record<string, string> = { ...(since?.items ?? {}) };
-  /** The paths with something to say, each with what is remembered once it has been said. */
-  const news: Array<{ key: string; value: string; block: string }> = [];
+  /** The paths with something to say. */
+  const news: Contested[] = [];
   let changed = false;
   for (const path of targets) {
     const key = WARNED + path;
@@ -678,22 +767,24 @@ async function overlapWarning(run: Run, targets: string[], brief = false): Promi
       }
       continue;
     }
-    const who = found.map((overlap) => shortHash(`${overlap.session.actor}/${overlap.session.id}`)).sort();
-    const value = who.join(",");
-    const told = new Set((Object.hasOwn(items, key) ? (items[key] ?? "") : "").split(","));
-    if (!remember || who.some((one) => !told.has(one))) {
-      news.push({ key, value, block: renderOverlaps(path, found, now) });
-    } else if (items[key] !== value) {
+    const told = new Set(Object.hasOwn(items, key) ? (items[key] ?? "").split(",") : []);
+    const fresh = found.filter((overlap) => !told.has(markOf(overlap)));
+    if (fresh.length > 0) {
+      news.push({ key, path, found: [...fresh, ...found.filter((overlap) => told.has(markOf(overlap)))], fresh: fresh.length });
+    } else if (items[key] !== marksOf(found)) {
       // Nobody new, but somebody left: forgotten, so that their return is news again.
-      items[key] = value;
+      items[key] = marksOf(found);
       changed = true;
     }
   }
 
-  const { text, shown } = composeWarning(news.map((one) => one.block));
+  const { text, named } = composeWarning(news, now);
   if (remember) {
-    for (const { key, value } of news.slice(0, shown)) {
-      items[key] = value;
+    for (const [index, count] of named.entries()) {
+      const one = news[index];
+      if (one === undefined) continue;
+      // Told about: the sessions this warning names, and the ones an earlier warning named that are still there.
+      items[one.key] = marksOf(one.found.filter((_, position) => position < count || position >= one.fresh));
       changed = true;
     }
   }
@@ -748,12 +839,22 @@ async function refreshFirst(run: Run): Promise<boolean> {
     const stamp = waitStamp(paths);
     const waitedAgo = now.getTime() - Date.parse((await readFile(stamp, "utf8").catch(() => "")).trim());
     if (waitedAgo >= 0 && waitedAgo < STALE_AFTER_MS) return false;
-    const budget = Math.min(MAX_REFRESH_WAIT_MS, Math.floor(deadline.left()) - CHECK_RESERVE_MS);
-    if (budget <= 0) return false;
+    // What the wait may take, counted from this moment. Patience is for this machine: it makes what is kept back
+    // for the check longer, and the wait for the remote stays what it is.
+    const room = (): number => Math.min(MAX_REFRESH_WAIT_MS, Math.floor(deadline.left()) - CHECK_RESERVE_MS * run.patience);
+    if (room() <= 0) return false;
     // Recorded first: if it cannot be, there is no limit on how often this would wait, so it does not wait at all.
     await ensureStateDir(paths);
     await writeFileAtomic(stamp, now.toISOString());
-    await syncFor(contextFor(run, await getIdentityFast(run.home)), budget);
+    const ctx = contextFor(run, await getIdentityFast(run.home));
+    // Counted again: recording it took time as well, and that is not taken from the check.
+    const budget = room();
+    if (budget <= 0) {
+      // No wait is going to happen, so none stays recorded: the next commit may still make it.
+      await rm(stamp, { force: true }).catch(() => {});
+      return false;
+    }
+    await syncFor(ctx, budget);
     return true;
   } catch (error) {
     log(paths, "hook", "pre-edit: could not refresh the team state first", error);
@@ -866,7 +967,7 @@ async function ambientSession(run: Run): Promise<string> {
   return (await resolveSession({ ...ctx, paths: run.paths })).id;
 }
 
-async function prepare(event: HookEvent, io: Io, deadline: Deadline, trace: Trace): Promise<Prepared> {
+async function prepare(event: HookEvent, io: Io, deadline: Deadline, patience: number, trace: Trace): Promise<Prepared> {
   if (typeof event.type !== "string" || !Object.hasOwn(DEADLINE_MS, event.type)) return { outcome: {} };
   const ambient = event.ambient === true;
   const named = ambient ? "" : sessionIdOf(event.sessionId);
@@ -886,6 +987,7 @@ async function prepare(event: HookEvent, io: Io, deadline: Deadline, trace: Trac
     passive: ambient || event.subagent === true,
     now: clockNow(io.env),
     deadline,
+    patience,
   };
   if (ambient) run.id = await ambientSession(run);
   if (run.id === "") return { outcome: {} };
@@ -912,7 +1014,9 @@ async function prepare(event: HookEvent, io: Io, deadline: Deadline, trace: Trac
 async function commit(prepared: Prepared, deadline: Deadline, trace: Trace, type: unknown): Promise<void> {
   if (prepared.commit === undefined) return;
   try {
-    await before(deadline, prepared.commit());
+    const recorded = await before(deadline, prepared.commit());
+    // The write may still land. If it does not, the session is told the same thing once more.
+    if (!recorded.done) log(trace.paths, "hook", `${String(type)}: its deadline passed before what was shown was on record`);
   } catch (error) {
     log(trace.paths, "hook", `${String(type)}: could not record what was shown`, error);
   }
@@ -928,9 +1032,10 @@ export async function handleEvent(event: HookEvent, io: Io): Promise<HookOutcome
   const trace: Trace = { paths: null };
   lastTrace = trace;
   try {
-    const budget = deadlineFor(event);
+    const patience = patienceOf(io);
+    const budget = deadlineFor(event, patience);
     const deadline = deadlineIn(performance.now(), budget);
-    const prepared = await before(deadline, prepare(event, io, deadline, trace));
+    const prepared = await before(deadline, prepare(event, io, deadline, patience, trace));
     if (!prepared.done) {
       log(trace.paths, "hook", `${event.type}: gave up at its deadline of ${budget} ms`);
       return {};
@@ -1001,14 +1106,16 @@ export async function runHook(args: string[], io: Io): Promise<number> {
       return EXIT.OK;
     }
 
-    const stdin = await before(deadlineIn(started, STDIN_WAIT_MS + 50), io.readStdin({ timeoutMs: STDIN_WAIT_MS, json: true }));
+    const patience = patienceOf(io);
+    const stdinWait = STDIN_WAIT_MS * patience;
+    const stdin = await before(deadlineIn(started, stdinWait + 50), io.readStdin({ timeoutMs: stdinWait, json: true }));
     if (!stdin.done) return EXIT.OK;
     const event = adapter.parse({ args: rest, stdin: stdin.value, env: io.env, cwd: io.cwd });
     if (event === null || typeof event !== "object") return EXIT.OK; // not an event huddle cares about
 
-    const budget = deadlineFor(event);
+    const budget = deadlineFor(event, patience);
     const deadline = deadlineIn(started, budget);
-    const prepared = await before(deadline, prepare(event, io, deadline, trace));
+    const prepared = await before(deadline, prepare(event, io, deadline, patience, trace));
     if (!prepared.done) {
       log(trace.paths, "hook", `${event.type}: gave up at its deadline of ${budget} ms`);
       return EXIT.OK;

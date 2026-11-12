@@ -4,7 +4,10 @@
 //   - Never prompt: GIT_TERMINAL_PROMPT=0, no askpass, ssh in batch mode. A hook
 //     must not hang on a credential prompt.
 //   - Every call has a timeout, and a timed-out call takes its whole process
-//     group with it (git's ssh child would otherwise outlive git).
+//     group with it (git's ssh child would otherwise outlive git): SIGTERM,
+//     on which git removes its lock files, and SIGKILL if git still runs two
+//     seconds later. The timeout is a timer in this process, so a process that
+//     exits without waiting for a call ends it first (endRunningGits).
 //   - No surprise writes: gc and maintenance are off, and optional locks are off
 //     so that `git status` does not rewrite the index behind the user's back.
 //   - Inherited GIT_DIR / GIT_INDEX_FILE / ... are dropped. huddle runs inside
@@ -179,6 +182,29 @@ export async function gitOut(args: string[], opts: GitOptions): Promise<string> 
   return result.stdout.replace(/\r?\n$/, "");
 }
 
+/**
+ * How long a git that was asked to stop has before it is killed. Git needs a
+ * moment to remove its lock files; one that takes longer is stuck.
+ */
+export const STOP_GRACE_MS = 2000;
+
+/** How to stop each git call that has not settled yet. See endRunningGits. */
+const running = new Set<() => void>();
+
+/**
+ * Ends every git call of this process that is still running, the way a call
+ * that times out is ended (see stopGit in run). For a process that is about to
+ * exit without waiting for its calls, as a hook does at its deadline: the
+ * timeout of each call is a timer in this process, and once the process is
+ * gone nothing would end a git that hangs. Synchronous, so that it can run in
+ * an "exit" listener. A process that exits right after it sends only the
+ * SIGTERM: it is gone before a SIGKILL would be due. The calls it ends settle
+ * as failed.
+ */
+export function endRunningGits(): void {
+  for (const stop of running) stop();
+}
+
 function run(args: string[], opts: GitOptions, env: NodeJS.ProcessEnv): Promise<GitResult> {
   const timeoutMs = opts.timeoutMs ?? (opts.network ? networkTimeout() : LOCAL_TIMEOUT_MS);
   // Its own process group on POSIX, so a timeout can kill git and its ssh child together.
@@ -190,11 +216,13 @@ function run(args: string[], opts: GitOptions, env: NodeJS.ProcessEnv): Promise<
     let bytes = 0;
     let settled = false;
     let timer: NodeJS.Timeout | undefined;
+    let stop: (() => void) | undefined;
 
     const settle = (code: number, timedOut: boolean, note?: string) => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      if (stop) running.delete(stop);
       const stderr = Buffer.concat(err).toString("utf8");
       resolve({
         ok: code === 0 && !timedOut,
@@ -219,31 +247,55 @@ function run(args: string[], opts: GitOptions, env: NodeJS.ProcessEnv): Promise<
       return;
     }
 
-    const kill = () => {
+    const signal = (name: NodeJS.Signals) => {
       try {
-        if (ownGroup && child.pid !== undefined) process.kill(-child.pid, "SIGKILL");
+        if (ownGroup && child.pid !== undefined) process.kill(-child.pid, name);
         // Windows has no process groups to signal: this ends git but not the ssh or
         // credential helper it started. Those end by themselves through the ssh and
         // http limits set above.
-        else child.kill("SIGKILL");
+        else child.kill(name);
       } catch {
         // Already gone.
       }
-      // A grandchild may still hold the pipes open; do not wait for 'close'.
-      child.stdout?.destroy();
-      child.stderr?.destroy();
     };
 
-    timer = setTimeout(() => {
-      kill();
-      settle(-1, true, `timed out after ${timeoutMs} ms`);
-    }, timeoutMs);
+    // Signals go to git only while it runs: once it has exited, the number of its
+    // process group may be given to another process.
+    const runs = () => child.exitCode === null && child.signalCode === null;
+    let grace: NodeJS.Timeout | undefined;
+    child.once("exit", () => clearTimeout(grace));
+
+    /**
+     * Ends git: SIGTERM to its process group, on which git removes the lock
+     * files it holds (after a SIGKILL a ref's lock would stay, and every later
+     * update of that ref would fail until someone deletes it by hand), and ssh
+     * or the http helper ends with it. If git still runs STOP_GRACE_MS later,
+     * SIGKILL. Every way a call is ended goes through here.
+     */
+    const stopGit = () => {
+      if (!runs() || grace !== undefined) return;
+      signal("SIGTERM");
+      grace = setTimeout(() => {
+        if (runs()) signal("SIGKILL");
+      }, STOP_GRACE_MS);
+    };
+    stop = stopGit;
+    running.add(stopGit);
+
+    /** For a call that settles now, while git may still run. A grandchild may hold the pipes open, so they are not waited for. */
+    const abandon = (note: string, timedOut: boolean) => {
+      stopGit();
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      settle(-1, timedOut, note);
+    };
+
+    timer = setTimeout(() => abandon(`timed out after ${timeoutMs} ms`, true), timeoutMs);
 
     const collect = (into: Buffer[]) => (chunk: Buffer) => {
       bytes += chunk.length;
       if (bytes > MAX_OUTPUT_BYTES) {
-        kill();
-        settle(-1, false, "git output too large");
+        abandon("git output too large", false);
         return;
       }
       into.push(chunk);
