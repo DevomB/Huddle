@@ -665,7 +665,7 @@ test("install: a command of the user's that runs huddle's hook among other thing
   const chained = { command: "node .huddle/huddle.mjs hook cursor stop; .cursor/hooks/notify.sh", timeout: 30, loop_limit: 3 };
   const after = { command: ".cursor/hooks/format.sh && node .huddle/huddle.mjs hook cursor afterFileEdit" };
   const mention = { command: "echo 'TODO: node .huddle/huddle.mjs hook cursor is noisy' >> notes.txt" };
-  const theirs = { version: 1, hooks: { stop: [chained], afterFileEdit: [after], sessionEnd: [mention] } };
+  const theirs = { version: 1, hooks: { stop: [chained], afterFileEdit: [after], postToolUse: [mention] } };
   const { root, file } = await scratchRepo(t, theirs);
   const result = await cursor.install({ repoRoot: root, bundle: BUNDLE });
   assert.deepEqual(result.changed, [".cursor/hooks.json"]);
@@ -674,13 +674,13 @@ test("install: a command of the user's that runs huddle's hook among other thing
   // Each is where it was, as it was, and huddle's own handler stands next to it.
   assert.deepEqual(hooks.stop, [chained, handler("stop", 5)]);
   assert.deepEqual(hooks.afterFileEdit, [after, handler("afterFileEdit", 5)]);
-  assert.deepEqual(hooks.sessionEnd, [mention, handler("sessionEnd", 5)]);
+  assert.deepEqual(hooks.postToolUse, [mention, handler("postToolUse", 5, { matcher: "Write|Delete|Shell" })]);
   assert.deepEqual(withoutHuddle(merged), theirs, "taking huddle's handlers out again gives back the original");
   assert.deepEqual(countOurs(merged), ONE_EACH);
 
   // The user is told that the hook may now run twice, by init and by doctor, every time.
   const twice =
-    "In .cursor/hooks.json, a hook command of your own under stop, afterFileEdit, sessionEnd also names huddle's hook. huddle left it as it is and has its own handler next to it. If yours runs huddle's hook, the hook now runs twice on that event: take it out of yours.";
+    "In .cursor/hooks.json, a hook command of your own under stop, afterFileEdit, postToolUse also names huddle's hook. huddle left it as it is and has its own handler next to it. If yours runs huddle's hook, the hook now runs twice on that event: take it out of yours.";
   assert.equal(result.notes.length, 5);
   assert.equal(result.notes[4], twice);
   const text = await readFile(file, "utf8");
