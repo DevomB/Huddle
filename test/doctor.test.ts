@@ -598,7 +598,8 @@ test("git's own error text is shown without its unhelpful ending and without cre
   await writeFile(fakeSsh, "#!/bin/sh\necho \"proxy: cannot reach https://bot:leaky-token@proxy.example/x\" >&2\nexit 255\n");
   await chmod(fakeSsh, 0o755);
   await alice.git("remote", "set-url", "origin", "ssh://git@huddle.invalid/team/repo.git");
-  await alice.git("config", "core.sshCommand", fakeSsh);
+  // core.sshCommand is a shell command line, and the harness's directories have a space in their names.
+  await alice.git("config", "core.sshCommand", `'${fakeSsh.replace(/'/g, "'\\''")}'`);
   const r = await alice.huddle(["doctor"]);
   assert.equal(r.code, 1);
   assert.match(r.stdout, /cannot reach remote "origin" \(ssh:\/\/\*\*\*@huddle\.invalid\/team\/repo\.git\): proxy: cannot reach https:\/\/\*\*\*@proxy\.example\/x \/ fatal: Could not read from remote repository\./);
