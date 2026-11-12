@@ -65,7 +65,7 @@
 // is not repeated before every edit of the same file.
 
 import { createHash } from "node:crypto";
-import { appendFile, mkdir, readFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rm } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { ADAPTERS, getAdapter } from "../adapters/index.ts";
 import type { HookEvent, HookEventType, HookOutcome, HookOutput } from "../adapters/types.ts";
@@ -122,7 +122,12 @@ const STDIN_WAIT_MS = 300;
 const BRIEFING_RESERVE_MS = 300;
 /** The longest session-start waits for that sync: the rest of its deadline, which patience does not make longer. */
 const SYNC_WAIT_MS = DEADLINE_MS["session-start"] - BRIEFING_RESERVE_MS;
-/** A store lock is not waited for longer than this, nor into the last moments before the deadline. */
+/**
+ * A store lock is not waited for longer than this, nor into the last moments
+ * before the deadline. Patience does not make it longer: it caps the time
+ * spent queueing behind another process of this clone, and what patience adds
+ * to a deadline is meant for the work, not for the queue.
+ */
 const MAX_STORE_WAIT_MS = 1000;
 const STORE_MARGIN_MS = 30;
 /**
@@ -169,18 +174,28 @@ function deadlineIn(startedMs: number, budgetMs: number): Deadline {
 }
 
 /**
- * HUDDLE_HOOK_PATIENCE, a number from 1 to 100: every time limit of a hook is
- * that many times as long. It is for a machine on which hooks keep giving up
- * at their deadlines, which the debug log shows: a slow disk, a scanner that
- * reads every file first, a container on a busy host. It buys time for the
- * machine and none for the network: how long a hook waits for a sync stays as
- * it is (see sessionStart and refreshFirst). Anything that is not such a
- * number counts as 1. Takes whatever it is given.
+ * The most HUDDLE_HOOK_PATIENCE may be. A committed settings file can set the
+ * variable for a whole team, and at 100 one hook that hangs would hold every
+ * agent for 15 s at each edit and for minutes at a session start. 20 is what
+ * the slowest machine these hooks were timed on needed.
+ */
+const MAX_PATIENCE = 20;
+
+/**
+ * HUDDLE_HOOK_PATIENCE, a number from 1 to 20: the deadline of every hook
+ * event, and what an event keeps back from it for its own work, is that many
+ * times as long. It is for a machine on which hooks keep giving up at their
+ * deadlines, which the debug log shows: a slow disk, a scanner that reads
+ * every file first, a container on a busy host. It buys time for the machine
+ * and none for the network: how long a hook waits for a sync stays as it is
+ * (see sessionStart and refreshFirst), and so does the wait for a store lock
+ * (MAX_STORE_WAIT_MS). Anything that is not such a number counts as 1. Takes
+ * whatever it is given.
  */
 function patienceOf(io: Io | null | undefined): number {
   const env: unknown = io?.env;
   const raw = Number(typeof env === "object" && env !== null ? (env as NodeJS.ProcessEnv).HUDDLE_HOOK_PATIENCE : undefined);
-  return raw >= 1 && raw <= 100 ? raw : 1;
+  return raw >= 1 && raw <= MAX_PATIENCE ? raw : 1;
 }
 
 /**
@@ -644,7 +659,7 @@ function moreNote(count: number): string {
 
 /** The line after the block of a path that has more sessions on it than the block names. The path is shown as the block's first line shows it. */
 function unnamedNote(count: number, path: string): string {
-  return `[huddle] ${count} more ${count === 1 ? "session overlaps" : "sessions overlap"} ${shownText(path, 200)} as well: run \`huddle check\` with that path to see them all.`;
+  return `[huddle] ${count} more ${count === 1 ? "session overlaps" : "sessions overlap"} ${shownText(path, 200)} as well: run \`huddle check\` with the path as it is in the repository to see them all.`;
 }
 
 /**
@@ -834,7 +849,11 @@ async function refreshFirst(run: Run): Promise<boolean> {
     const ctx = contextFor(run, await getIdentityFast(run.home));
     // Counted again: recording it took time as well, and that is not taken from the check.
     const budget = room();
-    if (budget <= 0) return false;
+    if (budget <= 0) {
+      // No wait is going to happen, so none stays recorded: the next commit may still make it.
+      await rm(stamp, { force: true }).catch(() => {});
+      return false;
+    }
     await syncFor(ctx, budget);
     return true;
   } catch (error) {

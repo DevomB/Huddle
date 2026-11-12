@@ -17,6 +17,13 @@
 //     letters: "key=value" is how people write about maps
 //   - a random run that no name announces and that is shorter than 24
 //     characters, has punctuation in it, or is broken by a line wrap
+//   - a longer run of that kind in which letters and digits change places
+//     fewer than three times: about one random 40-character base64 key in a
+//     hundred, and one 24-character base62 key in ten
+//   - a password in a URL that is not behind a ":" (a token as the user name
+//     goes only when it has a digit in it or is long)
+//   - credentials inside another encoding, such as the base64 "auth" value of
+//     a Docker config file
 //   - the one-letter flags of particular tools, other than -p after -u,
 //     sshpass -p and curl -u
 //   - text written to get past it: a character that only looks like "=", an
@@ -118,8 +125,11 @@ const HAS_WEAK = new RegExp(WEAK);
 // ---------------------------------------------------------------------------
 
 /**
- * -u name -p value, as mysql and `docker login` take it, with or without the
- * blanks. Only after a -u: a -p alone is a port, or "parents", or "preserve".
+ * -u name -p value, as `docker login` takes it, and -u name -pvalue, as mysql
+ * does. Only after a -u: a -p alone is a port, or "parents", or "preserve".
+ * mysql reads the word after "-p " as the database and asks for the password,
+ * so with a blank the word goes only when it looks like a secret; that blurs
+ * a database name with a digit in it, which costs a teammate nothing.
  */
 const USER_THEN_P = /(?<![\w-])(-u\s?[^\s-]\S{0,80}\s+-p)(\s?)(\S+)/g;
 /** What -p means for docker: 8080, 8080:80, 127.0.0.1:8080:80/tcp. */
@@ -141,9 +151,10 @@ const PEM_BLOCK = /-----BEGIN [A-Z0-9 ]{1,40}-----[\s\S]*?(?:-----END [A-Z0-9 ]{
 /**
  * A user name and password in front of the host of a URL. What is kept is the
  * scheme. The password ends at the last "@" before the path: one that has an
- * "@" in it should have been written %40, and often is not.
+ * "@" in it should have been written %40, and often is not. The user name may
+ * be empty, as Redis URLs have it (redis://:password@host).
  */
-const URL_CREDENTIALS = /\b([a-z][a-z0-9+.-]{1,20}:\/\/)[^\s/:@]{1,256}:[^\s/]{1,256}@/gi;
+const URL_CREDENTIALS = /\b([a-z][a-z0-9+.-]{1,20}:\/\/)[^\s/:@]{0,256}:[^\s/]{1,256}@/gi;
 /** A URL with nothing but a user name in front of the host. A token is used that way (https://<token>@host); so is "git". */
 const URL_USER = /\b([a-z][a-z0-9+.-]{1,20}:\/\/)([^\s/:@]{1,256})@/gi;
 
@@ -250,6 +261,25 @@ function looksEncoded(value: string): boolean {
   return /[0-9]|[a-z][A-Z]|=$/.test(value) || value.length >= 16;
 }
 
+export interface ScrubOptions {
+  /**
+   * For text that is refused when the scrub would change it (a decision, a
+   * task title) rather than blurred. There one false alarm costs the whole
+   * command, so the rules that ordinary sentences set off count only when the
+   * value also looks random (see nextTo): "Primary key: uuid7 for all new
+   * tables" and "Auth: oauth2 with PKCE only" pass as typed. What needs no
+   * such judgement counts as always: a name that says secret, token or
+   * password with "=" or ":", known token prefixes, a password in a URL, an
+   * Authorization value, a key block, a long random run.
+   */
+  durable?: boolean;
+}
+
+/** A value without the quotes around it, and without what may follow the closing one. */
+function unquoted(value: string): string {
+  return /^["']/.test(value) ? value.slice(1).replace(/["'][.,;:)\]}]?$/, "") : value;
+}
+
 /**
  * `text` with everything that looks like a credential replaced by
  * "[redacted]": PEM blocks, passwords and tokens inside URLs, Authorization
@@ -259,17 +289,22 @@ function looksEncoded(value: string): boolean {
  * lines, and long runs that look random.
  *
  * Best effort (see the top of this file). It errs towards redacting: a commit
- * id or a UUID goes too, which costs a teammate nothing.
+ * id or a UUID goes too, which costs a teammate nothing. With `durable` it
+ * errs less (see ScrubOptions), because there a change refuses the text.
  */
-export function scrubSecrets(text: string): string {
-  const named = (weak: boolean) => (match: string, label: string, value: string) => (looksSecret(value, weak) ? `${label}${REDACTED}` : match);
+export function scrubSecrets(text: string, opts: ScrubOptions = {}): string {
+  const durable = opts.durable === true;
+  /** The extra bar for a rule that sentences set off, in durable text. */
+  const random = (value: string): boolean => !durable || nextTo(unquoted(value));
+  const named = (weak: boolean) => (match: string, label: string, value: string) =>
+    looksSecret(value, weak) && (weak ? random(value) : !(durable && SMALL_NUMBER.test(value))) ? `${label}${REDACTED}` : match;
   return text
     .replace(PEM_BLOCK, REDACTED)
     .replace(URL_CREDENTIALS, `$1${REDACTED}@`)
-    .replace(URL_USER, (match, scheme: string, user: string) => (looksSecret(user) ? `${scheme}${REDACTED}@` : match))
+    .replace(URL_USER, (match, scheme: string, user: string) => (looksSecret(user) && random(user) ? `${scheme}${REDACTED}@` : match))
     .replace(AUTH_HEADER, (match, head: string, value: string) => (looksEncoded(value) ? `${head}${REDACTED}` : match))
     .replace(AUTH_SCHEME, (match, scheme: string, gap: string, value: string) => (/[0-9]/.test(value) ? `${scheme}${gap}${REDACTED}` : match))
-    .replace(COOKIE, (match, head: string, first: string) => (looksSecret(first, true) ? `${head}${REDACTED}` : match))
+    .replace(COOKIE, (match, head: string, first: string) => (looksSecret(first, true) && random(first) ? `${head}${REDACTED}` : match))
     .replace(KNOWN_TOKEN, REDACTED)
     .replace(PREFIXED_KEY, (match) => (/[0-9]/.test(match) ? REDACTED : match))
     .replace(CONFIG_LINE, (match, head: string, name: string, separator: string) =>
@@ -279,25 +314,38 @@ export function scrubSecrets(text: string): string {
       equals === "=" || looksSecret(value) ? `${name}${equals}${REDACTED}` : match,
     )
     .replace(ASSIGNED_WEAK, (match, name: string, equals: string, value: string) =>
-      (equals === "=" && ENV_NAME.test(name)) || looksSecret(value, true) ? `${name}${equals}${REDACTED}` : match,
+      (equals === "=" && ENV_NAME.test(name)) || (looksSecret(value, true) && random(value)) ? `${name}${equals}${REDACTED}` : match,
     )
     .replace(ROCKET, `$1${REDACTED}`)
     .replace(LABELLED_STRONG, named(false))
     .replace(LABELLED_WEAK, named(true))
     // In a sentence a small number is a length or a count, whatever word it follows: "the password is 8 characters".
-    .replace(STATED_STRONG, (match, label: string, value: string) => (!SMALL_NUMBER.test(value) && looksSecret(value) ? `${label}${REDACTED}` : match))
+    .replace(STATED_STRONG, (match, label: string, value: string) =>
+      !SMALL_NUMBER.test(value) && looksSecret(value) && random(value) ? `${label}${REDACTED}` : match,
+    )
     .replace(STATED_WEAK, named(true))
     .replace(FLAG_STRONG, (match, flag: string, value: string) => (!PATH_LIKE.test(value) && looksSecret(value) ? `${flag}${REDACTED}` : match))
-    .replace(FLAG_WEAK, (match, flag: string, value: string) => (!PATH_LIKE.test(value) && looksSecret(value, true) ? `${flag}${REDACTED}` : match))
+    .replace(FLAG_WEAK, (match, flag: string, value: string) =>
+      !PATH_LIKE.test(value) && looksSecret(value, true) && random(value) ? `${flag}${REDACTED}` : match,
+    )
     .replace(NEXT_TO, (match, name: string, value: string) => (nextTo(value) ? `${name}${REDACTED}` : match))
     .replace(SSHPASS, `$1${REDACTED}`)
     .replace(USER_THEN_P, (match, head: string, gap: string, value: string) =>
-      !PORTS.test(value) && (gap === "" || looksSecret(value)) ? `${head}${gap}${REDACTED}` : match,
+      !PORTS.test(value) && (gap === "" || (looksSecret(value) && random(value))) ? `${head}${gap}${REDACTED}` : match,
     )
     .replace(USER_COLON, (match, head: string, value: string) => (looksSecret(value, true) ? `${head}${REDACTED}` : match))
     .replace(HEX_RUN, REDACTED)
     .replace(BASE64_RUN, (run) => (/[+/]/.test(run) && /[a-z]/.test(run) && /[A-Z]/.test(run) && mixing(run) >= RANDOM_LOOKING ? REDACTED : run))
     .replace(TOKEN_RUN, (run) => (mixing(run) >= RANDOM_LOOKING ? REDACTED : run));
+}
+
+/**
+ * True when `text` holds something that looks like a credential by the bar
+ * for durable shared text (ScrubOptions.durable). `huddle decide` and task
+ * titles refuse such text instead of publishing it.
+ */
+export function hasCredential(text: string): boolean {
+  return scrubSecrets(text, { durable: true }) !== text;
 }
 
 /**
