@@ -16,7 +16,7 @@ import { loadConfigReport, settingsHome } from "../core/paths.ts";
 import { readCache, readLocal } from "../core/store.ts";
 import { actorRef, REF_PATTERN } from "../core/types.ts";
 import type { ActorDoc } from "../core/types.ts";
-import { BUNDLE, bundleVersion, unsharedNotes } from "./init.ts";
+import { BUNDLE, bundleVersion, CONFIG, isJsonObject, unsharedNotes } from "./init.ts";
 
 export const summary = "Check that huddle can work here: remote, push access, hooks, last sync";
 
@@ -111,10 +111,9 @@ async function setUpElsewhere(ctx: Ctx): Promise<string | null> {
   return home.worktree === ctx.paths.worktree ? null : home.worktree;
 }
 
-async function bundle(ctx: Ctx): Promise<Check> {
+async function bundle(ctx: Ctx, elsewhere: string | null): Promise<Check> {
   const vendored = await readText(ctx.paths.bundleFile);
   if (vendored === null) {
-    const elsewhere = await setUpElsewhere(ctx);
     if (elsewhere !== null) {
       // Running init here would set huddle up a second time, on this branch, and conflict with the first when the two meet.
       return check("bundle", "warn", `${BUNDLE} is missing in this checkout; ${elsewhere} has it`, [
@@ -128,7 +127,9 @@ async function bundle(ctx: Ctx): Promise<Check> {
   if (version === null) return check("bundle", "fail", `${BUNDLE} is not a huddle bundle`, ['run "huddle init" to replace it']);
   const tracked = await git(["ls-files", "--error-unmatch", "--", BUNDLE], { cwd: ctx.paths.worktree });
   if (!tracked.ok) {
-    return check("bundle", "warn", `${BUNDLE} (huddle ${version}) is not committed`, [`git add .huddle && git commit: teammates get huddle by pulling it`]);
+    // Under an ignore rule a plain git add refuses the file; the note gives the command that works.
+    const gaps = await unsharedNotes(ctx.paths.worktree, [BUNDLE]);
+    return check("bundle", "warn", `${BUNDLE} (huddle ${version}) is not committed`, gaps.length > 0 ? gaps : [`git add ${BUNDLE} && git commit: teammates get huddle by pulling it`]);
   }
   // Tracked says only that some version of the file is committed, not that this one is.
   const dirty = await git(["status", "--porcelain", "--", BUNDLE], { cwd: ctx.paths.worktree });
@@ -144,18 +145,22 @@ async function bundle(ctx: Ctx): Promise<Check> {
   return check("bundle", "ok", `${BUNDLE} is huddle ${version} and committed`);
 }
 
-async function config(ctx: Ctx): Promise<Check> {
+async function config(ctx: Ctx, elsewhere: string | null): Promise<Check> {
   const c = ctx.config;
   const detail = `remote ${c.remote}, base ${c.base}, sync every ${c.syncIntervalSeconds}s, heartbeat ${c.heartbeatMinutes}m, sessions expire after ${c.ttlMinutes}m, mode ${c.mode}`;
   const capture = c.captureIntent
     ? "prompt capture is on: the first 200 characters of each prompt are shared with everyone who can read this repo (captureIntent: false turns it off)"
     : "prompt capture is off: agents announce what they are doing with huddle intent";
   // The settings in force are those of a set-up checkout of the clone when this one has none; so are their problems.
-  const elsewhere = await setUpElsewhere(ctx);
   // A settings file that cannot be used is skipped, not fatal; what was skipped is said here.
   const { problems } = await loadConfigReport(await settingsHome(ctx.paths));
   const from = elsewhere === null ? [] : [`this checkout has no .huddle: these are the settings of ${elsewhere}`];
-  return check("config", problems.length > 0 ? "warn" : "info", detail, [...from, ...problems, capture]);
+  // The team's settings as this clone has them, and as teammates do not until they are committed: prompt capture
+  // switched off here and never committed is still on for everyone else. A file that cannot be used is not one to
+  // tell anybody to commit (its problems are above).
+  const team = elsewhere === null ? await readText(ctx.paths.teamConfigFile) : null;
+  const gaps = team !== null && isJsonObject(team) ? await unsharedNotes(ctx.paths.worktree, [CONFIG]) : [];
+  return check("config", problems.length > 0 || gaps.length > 0 ? "warn" : "info", detail, [...from, ...gaps, ...problems, capture]);
 }
 
 /**
@@ -287,11 +292,19 @@ async function pushAccess(ctx: Ctx): Promise<Check> {
   ]);
 }
 
-async function hooks(ctx: Ctx): Promise<Check[]> {
+async function hooks(ctx: Ctx, elsewhere: string | null): Promise<Check[]> {
   const checks: Check[] = [];
+  // On a branch from before huddle, while another checkout of the clone has it, nothing of huddle's can run here and
+  // every adapter's advice ("run huddle init") would set huddle up a second time on this branch. The bundle line says
+  // how the branch gets huddle; until then these lines say only that, and once it has, they are checked as usual.
+  const notYet = (name: string, then: string): Check => check(name, "info", "not on this branch yet", [`this branch does not have huddle yet (see bundle); ${then}`]);
   for (const adapter of ADAPTERS) {
     try {
       const result = await adapter.check(ctx.paths.worktree);
+      if (elsewhere !== null && !result.installed) {
+        checks.push(notYet(`hooks: ${adapter.title}`, "the hooks work here once it does"));
+        continue;
+      }
       // Hooks that work here and are not committed work for nobody else: "everyone else only pulls" is the promise.
       const gaps = result.installed && result.files ? await unsharedNotes(ctx.paths.worktree, result.files) : [];
       // Hooks that are there and cannot work are a problem; an agent nobody set up here is not.
@@ -306,9 +319,14 @@ async function hooks(ctx: Ctx): Promise<Check[]> {
     }
   }
   const agentsMd = await checkAgentsMd(ctx.paths.worktree, { bundle: BUNDLE });
+  if (elsewhere !== null && !agentsMd.installed) {
+    checks.push(notYet("AGENTS.md", "the block comes with it"));
+    return checks;
+  }
   // When AGENTS.md is a link, the block is in the file it points at, and that is the file to commit.
   const gaps = agentsMd.installed ? await unsharedNotes(ctx.paths.worktree, ["AGENTS.md"]) : [];
-  checks.push(check("AGENTS.md", agentsMd.installed ? (gaps.length > 0 ? "warn" : "ok") : "info", agentsMd.detail, [...gaps, ...agentsMd.notes]));
+  const level: Level = agentsMd.installed ? (gaps.length > 0 ? "warn" : "ok") : agentsMd.broken ? "warn" : "info";
+  checks.push(check("AGENTS.md", level, agentsMd.detail, [...gaps, ...agentsMd.notes]));
   return checks;
 }
 
@@ -370,10 +388,11 @@ export async function run(args: string[], io: Io): Promise<number> {
   if (positionals.length > 0) throw new UsageError(`unexpected argument "${positionals[0]}"\nUsage: ${USAGE}`);
 
   const ctx = await openContext(io);
-  const checks: Check[] = [await toolchain(ctx), await bundle(ctx), await config(ctx), ...clock(ctx), await base(ctx)];
+  const elsewhere = await setUpElsewhere(ctx);
+  const checks: Check[] = [await toolchain(ctx), await bundle(ctx, elsewhere), await config(ctx, elsewhere), ...clock(ctx), await base(ctx)];
   if (values.offline) checks.push(check("remote", "info", "not checked (--offline)"));
   else checks.push(...(await remote(ctx)));
-  checks.push(...(await hooks(ctx)), ...(await state(ctx)));
+  checks.push(...(await hooks(ctx, elsewhere)), ...(await state(ctx)));
 
   const failed = checks.filter((c) => c.level === "fail").length;
   const warned = checks.filter((c) => c.level === "warn").length;

@@ -19,7 +19,7 @@ const USAGE = "huddle init [--agent <name>]... [--all] [--remote <name>] [--no-c
 
 /** Repo-relative, forward slashes: what hook configs and AGENTS.md refer to. */
 export const BUNDLE = ".huddle/huddle.mjs";
-const CONFIG = ".huddle/config.json";
+export const CONFIG = ".huddle/config.json";
 const ATTRIBUTES = ".huddle/.gitattributes";
 const AGENTS_MD = "AGENTS.md";
 
@@ -156,7 +156,8 @@ function chooseAdapters(names: string[], all: boolean): Adapter[] | null {
   });
 }
 
-function isJsonObject(text: string): boolean {
+/** Whether a settings file's text is one huddle can use: a JSON object. Doctor uses it too. */
+export function isJsonObject(text: string): boolean {
   try {
     const value: unknown = JSON.parse(text);
     return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -401,7 +402,8 @@ export async function run(args: string[], io: Io): Promise<number> {
     io.out("Next: commit and push these files so your teammates get huddle with their next pull:");
     io.out(`  ${gitHere} add ${toCommit.map(shellWord).join(" ")}`);
     io.out(`  ${gitHere} commit -m "Set up huddle" && ${gitHere} push`);
-    io.out(`Then check the setup with: node ${BUNDLE} doctor`);
+    // From where the user is, like the git lines above: typed in a subdirectory, .huddle/huddle.mjs is not there.
+    io.out(`Then check the setup with: node ${shellWord(relative(io.cwd, resolve(repoRoot, BUNDLE)).split(sep).join("/"))} doctor`);
   }
 
   if (partly) {

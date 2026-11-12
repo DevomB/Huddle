@@ -685,16 +685,18 @@ test("AGENTS.md that is a link to another file in the repository: the file that 
   assert.equal(await clone.git("status", "--porcelain"), "");
   assert.doesNotMatch((await clone.huddle(["init", "--agent", "claude-code"])).stdout, /Next: commit/);
 
-  // A link that leads out of the repository names nothing that cannot be committed from here.
+  // A link that leads out of the repository gets no block (doctor.test.ts has the rest), and the commit line names
+  // nothing that cannot be committed from here.
   const outside = await h.clone("bob");
   await writeFile(join(h.root, "shared-rules.md"), "# Shared\n");
   await rm(join(outside.dir, "AGENTS.md"));
   await symlink(join(h.root, "shared-rules.md"), join(outside.dir, "AGENTS.md"));
   const out = await outside.huddle(["init", "--agent", "claude-code"]);
-  assert.equal(out.code, 0, out.stderr);
+  assert.equal(out.code, 1, "not done: the block has nowhere to go");
+  assert.equal(await readFile(join(h.root, "shared-rules.md"), "utf8"), "# Shared\n");
   const named = (/^ {2}git add (.+)$/m.exec(out.stdout)?.[1] ?? "").split(" ");
-  assert.ok(named.includes("AGENTS.md"), "the link changed, and it is this repository's");
-  assert.ok(!named.some((file) => file.includes("shared-rules")), "its target is not");
+  assert.ok(named.includes(".claude/settings.json"), "what was set up is still offered for the commit");
+  assert.ok(!named.some((file) => file.includes("shared-rules")), "the link's target is not");
 });
 
 test("an older .gitattributes is brought up to date, and other lines in it are kept", async (t) => {
@@ -780,6 +782,9 @@ test("init from a subdirectory sets up the repository root", async (t) => {
   assert.equal(r.code, 0, r.stderr);
   assert.match(await clone.read(".huddle/config.json"), /syncIntervalSeconds/);
   assert.match(r.stdout, /git -C \.\.\/\.\. add \.huddle\/huddle\.mjs /);
+  // The doctor line too is for where the user is.
+  assert.match(r.stdout, /^Then check the setup with: node \.\.\/\.\.\/\.huddle\/huddle\.mjs doctor$/m);
+  assert.equal((await clone.huddle(["doctor", "--offline"], { cwd: "packages/app" })).code, 0, "and doctor does run from there");
 });
 
 test("init refuses to vendor anything that is not a built bundle", async (t) => {

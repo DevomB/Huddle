@@ -1,9 +1,11 @@
 // T2.3: huddle doctor.
 
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { chmod, cp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
+import { agentsMdBlock } from "../src/adapters/agents-md.ts";
 import { redactUrl } from "../src/commands/doctor.ts";
 import { REF_PATTERN } from "../src/core/types.ts";
 import { createHarness } from "./harness.ts";
@@ -189,6 +191,77 @@ test("AGENTS.md that is a link: the file it points at is the one that has to be 
   assert.deepEqual({ level: (await agentsMd()).level, notes: (await agentsMd()).notes }, { level: "ok", notes: [] });
 });
 
+test("AGENTS.md that is a link out of the checkout: init does not write the block there, and doctor says why", { skip: process.platform === "win32" ? "symbolic links" : false }, async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  // A personal rules file kept in one place and linked into several repositories.
+  const outside = join(h.root, "my-rules.md");
+  await writeFile(outside, "# My rules\n");
+  await symlink(outside, join(alice.dir, "AGENTS.md"));
+  await commitAll(h, alice, "my rules");
+
+  const r = await alice.huddle(["init", "--agent", "claude-code"]);
+  assert.equal(r.code, 1, "the setup is not complete");
+  assert.equal(await readFile(outside, "utf8"), "# My rules\n", "the file out there is left as it was");
+  assert.match(r.stderr, /^huddle: not done: AGENTS\.md is a symbolic link to a file outside this checkout \(.*my-rules\.md\)\. huddle does not write the block there: teammates would not get it, and it would reach every other place that file is linked into\./m);
+  assert.doesNotMatch(r.stdout, /^ {2}AGENTS\.md$/m, "not among the files written");
+  assert.doesNotMatch(r.stdout, /add .*AGENTS\.md|my-rules/, "and not in the commit line");
+
+  const agentsMd = async () => find((await doctorJson(alice, ["--offline"])).report, "AGENTS.md");
+  const refused = await agentsMd();
+  assert.equal(refused.level, "warn");
+  assert.match(refused.detail, /^AGENTS\.md is a symbolic link to a file outside this checkout \(.*my-rules\.md\), so a huddle block in it does not reach teammates\. Put a real file in its place/);
+  // The same when the file out there does have the block: it is still nobody else's.
+  await writeFile(outside, `# My rules\n\n${agentsMdBlock({ bundle: ".huddle/huddle.mjs" })}\n`);
+  assert.equal((await agentsMd()).level, "warn");
+
+  // A link out of the checkout to a file that is not there yet: writing through it would create the file out there.
+  await rm(join(alice.dir, "AGENTS.md"));
+  await symlink("../not-yet.md", join(alice.dir, "AGENTS.md"));
+  const dangling = await alice.huddle(["init", "--agent", "claude-code"]);
+  assert.equal(dangling.code, 1);
+  assert.match(dangling.stderr, /AGENTS\.md is a symbolic link to a file outside this checkout \(.*not-yet\.md\)/);
+  assert.equal(existsSync(join(h.root, "not-yet.md")), false);
+});
+
+test("team settings changed and not committed are a warning: teammates go by the committed ones", async (t) => {
+  const { h, alice } = await setUp(t);
+  const config = async () => find((await doctorJson(alice, ["--offline"])).report, "config");
+  assert.equal((await config()).level, "info");
+  // Prompt capture switched off here, and the commit forgotten: for everyone else it is still on.
+  await alice.write(".huddle/config.json", '{ "captureIntent": false }\n');
+  const open = await config();
+  assert.equal(open.level, "warn");
+  assert.deepEqual(open.notes, [
+    ".huddle/config.json is not committed as it is now, so teammates do not get it with a pull: git add .huddle/config.json && git commit",
+    "prompt capture is off: agents announce what they are doing with huddle intent",
+  ]);
+  await commitAll(h, alice, "no prompt capture");
+  assert.deepEqual({ level: (await config()).level, notes: (await config()).notes }, { level: "info", notes: ["prompt capture is off: agents announce what they are doing with huddle intent"] });
+});
+
+test("an ignore rule over .huddle: the bundle and settings lines give the command that works", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  await alice.write(".gitignore", ".huddle/\n");
+  await commitAll(h, alice, "ignore rules");
+  assert.equal((await alice.huddle(["init", "--agent", "claude-code"])).code, 0);
+  // git add -A passes over .huddle without a word.
+  await commitAll(h, alice, "Set up huddle");
+  const { report } = await doctorJson(alice, ["--offline"]);
+  const bundle = find(report, "bundle");
+  assert.equal(bundle.level, "warn");
+  assert.deepEqual(bundle.notes, [
+    ".huddle/huddle.mjs is hidden from git by an ignore rule (.gitignore:1: .huddle/) and is not committed, so teammates do not get it with a pull: change the rule, or git add -f .huddle/huddle.mjs && git commit",
+  ]);
+  const config = find(report, "config");
+  assert.equal(config.level, "warn");
+  assert.equal(
+    config.notes[0],
+    ".huddle/config.json is hidden from git by an ignore rule (.gitignore:1: .huddle/) and is not committed, so teammates do not get it with a pull: change the rule, or git add -f .huddle/config.json && git commit",
+  );
+});
+
 test("the push test leaves no trace when this clone has nothing to announce", async (t) => {
   const { h, alice } = await setUp(t);
   const before = await alice.snapshot();
@@ -362,7 +435,8 @@ test("in a worktree whose branch has no .huddle, doctor says whose settings are 
   const h = await createHarness(t);
   const alice = await h.clone("alice");
   const old = await alice.addWorktree("old"); // a branch from before huddle was set up
-  assert.equal((await alice.huddle(["init", "--agent", "claude-code"])).code, 0);
+  // The git hooks live in the clone's .git/hooks, which this worktree shares.
+  assert.equal((await alice.huddle(["init", "--agent", "claude-code", "--agent", "git"])).code, 0);
   await alice.write(".huddle/config.json", `${JSON.stringify({ ttlMinutes: 45 })}\n`);
   await commitAll(h, alice, "Set up huddle");
 
@@ -377,16 +451,34 @@ test("in a worktree whose branch has no .huddle, doctor says whose settings are 
   assert.match(bundle.notes[0] ?? "", /An agent started here runs no huddle hooks until the branch gets \.huddle: merge or rebase onto the branch that has it\.$/);
   assert.doesNotMatch(bundle.notes.join("\n"), /run "huddle init"/, "a second init on this branch would meet the first in a conflict");
 
+  // The hook lines and AGENTS.md wait for the branch too, and do not repeat that advice either; the git hooks
+  // (installed for the clone, with no bundle here to run) are not a second thing to look at.
+  const waiting = report.checks.filter((c) => c.name.startsWith("hooks: ") || c.name === "AGENTS.md");
+  assert.ok(waiting.some((c) => c.name === "hooks: git hooks") && waiting.length >= 6, waiting.map((c) => c.name).join(", "));
+  for (const line of waiting) assert.deepEqual({ name: line.name, level: line.level, detail: line.detail }, { name: line.name, level: "info", detail: "not on this branch yet" });
+  assert.deepEqual(find(report, "hooks: git hooks").notes, ["this branch does not have huddle yet (see bundle); the hooks work here once it does"]);
+  assert.deepEqual(find(report, "AGENTS.md").notes, ["this branch does not have huddle yet (see bundle); the block comes with it"]);
+  assert.doesNotMatch((await old.huddle(["doctor", "--offline"])).stdout, /huddle init/);
+
   // The checkout that is set up says nothing of the kind.
   const main = (await doctorJson(alice, ["--offline"])).report;
   assert.ok(!find(main, "config").notes.some((note) => note.includes("has no .huddle")));
   assert.equal(find(main, "bundle").level, "ok");
+  const mainClaude = find(main, "hooks: Claude Code");
 
   // A settings file that cannot be used is the same problem seen from either checkout.
   await alice.write(".huddle/config.json", "{ broken");
   const broken = find((await doctorJson(old, ["--offline"])).report, "config");
   assert.equal(broken.level, "warn");
   assert.ok(broken.notes.some((note) => /^\.huddle\/config\.json is not valid JSON/.test(note)), broken.notes.join("\n"));
+
+  // Once the branch has huddle, its lines are checked as in any set-up checkout.
+  await old.git("-c", `core.hooksPath=${join(h.root, "no-hooks")}`, "merge", "--quiet", "main");
+  const merged = (await doctorJson(old, ["--offline"])).report;
+  assert.equal(find(merged, "bundle").level, "ok");
+  const claude = find(merged, "hooks: Claude Code");
+  assert.deepEqual({ level: claude.level, detail: claude.detail }, { level: mainClaude.level, detail: mainClaude.detail });
+  assert.equal(find(merged, "AGENTS.md").level, "ok");
 });
 
 test("no base branch to compare with is a warning that says what is lost and how to fix it", async (t) => {
