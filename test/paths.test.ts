@@ -81,6 +81,16 @@ test("seenFile keeps every session id inside seen/ and distinct ids apart", asyn
   assert.equal(new Set(files).size, files.length, "two ids mapped to the same file");
   assert.notEqual(seenFile(paths, "a/b"), seenFile(paths, "a_b"));
   assert.equal(seenFile(paths, "a/b"), seenFile(paths, "a/b"), "stable");
+
+  // On a case-insensitive filesystem two names that differ only by case are one file,
+  // and Windows refuses device names. Compare the way such a filesystem would.
+  const tricky = ["Session-A", "session-a", "SESSION-A", "con", "CON", "aux", "nul", "com1", "lpt9", "manual-0a1b2c3d"];
+  const folded = tricky.map((id) => basename(seenFile(paths, id)).toLowerCase());
+  assert.equal(new Set(folded).size, tricky.length, `ids collide once case is ignored: ${folded.join(", ")}`);
+  // Windows reserves a device name with any extension too ("con.txt").
+  for (const name of folded) assert.doesNotMatch(name, /^(?:con|prn|aux|nul|com[0-9]|lpt[0-9])(?:\.|$)/, name);
+  assert.equal(seenFile(paths, "session-a"), join(paths.seenDir, "session-a"), "a lower-case id is still used as it is");
+  assert.equal(seenFile(paths, "manual-0a1b2c3d"), join(paths.seenDir, "manual-0a1b2c3d"));
 });
 
 test("mergeConfig starts from the defaults and lets later sources win", () => {
