@@ -302,7 +302,7 @@ describe("local.json", () => {
     assert.deepEqual(await leftovers(paths), []);
   });
 
-  test("an update that changes nothing does not rewrite the file", { skip: process.platform === "win32" }, async () => {
+  test("an update that changes nothing does not rewrite the file", { skip: process.platform === "win32" ? "POSIX-only: inode numbers, which Windows stat() does not keep across a rename" : false }, async () => {
     const paths = await makePaths();
     await touchSession(paths, { id: "s1", worktree: paths.worktree });
     const inode = (await stat(paths.localFile)).ino;
@@ -654,6 +654,12 @@ describe("withLock", () => {
     await mkdir(paths.stateDir, { recursive: true });
     const stray = join(paths.stateDir, "demo.lock");
     await writeFile(stray, "junk");
+    if (process.platform === "win32") {
+      // Windows renames the new lock directory over a plain file (POSIX refuses with ENOTDIR), so a stray
+      // file never blocks the lock there, recent or not. It is never a lock: locks are directories.
+      assert.deepEqual(await withLock(paths, "demo", async () => 1, { waitMs: 0 }), { acquired: true, value: 1 });
+      return;
+    }
     assert.deepEqual(await withLock(paths, "demo", async () => 1, { waitMs: 0 }), { acquired: false });
     const then = new Date(Date.now() - 120_000);
     await utimes(stray, then, then);

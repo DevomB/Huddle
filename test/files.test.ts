@@ -2,10 +2,10 @@
 
 import assert from "node:assert/strict";
 import { realpathSync } from "node:fs";
-import { mkdir, rm, symlink } from "node:fs/promises";
+import { mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
-import { currentBranch, DETACHED, filesInFlight, resolveBase, resolveExisting, toRepoPath, toRepoPattern } from "../src/core/files.ts";
+import { currentBranch, DETACHED, filesInFlight, resolveBase, resolveExisting, toRepoPath, toRepoPattern, workInFlight } from "../src/core/files.ts";
 import { DEFAULT_CONFIG } from "../src/core/types.ts";
 import { createHarness } from "./harness.ts";
 
@@ -211,6 +211,30 @@ test("filesInFlight outside a repository is empty rather than an error", async (
   assert.deepEqual(await filesInFlight(join(h.root, "nowhere"), config), []);
 });
 
+test("workInFlight says when git could not list the files: an empty list is then not \"nothing in flight\"", async (t) => {
+  const h = await createHarness(t);
+  const clone = await h.clone("alice");
+  await clone.write("src/a.ts", "x\n");
+  const healthy = await workInFlight(clone.dir, config);
+  assert.deepEqual([healthy.all, healthy.complete], [["src/a.ts"], true]);
+
+  // A clone that has fetched nothing has no unpushed commits to list: that is complete, not a failure.
+  const fresh = await h.clone("bob");
+  await fresh.git("update-ref", "-d", "refs/remotes/origin/main");
+  await fresh.git("update-ref", "-d", "refs/remotes/origin/HEAD").catch(() => "");
+  assert.equal((await workInFlight(fresh.dir, config)).complete, true);
+
+  // A damaged index: `git status` fails, so the dirty files are unknown.
+  await writeFile(join(clone.dir, ".git", "index"), "not an index");
+  const broken = await workInFlight(clone.dir, config);
+  assert.equal(broken.complete, false);
+  assert.deepEqual(broken.all, []);
+
+  // Not a repository at all (a worktree that was removed): nothing could be listed.
+  const gone = join(h.root, "no-such-worktree");
+  assert.equal((await workInFlight(gone, config)).complete, false);
+});
+
 test("toRepoPath makes agent-supplied paths repo-relative and rejects paths outside the worktree", async (t) => {
   const h = await createHarness(t);
   const clone = await h.clone("alice");
@@ -232,6 +256,24 @@ test("toRepoPath makes agent-supplied paths repo-relative and rejects paths outs
   assert.equal(toRepoPath(paths, clone.dir, "/etc/passwd"), null);
   assert.equal(toRepoPath(paths, clone.dir, join(h.root, "alice-other", "x.ts")), null, "a directory that merely shares the prefix");
 });
+
+test(
+  "toRepoPath on Windows: drive letter and separators in any form, and the case on disk, as git reports the path",
+  { skip: process.platform === "win32" ? false : "Windows-only: a case-insensitive file system with drive letters" },
+  async (t) => {
+    const h = await createHarness(t);
+    const clone = await h.clone("alice");
+    const paths = await clone.paths();
+    await clone.write("src/Auth.ts", "x\n");
+    const lowerDrive = clone.dir.replace(/^[A-Z]:/, (drive) => drive.toLowerCase());
+    assert.equal(toRepoPath(paths, clone.dir, join(clone.dir, "SRC", "auth.TS")), "src/Auth.ts", "case on disk");
+    assert.equal(toRepoPath(paths, clone.dir, join(lowerDrive, "src", "Auth.ts")), "src/Auth.ts", "lower-case drive letter");
+    assert.equal(toRepoPath(paths, clone.dir, `${clone.dir.replace(/\\/g, "/")}/src/Auth.ts`), "src/Auth.ts", "forward slashes");
+    assert.equal(toRepoPath(paths, clone.dir, "SRC\\new\\File.ts"), "src/new/File.ts", "a new file keeps its own case below what exists");
+    // What git itself reports for the file is the same path.
+    assert.match(await clone.git("status", "--porcelain", "--untracked-files=all"), /src\/Auth\.ts/);
+  },
+);
 
 test("toRepoPath sees through a symlink to the worktree", async (t) => {
   const h = await createHarness(t);

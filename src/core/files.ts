@@ -46,6 +46,20 @@ export interface WorkInFlight {
   files: string[];
   /** Null when `files` is all of it; otherwise the count and the generated globs that cover the rest. */
   partial: SessionPartial | null;
+  /**
+   * False when git could not list the dirty files or the committed ones (a
+   * failed `git status`, diff, log or ref listing): the lists above then miss
+   * that group, and an empty result is not "nothing in flight". True when every
+   * listing that was needed succeeded, including "nothing fetched yet, so no
+   * unpushed commits to list".
+   */
+  complete: boolean;
+}
+
+/** One group of files in flight, and whether git listed it (false: the group is missing, not empty). */
+interface Listed {
+  files: string[];
+  ok: boolean;
 }
 
 /**
@@ -53,7 +67,7 @@ export interface WorkInFlight {
  * not ignored) first, then files changed in commits since the merge-base with
  * the base branch (without a base: in commits not pushed to the remote, see
  * unpushedFiles). Each group is sorted, so the list is stable between calls.
- * On any git failure the affected group is simply missing.
+ * On a git failure the affected group is missing and `complete` is false.
  *
  * Nothing is dropped: past LIMITS.files, or for a path the wire cannot carry
  * exactly, `partial` holds coverage globs for the rest (see cutFiles).
@@ -61,9 +75,9 @@ export interface WorkInFlight {
 export async function workInFlight(worktree: string, config: Config): Promise<WorkInFlight> {
   const [dirty, committed] = await Promise.all([dirtyFiles(worktree), committedFiles(worktree, config)]);
   const all = new Set<string>();
-  for (const group of [dirty, committed]) for (const file of [...group].sort()) all.add(file);
+  for (const group of [dirty, committed]) for (const file of [...group.files].sort()) all.add(file);
   const list = [...all];
-  return { all: list, ...cutFiles(list) };
+  return { all: list, ...cutFiles(list), complete: dirty.ok && committed.ok };
 }
 
 /** The exact part of workInFlight: at most LIMITS.files paths. What is cut is in workInFlight's `partial`. */
@@ -71,11 +85,11 @@ export async function filesInFlight(worktree: string, config: Config): Promise<s
   return (await workInFlight(worktree, config)).files;
 }
 
-async function dirtyFiles(worktree: string): Promise<string[]> {
+async function dirtyFiles(worktree: string): Promise<Listed> {
   // -z: NUL-separated and never quoted. --no-renames: a rename shows as a
   // delete plus an add, so both names are reported and every entry is one path.
   const result = await git(["status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"], { cwd: worktree });
-  if (!result.ok) return [];
+  if (!result.ok) return { files: [], ok: false };
   const files: string[] = [];
   const entries = result.stdout.split("\0");
   for (let i = 0; i < entries.length; i++) {
@@ -89,17 +103,17 @@ async function dirtyFiles(worktree: string): Promise<string[]> {
       if (source) files.push(source);
     }
   }
-  return files.filter((file) => file !== "" && !file.endsWith("/"));
+  return { files: files.filter((file) => file !== "" && !file.endsWith("/")), ok: true };
 }
 
-async function committedFiles(worktree: string, config: Config): Promise<string[]> {
+async function committedFiles(worktree: string, config: Config): Promise<Listed> {
   const base = await resolveBase(worktree, config);
   if (base) {
     const mergeBase = await git(["merge-base", "HEAD", base], { cwd: worktree });
     const from = mergeBase.stdout.trim();
     if (mergeBase.ok && from) {
       const result = await git(["diff", "--name-only", "-z", "--no-renames", from, "HEAD"], { cwd: worktree });
-      return result.ok ? result.stdout.split("\0").filter(Boolean) : [];
+      return result.ok ? { files: result.stdout.split("\0").filter(Boolean), ok: true } : { files: [], ok: false };
     }
   }
   return unpushedFiles(worktree, config);
@@ -117,16 +131,17 @@ const UNPUSHED_COMMITS = 500;
  * pushed these files leave the list; `huddle doctor` says so and how to set
  * `base`.
  */
-async function unpushedFiles(worktree: string, config: Config): Promise<string[]> {
+async function unpushedFiles(worktree: string, config: Config): Promise<Listed> {
   // With nothing fetched from the remote, every commit in the history would count as unpushed.
   const tracking = await git(["for-each-ref", "--count=1", "--format=%(refname)", `refs/remotes/${config.remote}/`], { cwd: worktree });
-  if (!tracking.ok || tracking.stdout.trim() === "") return [];
+  if (!tracking.ok) return { files: [], ok: false };
+  if (tracking.stdout.trim() === "") return { files: [], ok: true };
   const result = await git(
     ["log", "--format=", "--name-only", "-z", "--no-renames", `--max-count=${UNPUSHED_COMMITS}`, "HEAD", "--not", `--remotes=${config.remote}`],
     { cwd: worktree },
   );
-  if (!result.ok) return [];
-  return result.stdout.split("\0").filter(Boolean);
+  if (!result.ok) return { files: [], ok: false };
+  return { files: result.stdout.split("\0").filter(Boolean), ok: true };
 }
 
 /**
@@ -141,6 +156,14 @@ export function toRepoPath(paths: RepoPaths, cwd: string, path: string): string 
     const rel = relative(paths.worktree, candidate);
     return rel !== "" && !isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`) ? rel.split(sep).join("/") : null;
   };
+  if (process.platform === "win32") {
+    // Windows file systems ignore case and git does not: an agent may name
+    // src\Auth.ts as c:\repo\SRC\auth.ts, and the path must come out as git
+    // reports it, or no teammate's src/Auth.ts would match. The native realpath
+    // gives the case on disk (and long names for 8.3 short ones). A tail that
+    // does not exist yet keeps the case it was given.
+    return inside(resolveExisting(absolute, realpathSync.native)) ?? inside(absolute);
+  }
   // The worktree path from git has symlinks resolved; the path we were given
   // may not (macOS /tmp, a symlinked checkout). Try it as given, and only then
   // resolved: resolving asks the file system, and this runs before every edit.

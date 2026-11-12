@@ -28,6 +28,7 @@
 // and commit-tree needs an identity the machine may not have (a fixed one).
 
 import { spawn } from "node:child_process";
+import { join } from "node:path";
 
 export const NETWORK_TIMEOUT_MS = 10_000;
 export const LOCAL_TIMEOUT_MS = 15_000;
@@ -250,9 +251,10 @@ function run(args: string[], opts: GitOptions, env: NodeJS.ProcessEnv): Promise<
     const signal = (name: NodeJS.Signals) => {
       try {
         if (ownGroup && child.pid !== undefined) process.kill(-child.pid, name);
-        // Windows has no process groups to signal: this ends git but not the ssh or
-        // credential helper it started. Those end by themselves through the ssh and
-        // http limits set above.
+        // Windows has no process groups to signal, and ending git.exe alone is not
+        // enough: Git for Windows' git.exe is a launcher for the real git, which may
+        // have started ssh or a credential helper. End that tree (see endTreeWindows).
+        else if (process.platform === "win32" && child.pid !== undefined) endTreeWindows(child.pid, () => child.kill(name));
         else child.kill(name);
       } catch {
         // Already gone.
@@ -311,6 +313,56 @@ function run(args: string[], opts: GitOptions, env: NodeJS.ProcessEnv): Promise<
       child.stdin.end(opts.input);
     }
   });
+}
+
+/** How long taskkill gets before the fallback is used. */
+const TASKKILL_MS = 2000;
+
+/**
+ * Ends the process `pid` and every process it started, on Windows: taskkill
+ * with /T (the tree under that pid) and /F (Windows has no SIGTERM for a
+ * console process, so a polite stop does not exist anyway). Only ever the pid
+ * of a git that this process spawned and that is still running, so the pid
+ * cannot belong to someone else, and never a process found by name. taskkill
+ * is run from System32 by its full path, with an argument list and no shell.
+ * When taskkill cannot start, fails or takes longer than TASKKILL_MS,
+ * `fallback` ends at least git.exe itself. Does not wait.
+ *
+ * At process exit nothing more is needed: Node puts the children it spawns
+ * (except detached ones) into a job object that Windows closes, ending them
+ * and their own children, when the process ends.
+ */
+function endTreeWindows(pid: number, fallback: () => void): void {
+  const root = process.env.SystemRoot || process.env.windir || "C:\\Windows";
+  let settled = false;
+  let timer: NodeJS.Timeout | undefined;
+  const finish = (ok: boolean) => {
+    if (settled) return;
+    settled = true;
+    if (timer) clearTimeout(timer);
+    if (!ok) {
+      try {
+        fallback();
+      } catch {
+        // Already gone.
+      }
+    }
+  };
+  let killer: ReturnType<typeof spawn>;
+  try {
+    killer = spawn(join(root, "System32", "taskkill.exe"), ["/PID", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+  } catch {
+    finish(false);
+    return;
+  }
+  timer = setTimeout(() => {
+    killer.kill();
+    finish(false);
+  }, TASKKILL_MS);
+  timer.unref();
+  killer.on("error", () => finish(false));
+  killer.on("exit", (code) => finish(code === 0));
+  killer.unref();
 }
 
 function message(error: unknown): string {
