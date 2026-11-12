@@ -1942,7 +1942,8 @@ test("plugin: in a worktree inside another checkout, the worktree's own bundle r
   await mkdir(directory);
 
   // opencode 2 keeps the outer checkout's plugin, the first with its id: the worktree's bundle runs all the same.
-  const v2 = opencode2(directory, { [SESSION]: undefined });
+  // Here the session runs at the top of the worktree, below in one of its directories.
+  const v2 = opencode2(inner, { [SESSION]: undefined });
   const cleanup = await s.plugin.setup(v2.ctx);
   await call(v2.hooks, "session.prompt", promptEvent(SESSION, "Fix the build"));
   assert.deepEqual(
@@ -1951,6 +1952,10 @@ test("plugin: in a worktree inside another checkout, the worktree's own bundle r
   );
   cleanup();
   await until("the session being ended", async () => innerSent().length === 3);
+  assert.deepEqual(
+    innerSent().map((payload) => payload.cwd),
+    [inner, inner, inner],
+  );
 
   // opencode 1 keeps both, in one process: one of them acts.
   const outer1 = await s.plugin.server(opencode1(directory, { [SESSION]: undefined }).input);
@@ -1963,11 +1968,10 @@ test("plugin: in a worktree inside another checkout, the worktree's own bundle r
     ["Fix the build", "INNER"],
   );
   assert.deepEqual(
-    innerSent().map((payload) => [payload.hook_event_name, payload.cwd]),
+    innerSent()
+      .slice(3)
+      .map((payload) => [payload.hook_event_name, payload.cwd]),
     [
-      ["start", directory],
-      ["prompt", directory],
-      ["end", directory],
       ["start", directory],
       ["prompt", directory],
     ],
