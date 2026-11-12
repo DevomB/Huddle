@@ -14,6 +14,7 @@ import { ensureStateDir } from "./paths.ts";
 import type { RepoPaths } from "./paths.ts";
 import { toActorDoc } from "./session.ts";
 import { readCache, readLocal, removeSeen, updateLocal, withLock, writeCache } from "./store.ts";
+import type { LockResult } from "./store.ts";
 import { actorRef } from "./types.ts";
 import type { ActorDoc, CacheEntry, Config, Doc, FailReason, LocalState, PublishResult } from "./types.ts";
 
@@ -35,9 +36,18 @@ export interface SyncResult {
 }
 
 /** A forced sync waits this long for a round that is already running. */
-const FORCED_LOCK_WAIT_MS = 20_000;
+export const FORCED_LOCK_WAIT_MS = 20_000;
 /** A sync.lock whose holder stopped heartbeating for this long is taken over. */
 const SYNC_LOCK_STALE_MS = 60_000;
+
+/**
+ * Runs `fn` holding sync.lock, waiting up to `waitMs` for it. Everything that
+ * writes cache.json takes this lock, so a round and a `huddle decide` never
+ * overwrite each other's view of the remote.
+ */
+export function withSyncLock<T>(paths: RepoPaths, waitMs: number, fn: () => Promise<T>): Promise<LockResult<T>> {
+  return withLock(paths, "sync", fn, { waitMs, staleMs: SYNC_LOCK_STALE_MS });
+}
 
 /** When the last round started (ISO text). Local bookkeeping for the throttle; see stampFile. */
 function stampFile(paths: RepoPaths): string {
@@ -95,19 +105,14 @@ export async function sync(ctx: Ctx, opts: SyncOptions = {}): Promise<SyncResult
   try {
     await ensureStateDir(ctx.paths);
     if (!opts.force && throttledAt(readStamp(ctx.paths), ctx.config, ctx.now)) return skipped("throttled");
-    const locked = await withLock(
-      ctx.paths,
-      "sync",
-      async () => {
-        // Another process may have synced while we waited for the lock.
-        if (!opts.force && throttledAt(readStamp(ctx.paths), ctx.config, ctx.now)) return skipped("throttled");
-        await writeFile(stampFile(ctx.paths), ctx.now.toISOString());
-        // After the stamp and before the round reads local state: see pendingFile.
-        clearPending(ctx.paths);
-        return round(ctx);
-      },
-      { waitMs: opts.force ? FORCED_LOCK_WAIT_MS : 0, staleMs: SYNC_LOCK_STALE_MS },
-    );
+    const locked = await withSyncLock(ctx.paths, opts.force ? FORCED_LOCK_WAIT_MS : 0, async () => {
+      // Another process may have synced while we waited for the lock.
+      if (!opts.force && throttledAt(readStamp(ctx.paths), ctx.config, ctx.now)) return skipped("throttled");
+      await writeFile(stampFile(ctx.paths), ctx.now.toISOString());
+      // After the stamp and before the round reads local state: see pendingFile.
+      clearPending(ctx.paths);
+      return round(ctx);
+    });
     return locked.acquired ? locked.value : skipped("locked");
   } catch (error) {
     log(ctx.paths, "sync", "sync failed", error);
