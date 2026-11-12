@@ -13,13 +13,15 @@ import { log } from "./log.ts";
 import { ensureStateDir } from "./paths.ts";
 import { readCache, writeCache } from "./store.ts";
 import { FORCED_LOCK_WAIT_MS, withSyncLock } from "./sync.ts";
-import { decisionsRef } from "./types.ts";
+import { decisionsRef, REF_PREFIX } from "./types.ts";
 import type { Cache, Decision, DecisionDoc, FailReason, Identity } from "./types.ts";
 
 export type DecideFailure =
   | FailReason
   /** --supersedes names no decision in anybody's log. */
   | "unknown-supersedes"
+  /** --supersedes names a decision that another decision has replaced already. */
+  | "already-superseded"
   /** This clone's log is at its limit and nothing in it can be dropped. */
   | "full"
   /** The remote holds something at this clone's decisions ref that this version cannot read; it is left alone. */
@@ -27,7 +29,26 @@ export type DecideFailure =
   /** A sync held the lock for too long. */
   | "busy";
 
-export type DecideResult = { ok: true; decision: Decision; dropped: number } | { ok: false; reason: DecideFailure };
+/** A decision and whose log it is in. */
+export interface Attributed {
+  decision: Decision;
+  user: string;
+}
+
+export type DecideResult =
+  | { ok: true; decision: Decision; dropped: number }
+  | {
+      ok: false;
+      reason: DecideFailure;
+      /**
+       * True when the failure came after the push was started. With "offline"
+       * that leaves the outcome unknown: the remote may have taken the push
+       * and the answer got lost.
+       */
+      sent?: boolean;
+      /** With "already-superseded": what is in force in place of the decision that was named. */
+      inForce?: Attributed[];
+    };
 
 /** Tries before a lost race is reported: each one starts from what the remote holds then. */
 const ATTEMPTS = 3;
@@ -35,6 +56,44 @@ const ATTEMPTS = 3;
 /** Every decision in every log in the cache, hidden ones included. */
 export function allDecisions(cache: Cache): Decision[] {
   return Object.values(cache.refs).flatMap((entry) => (entry.doc?.kind === "decisions" ? entry.doc.decisions : []));
+}
+
+/** The same, each with the user of the log it is in. */
+function attributed(cache: Cache): Attributed[] {
+  return Object.values(cache.refs).flatMap((entry) =>
+    entry.doc?.kind === "decisions" ? entry.doc.decisions.map((decision) => ({ decision, user: (entry.doc as DecisionDoc).user })) : [],
+  );
+}
+
+/** True when every decision log in the cache could be read. A decision that is not found may otherwise be in the one that could not. */
+function logsComplete(cache: Cache): boolean {
+  const prefix = `${REF_PREFIX}decisions/`;
+  return Object.entries(cache.refs).every(([name, entry]) => !name.startsWith(prefix) || entry.doc?.kind === "decisions");
+}
+
+/**
+ * What stands in place of decision `id` now: the decisions in force at the
+ * end of every chain of replacements that starts at it, newest first. Empty
+ * when nothing has replaced it.
+ */
+export function replacementsOf(id: string, everyone: Attributed[]): Attributed[] {
+  const replacing = new Map<string, Attributed[]>();
+  for (const entry of everyone) {
+    const target = entry.decision.supersedes;
+    if (target === undefined || target === entry.decision.id) continue;
+    replacing.set(target, [...(replacing.get(target) ?? []), entry]);
+  }
+  const ends = new Map<string, Attributed>();
+  const seen = new Set<string>([id]);
+  const queue = [...(replacing.get(id) ?? [])];
+  for (let next = queue.shift(); next !== undefined; next = queue.shift()) {
+    if (seen.has(next.decision.id)) continue;
+    seen.add(next.decision.id);
+    const further = replacing.get(next.decision.id) ?? [];
+    if (further.length === 0) ends.set(next.decision.id, next);
+    else queue.push(...further);
+  }
+  return [...ends.values()].sort((a, b) => b.decision.at.localeCompare(a.decision.at));
 }
 
 function logOf(identity: Identity, decisions: Decision[]): DecisionDoc {
@@ -51,27 +110,39 @@ function fits(identity: Identity, decisions: Decision[]): boolean {
  * dropped, oldest first, and only when dropping them brings nothing back:
  *
  * - a decision is hidden when another decision, in any log, supersedes it;
- * - dropping a hidden decision that is the only one superseding a third would
- *   make that third one visible again, so such a decision stays.
+ * - a hidden decision that supersedes a third one keeps that third one
+ *   hidden, so it goes only when this log itself keeps another decision that
+ *   supersedes the same one, or when the third one is gone from every log.
  *
- * `others` is every decision in the other clones' logs.
+ * Another clone's decision that supersedes the same one does not count. That
+ * clone can be making the same judgement about this log at the same moment,
+ * and the push is conditional on this clone's ref only: both would drop, and
+ * the decision they were hiding would be back in every briefing.
+ *
+ * `everyone` is every decision in every log on the remote, this clone's
+ * included or not. `complete` is false when some log could not be read: a
+ * decision that is not found may then be in that log, and is treated as
+ * still there.
  */
-export function fitLog(identity: Identity, mine: Decision[], others: Decision[]): Decision[] | null {
+export function fitLog(identity: Identity, mine: Decision[], everyone: Decision[], complete = true): Decision[] | null {
+  const mineIds = new Set(mine.map((decision) => decision.id));
+  const others = everyone.filter((decision) => !mineIds.has(decision.id));
   const kept = [...mine];
   while (!fits(identity, kept)) {
     const everything = [...kept, ...others];
     const exists = new Set(everything.map((decision) => decision.id));
-    const supersededBy = new Map<string, number>();
+    const hidden = new Set<string>();
     for (const decision of everything) {
-      if (decision.supersedes !== undefined && decision.supersedes !== decision.id) {
-        supersededBy.set(decision.supersedes, (supersededBy.get(decision.supersedes) ?? 0) + 1);
-      }
+      if (decision.supersedes !== undefined && decision.supersedes !== decision.id) hidden.add(decision.supersedes);
     }
     const droppable = (decision: Decision): boolean => {
-      if (!supersededBy.has(decision.id)) return false; // still in force
+      if (!hidden.has(decision.id)) return false; // still in force
       const target = decision.supersedes;
-      if (target === undefined || target === decision.id || !exists.has(target)) return true;
-      return (supersededBy.get(target) ?? 0) > 1; // something else keeps the target hidden
+      if (target === undefined || target === decision.id) return true;
+      // Another decision of this log keeps the target hidden.
+      if (kept.some((other) => other.supersedes === target && other.id !== decision.id && other.id !== target)) return true;
+      // Or the target is gone, which is only known when every log was read.
+      return complete && !exists.has(target);
     };
     // The log is newest first: look for the oldest from the end.
     let index = -1;
@@ -126,9 +197,17 @@ export async function addDecision(ctx: Ctx, text: string, opts: { supersedes?: s
       }
       const mine = current?.doc?.kind === "decisions" ? current.doc.decisions : [];
       const everyone = allDecisions(cache);
-      if (opts.supersedes !== undefined && !everyone.some((decision) => decision.id === opts.supersedes)) {
-        await writeCache(paths, cache);
-        return { ok: false, reason: "unknown-supersedes" };
+      if (opts.supersedes !== undefined) {
+        if (!everyone.some((decision) => decision.id === opts.supersedes)) {
+          await writeCache(paths, cache);
+          return { ok: false, reason: "unknown-supersedes" };
+        }
+        // Replacing a decision that was replaced already would leave two rules in force with nothing saying so.
+        const inForce = replacementsOf(opts.supersedes, attributed(cache));
+        if (inForce.length > 0) {
+          await writeCache(paths, cache);
+          return { ok: false, reason: "already-superseded", inForce };
+        }
       }
 
       const taken = new Set(everyone.map((decision) => decision.id));
@@ -137,8 +216,7 @@ export async function addDecision(ctx: Ctx, text: string, opts: { supersedes?: s
       const decision: Decision = { id, at: now.toISOString(), agent: cleanText(opts.agent, LIMITS.name) || "manual", text: clean };
       if (opts.supersedes !== undefined) decision.supersedes = opts.supersedes;
 
-      const mineIds = new Set(mine.map((entry) => entry.id));
-      const kept = fitLog(identity, [decision, ...mine], everyone.filter((entry) => !mineIds.has(entry.id)));
+      const kept = fitLog(identity, [decision, ...mine], everyone, logsComplete(cache));
       if (kept === null) {
         await writeCache(paths, cache);
         return { ok: false, reason: "full" };
@@ -153,9 +231,9 @@ export async function addDecision(ctx: Ctx, text: string, opts: { supersedes?: s
       }
       await writeCache(paths, cache);
       log(paths, "decide", `publish failed: ${published.reason} (attempt ${attempt} of ${ATTEMPTS})`);
-      if (published.reason !== "lost-race") return { ok: false, reason: published.reason };
+      if (published.reason !== "lost-race") return { ok: false, reason: published.reason, sent: true };
     }
-    return { ok: false, reason: "lost-race" };
+    return { ok: false, reason: "lost-race", sent: true };
   });
   return locked.acquired ? locked.value : { ok: false, reason: "busy" };
 }

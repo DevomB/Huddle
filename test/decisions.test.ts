@@ -7,8 +7,11 @@ import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { openContext } from "../src/core/context.ts";
 import type { Ctx } from "../src/core/context.ts";
-import { addDecision, allDecisions, fitLog } from "../src/core/decisions.ts";
+import { report } from "../src/commands/decide.ts";
+import { addDecision, allDecisions, fitLog, replacementsOf } from "../src/core/decisions.ts";
+import type { Attributed, DecideResult } from "../src/core/decisions.ts";
 import { LIMITS } from "../src/core/docs.ts";
+import { UsageError } from "../src/core/io.ts";
 import type { Io } from "../src/core/io.ts";
 import { renderBriefing } from "../src/core/render.ts";
 import { currentView } from "../src/core/session.ts";
@@ -231,9 +234,149 @@ test("a log that keeps moving is reported as a lost race after three tries, with
       return { ok: false, reason: "lost-race" };
     },
   }));
-  assert.deepEqual(await addDecision(ctx, "two"), { ok: false, reason: "lost-race" });
+  assert.deepEqual(await addDecision(ctx, "two"), { ok: false, reason: "lost-race", sent: true });
   assert.equal(pushes, 3);
   assert.deepEqual(texts((await remoteLogs(h))[0]!.decisions), ["one"]);
+});
+
+test("when the fetch fails nothing is pushed; when the push gets no answer the result says it was sent", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  await decide(alice, "one", at(0));
+
+  // The decision would be added to a log that may be behind: not pushed at all.
+  let pushes = 0;
+  const blind = await withTransport(alice, at(10), () => ({
+    fetchAll: async () => ({ ok: false, reason: "offline" }),
+    publish: async () => {
+      pushes++;
+      return { ok: false, reason: "offline" };
+    },
+  }));
+  assert.deepEqual(await addDecision(blind, "two"), { ok: false, reason: "offline" });
+  assert.equal(pushes, 0, "a push went out after a failed fetch");
+
+  // The fetch works and the push gets no answer: the remote may have taken it.
+  const cut = await withTransport(alice, at(20), () => ({ publish: async () => ({ ok: false, reason: "offline" }) }));
+  assert.deepEqual(await addDecision(cut, "three"), { ok: false, reason: "offline", sent: true });
+  const refused = await withTransport(alice, at(30), () => ({ publish: async () => ({ ok: false, reason: "denied" }) }));
+  assert.deepEqual(await addDecision(refused, "four"), { ok: false, reason: "denied", sent: true });
+  assert.deepEqual(texts((await remoteLogs(h))[0]!.decisions), ["one"]);
+});
+
+test("report: what each outcome prints and which exit code it gives", () => {
+  const said = (result: DecideResult, supersedes?: string) => {
+    const out: string[] = [];
+    const err: string[] = [];
+    const code = report(result, { remote: "origin", supersedes }, { out: (line) => out.push(line), err: (line) => err.push(line) });
+    return { code, out: out.join("\n"), err: err.join("\n") };
+  };
+  const decision: Decision = { id: "abcd2345", at: at(0), agent: "manual", text: "Use pnpm" };
+
+  assert.deepEqual(said({ ok: true, decision, dropped: 0 }), { code: 0, out: "decision abcd2345 recorded: Use pnpm", err: "" });
+  const replaced = said({ ok: true, decision, dropped: 2 }, "zzzz2222");
+  assert.equal(replaced.code, 0);
+  assert.equal(replaced.out, "decision abcd2345 recorded, replacing zzzz2222: Use pnpm\n(2 superseded decisions were removed from this clone's log to make room)");
+
+  // Exit 3: someone else got there first. Exit 1: everything else that is not the command's own mistake.
+  const codes = { "lost-race": 3, "already-superseded": 3, offline: 1, denied: 1, busy: 1, full: 1, unreadable: 1 } as const;
+  for (const [reason, code] of Object.entries(codes) as [keyof typeof codes, number][]) {
+    const r = said({ ok: false, reason }, "zzzz2222");
+    assert.equal(r.code, code, reason);
+    assert.equal(r.out, "", `${reason} printed to stdout`);
+    assert.match(r.err, /^huddle: .*The decision was NOT recorded/, reason);
+  }
+  assert.match(said({ ok: false, reason: "busy" }).err, /a sync is still running/);
+  assert.match(said({ ok: false, reason: "offline" }).err, /could not reach remote "origin"/);
+
+  // A push that got no answer is the one case where "NOT recorded" would be a guess.
+  const unknown = said({ ok: false, reason: "offline", sent: true });
+  assert.equal(unknown.code, 1);
+  assert.match(unknown.err, /may or may not have been recorded\. Check with "huddle decisions" before running the command again/);
+  assert.doesNotMatch(unknown.err, /NOT recorded/);
+  // A refusal after the push went out is still a refusal.
+  assert.match(said({ ok: false, reason: "denied", sent: true }).err, /refused a push.*NOT recorded/);
+
+  const inForce: Attributed[] = [
+    { user: "bob", decision: { id: "bbbb2222", at: at(20), agent: "codex", text: "Use npm" } },
+    { user: "carol", decision: { id: "cccc2222", at: at(10), agent: "manual", text: "Use yarn" } },
+  ];
+  const late = said({ ok: false, reason: "already-superseded", inForce }, "zzzz2222");
+  assert.equal(
+    late.err,
+    'huddle: decision zzzz2222 was already replaced by [bbbb2222] Use npm (bob / codex) (and 1 more; see "huddle decisions"). ' +
+      "The decision was NOT recorded. To replace the rule in force, run the command again with --supersedes bbbb2222.",
+  );
+  assert.throws(() => said({ ok: false, reason: "unknown-supersedes" }, "zzzz2222"), (error: unknown) => error instanceof UsageError && /there is no decision zzzz2222/.test(error.message));
+});
+
+test("superseding a decision that was already replaced is refused, and names the rule in force", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  const bob = await h.clone("bob");
+  const pnpm = await decide(alice, "Use pnpm", at(0));
+  const npm = await decide(bob, "Use npm", at(10), ["--supersedes", pnpm]);
+
+  // Alice has not synced since her own decision. The command fetches first, so it knows.
+  const late = await alice.huddle(["decide", "Use yarn", "--supersedes", pnpm], { now: at(20) });
+  assert.equal(late.code, 3, late.stdout + late.stderr);
+  assert.equal(late.stdout, "");
+  assert.equal(
+    late.stderr.trim(),
+    `huddle: decision ${pnpm} was already replaced by [${npm}] Use npm (bob / manual). The decision was NOT recorded. To replace the rule in force, run the command again with --supersedes ${npm}.`,
+  );
+  assert.deepEqual((await remoteLogs(h)).flatMap((log) => texts(log.decisions)).sort(), ["Use npm", "Use pnpm"]);
+
+  // Doing what the message says works, and leaves one rule in force.
+  const yarn = await decide(alice, "Use yarn", at(30), ["--supersedes", npm]);
+  const json = JSON.parse((await ok(bob, ["decisions", "--json"], at(40))).stdout) as { decisions: Decision[] };
+  assert.deepEqual(json.decisions.map((decision) => decision.id), [yarn]);
+
+  // Naming the first decision again points at the end of the chain, not at the link in between.
+  const again = await bob.huddle(["decide", "Use bun", "--supersedes", pnpm], { now: at(50) });
+  assert.equal(again.code, 3);
+  assert.match(again.stderr, new RegExp(`was already replaced by \\[${yarn}\\] Use yarn \\(alice / manual\\)`));
+});
+
+test("replacementsOf follows every chain to what is in force", () => {
+  const by = (user: string, id: string, seconds: number, supersedes?: string): Attributed => ({ user, decision: made(id, seconds, supersedes) });
+  const idsOf = (entries: Attributed[]) => entries.map((entry) => entry.decision.id);
+
+  assert.deepEqual(replacementsOf("aaaa", [by("alice", "aaaa", 1)]), []);
+  assert.deepEqual(replacementsOf("gone", [by("alice", "aaaa", 1)]), []);
+  // aaaa <- bbbb <- cccc: cccc is what stands.
+  const chain = [by("alice", "aaaa", 1), by("bob", "bbbb", 2, "aaaa"), by("carol", "cccc", 3, "bbbb")];
+  assert.deepEqual(idsOf(replacementsOf("aaaa", chain)), ["cccc"]);
+  assert.deepEqual(idsOf(replacementsOf("bbbb", chain)), ["cccc"]);
+  assert.deepEqual(replacementsOf("cccc", chain), []);
+  assert.equal(replacementsOf("aaaa", chain)[0]!.user, "carol");
+  // Two people replaced it at the same moment: both stand, newest first.
+  const fork = [by("alice", "aaaa", 1), by("bob", "bbbb", 2, "aaaa"), by("carol", "cccc", 3, "aaaa"), by("dave", "dddd", 4, "bbbb")];
+  assert.deepEqual(idsOf(replacementsOf("aaaa", fork)), ["dddd", "cccc"]);
+  // Documents written by hand: a decision naming itself replaces nothing, and a loop ends.
+  assert.deepEqual(replacementsOf("aaaa", [by("alice", "aaaa", 1, "aaaa")]), []);
+  const loop = [by("alice", "aaaa", 1, "bbbb"), by("bob", "bbbb", 2, "aaaa")];
+  assert.deepEqual(replacementsOf("aaaa", loop), []);
+});
+
+test("an id whose log is gone from the remote cannot be superseded, and --cached asks nobody", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  const bob = await h.clone("bob");
+  const theirs = await decide(bob, "Use tabs", at(0));
+
+  // --cached reads the cache and nothing else: alice has not fetched bob's decision yet.
+  assert.match((await ok(alice, ["decisions", "--cached"], at(5))).stdout, /^No decisions recorded\./);
+  assert.match((await ok(alice, ["decisions"], at(6))).stdout, /Use tabs/);
+  assert.match((await ok(alice, ["decisions", "--cached"], at(7))).stdout, /Use tabs/);
+
+  // Bob's log is deleted on the remote. Alice's cache still has it; the command goes by the remote.
+  const ref = (await h.remoteGit("for-each-ref", "--format=%(refname)", "refs/huddle/decisions")).trim();
+  await h.remoteGit("update-ref", "-d", ref);
+  const r = await alice.huddle(["decide", "Use spaces", "--supersedes", theirs], { now: at(10) });
+  assert.equal(r.code, 2, r.stdout + r.stderr);
+  assert.match(r.stderr, new RegExp(`there is no decision ${theirs}`));
+  assert.deepEqual(await remoteLogs(h), []);
 });
 
 test("offline, the decision is not recorded and the command says so with exit 1", async (t) => {
@@ -294,7 +437,19 @@ test("usage errors exit 2 and record nothing", async (t) => {
 
   assert.equal((await run(["decide", "y", "--bogus"])).code, 2);
   assert.equal((await run(["decisions", "extra"])).code, 2);
+
+  const twice = await run(["decide", "y", "--supersedes", "abcd2345", "--supersedes", "bcde2345"]);
+  assert.equal(twice.code, 2);
+  assert.match(twice.stderr, /--supersedes was given 2 times/);
+
+  // A text that starts with a dash is taken for an option; the usage line says how to write it.
+  const dash = await run(["decide", "- no default exports"]);
+  assert.equal(dash.code, 2);
+  assert.match(dash.stderr, /put -- before a text that starts with a dash/);
   assert.equal((await remoteLogs(h))[0]!.decisions.length, 1, "only the one valid decision above");
+  const dashed = await run(["decide", "--", "- no default exports"]);
+  assert.equal(dashed.code, 0, dashed.stderr);
+  assert.match(dashed.stdout, /recorded: - no default exports$/m);
 });
 
 test("something unreadable at this clone's decisions ref is left alone", async (t) => {
@@ -355,10 +510,25 @@ test("fitLog drops only what nobody can see, oldest first, and never brings a hi
   const theirs = [made("teammate", 1)];
   const guard = [made("newest", 5000, "oldb"), ...filler(LIMITS.decisions - 1, 1000), made("oldb", 20, "teammate")];
   assert.equal(fitLog(identity, guard, theirs), null);
-  // Once the teammate's decision is hidden by something else as well, oldb can go.
-  assert.equal(ids(fitLog(identity, guard, [...theirs, made("other", 2, "teammate")]))?.includes("oldb"), false);
+  // Another clone's decision that hides the teammate's too does not free oldb: that clone may be
+  // dropping its own at this very moment, on the strength of oldb.
+  assert.equal(fitLog(identity, guard, [...theirs, made("other", 2, "teammate")]), null);
+  // A second decision in this log that supersedes the same one does.
+  const twice = [made("newest", 5000, "oldb"), made("again", 4000, "teammate"), ...filler(LIMITS.decisions - 2, 1000), made("oldb", 20, "teammate")];
+  assert.equal(twice.length, LIMITS.decisions + 1);
+  const freed = ids(fitLog(identity, twice, theirs));
+  assert.deepEqual([freed?.includes("oldb"), freed?.includes("again")], [false, true]);
   // And when the teammate's decision no longer exists, there is nothing to keep hidden.
   assert.equal(ids(fitLog(identity, guard, []))?.includes("oldb"), false);
+  // Unless some log could not be read: the decision may be in that one.
+  assert.equal(fitLog(identity, guard, [], false), null);
+  assert.equal(ids(fitLog(identity, twice, [], false))?.includes("oldb"), false, "what this log holds itself is known either way");
+
+  // The list of everyone's decisions may hold this clone's own, as the cache does. They are not counted twice:
+  // olda, once dropped, is gone, and oldb is then free to go.
+  const both = fitLog(identity, [made("more", 6000), ...chain], [...chain, ...theirs]);
+  assert.equal(both?.length, LIMITS.decisions);
+  assert.equal(both?.some((decision) => decision.id === "olda" || decision.id === "oldb"), false);
 
   // Two hidden decisions with nothing depending on them: the older one goes.
   const pair = [made("newb", 9001, "hidb"), made("newa", 9000, "hida"), ...filler(LIMITS.decisions - 3, 1000), made("hidb", 8), made("hida", 7)];
@@ -409,6 +579,57 @@ test("a full log refuses a new decision, and superseding one of its own makes ro
   assert.equal(log!.decisions.some((decision) => decision.id === oldest), false);
   // The new decision still names what it replaced, so a teammate's stale cache hides the old one too.
   assert.equal(log!.decisions[0]!.supersedes, oldest);
+});
+
+test("two full logs that each hide the same decision of a third clone: neither makes room by letting it show again", async (t) => {
+  const h = await createHarness(t);
+  const [alice, bob, carol] = [await h.clone("alice"), await h.clone("bob"), await h.clone("carol")];
+  const target = await decide(carol, "carol: use tabs", at(0));
+
+  // In each log: a hidden decision (replaced by a newer one of the same log) that supersedes carol's, and 198 in force.
+  for (const [clone, tag] of [[alice, "a"], [bob, "b"]] as const) {
+    const ctx = await inProcess(clone, at(1));
+    const log = [made(`${tag}new`, 5000, `${tag}old`), ...filler(LIMITS.decisions - 2, 1000), made(`${tag}old`, 20, target)];
+    assert.equal(log.length, LIMITS.decisions);
+    const seeded = await ctx.transport.publish(decisionsRef(ctx.identity.actor), { v: 0, kind: "decisions", actor: ctx.identity.actor, user: clone.name, decisions: log }, "absent");
+    assert.equal(seeded.ok, true);
+  }
+  const hidden = async (viewer: Clone, now: string) => !(await ok(viewer, ["decisions"], now)).stdout.includes("carol: use tabs");
+  assert.equal(await hidden(carol, at(10)), true, "setup: carol's decision is superseded");
+
+  // Each log could make room only by dropping the one decision of its own that hides carol's.
+  // The other clone's hides it too, but that clone is in the same position and may drop at the same moment.
+  for (const clone of [alice, bob]) {
+    const refused = await clone.huddle(["decide", "one more rule"], { now: at(20) });
+    assert.equal(refused.code, 1, `${clone.name}: ${refused.stdout}${refused.stderr}`);
+    assert.match(refused.stderr, /decision log is full/);
+  }
+  assert.equal(await hidden(carol, at(30)), true, "carol's superseded decision is visible again");
+  for (const log of await remoteLogs(h)) if (log.user !== "carol") assert.equal(log.decisions.length, LIMITS.decisions);
+});
+
+test("while some clone's log cannot be read, a decision that hides one nobody can find is kept", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  const bob = await h.clone("bob");
+  const ctx = await inProcess(alice, at(0));
+  // Alice's full log: "old" is replaced by "new" and itself supersedes a decision that is in no log alice can read.
+  const log = [made("anew", 5000, "aold"), ...filler(LIMITS.decisions - 2, 1000), made("aold", 20, "nowhere2")];
+  const seeded = await ctx.transport.publish(decisionsRef(ctx.identity.actor), { v: 0, kind: "decisions", actor: ctx.identity.actor, user: "alice", decisions: log }, "absent");
+  assert.equal(seeded.ok, true);
+  // Bob's log is something this version does not understand (an ordinary commit). The decision may be in there.
+  const bobRef = decisionsRef((await inProcess(bob, at(0))).identity.actor);
+  await bob.git("push", "--quiet", "origin", `HEAD:${bobRef}`);
+
+  const refused = await alice.huddle(["decide", "one more rule"], { now: at(10) });
+  assert.equal(refused.code, 1, refused.stdout + refused.stderr);
+  assert.match(refused.stderr, /decision log is full/);
+
+  // With that log gone, every log there is was read, the decision is known to be gone, and "old" makes room.
+  await h.remoteGit("update-ref", "-d", bobRef);
+  const r = await ok(alice, ["decide", "one more rule"], at(20));
+  assert.match(r.stdout, /\(1 superseded decision was removed from this clone's log to make room\)/);
+  assert.equal((await remoteLogs(h))[0]!.decisions.some((decision) => decision.id === "aold"), false);
 });
 
 test("the cache after a decision is what the remote holds, so the decider sees it without a sync", async (t) => {

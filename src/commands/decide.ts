@@ -3,6 +3,7 @@
 import { parse } from "../core/args.ts";
 import { openContext } from "../core/context.ts";
 import { addDecision } from "../core/decisions.ts";
+import type { Attributed, DecideResult } from "../core/decisions.ts";
 import { cleanText, LIMITS } from "../core/docs.ts";
 import { EXIT, UsageError } from "../core/io.ts";
 import type { Io } from "../core/io.ts";
@@ -11,10 +12,10 @@ import { ID_RE } from "../core/types.ts";
 
 export const summary = "Record a decision others must follow: huddle decide \"<text>\"";
 
-const USAGE = 'huddle decide "<choice others must follow>" [--supersedes <id>]';
+const USAGE = 'huddle decide [--supersedes <id>] [--] "<choice others must follow>"   (put -- before a text that starts with a dash)';
 
 export async function run(args: string[], io: Io): Promise<number> {
-  const { values, positionals } = parse(args, { supersedes: { type: "string" } }, USAGE);
+  const { values, positionals } = parse(args, { supersedes: { type: "string", multiple: true } }, USAGE);
   const typed = positionals.join(" ");
   const text = cleanText(typed, LIMITS.decisionText);
   if (text === "") throw new UsageError(`the decision is empty\nUsage: ${USAGE}`);
@@ -23,7 +24,9 @@ export async function run(args: string[], io: Io): Promise<number> {
   if (length > LIMITS.decisionText) {
     throw new UsageError(`a decision is at most ${LIMITS.decisionText} characters; this one is ${length}. Say it shorter, or split it into two.`);
   }
-  const supersedes = values.supersedes?.trim();
+  const named = values.supersedes ?? [];
+  if (named.length > 1) throw new UsageError(`a decision replaces one other decision; --supersedes was given ${named.length} times\nUsage: ${USAGE}`);
+  const supersedes = named[0]?.trim();
   if (supersedes !== undefined && !ID_RE.test(supersedes)) {
     throw new UsageError(`"${cleanText(supersedes, 40)}" is not a decision id; run "huddle decisions" to see them\nUsage: ${USAGE}`);
   }
@@ -31,7 +34,21 @@ export async function run(args: string[], io: Io): Promise<number> {
   const ctx = await openContext(io);
   const me = await resolveSession(ctx);
   const result = await addDecision(ctx, text, supersedes === undefined ? { agent: me.agent } : { agent: me.agent, supersedes });
+  return report(result, { remote: ctx.config.remote, supersedes }, io);
+}
 
+/** "[id] text (user / agent)", the way `huddle decisions` lists one. */
+function shown({ decision, user }: Attributed): string {
+  return `[${decision.id}] ${decision.text} (${cleanText(user, LIMITS.name) || "unknown"} / ${cleanText(decision.agent, LIMITS.name) || "unknown"})`;
+}
+
+/**
+ * Says what happened and gives the exit code: 0 recorded, 1 not recorded for
+ * a reason that running the command again as it is will not change by itself,
+ * 2 a mistake in the command, 3 someone else got there first.
+ */
+export function report(result: DecideResult, asked: { remote: string; supersedes?: string | undefined }, io: Pick<Io, "out" | "err">): number {
+  const { remote, supersedes } = asked;
   if (result.ok) {
     io.out(`decision ${result.decision.id} recorded${supersedes === undefined ? "" : `, replacing ${supersedes}`}: ${result.decision.text}`);
     if (result.dropped > 0) {
@@ -41,12 +58,27 @@ export async function run(args: string[], io: Io): Promise<number> {
     return EXIT.OK;
   }
 
-  const remote = ctx.config.remote;
   switch (result.reason) {
     case "unknown-supersedes":
       throw new UsageError(`there is no decision ${supersedes}; run "huddle decisions" to see the ids. Nothing was recorded.`);
+    case "already-superseded": {
+      const inForce = result.inForce ?? [];
+      const first = inForce[0];
+      const more = inForce.length > 1 ? ` (and ${inForce.length - 1} more; see "huddle decisions")` : "";
+      io.err(
+        first === undefined
+          ? `huddle: decision ${supersedes} was already replaced. The decision was NOT recorded; run "huddle decisions" to see what is in force.`
+          : `huddle: decision ${supersedes} was already replaced by ${shown(first)}${more}. The decision was NOT recorded. To replace the rule in force, run the command again with --supersedes ${first.decision.id}.`,
+      );
+      return EXIT.CONFLICT;
+    }
     case "offline":
-      io.err(`huddle: could not reach remote "${remote}" (offline or timed out). The decision was NOT recorded; run the command again when the remote is reachable.`);
+      // Once the push has gone out, a missing answer does not say whether the remote took it.
+      io.err(
+        result.sent
+          ? `huddle: remote "${remote}" stopped answering while the decision was being sent, so it may or may not have been recorded. Check with "huddle decisions" before running the command again.`
+          : `huddle: could not reach remote "${remote}" (offline or timed out). The decision was NOT recorded; run the command again when the remote is reachable.`,
+      );
       return EXIT.ERROR;
     case "denied":
       io.err(`huddle: remote "${remote}" refused a push to refs/huddle/*. The decision was NOT recorded; run "huddle doctor".`);
