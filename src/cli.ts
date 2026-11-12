@@ -21,7 +21,7 @@ import * as release from "./commands/release.ts";
 import * as status from "./commands/status.ts";
 import * as sync from "./commands/sync.ts";
 import * as task from "./commands/task.ts";
-import { CliError, EXIT, processIo } from "./core/io.ts";
+import { CliError, EXIT, HelpRequested, processIo } from "./core/io.ts";
 import type { Command, Io } from "./core/io.ts";
 
 // Replaced with the package version by scripts/build.mjs.
@@ -55,7 +55,7 @@ function usage(): string {
     ...Object.entries(COMMANDS).map(([name, command]) => `  ${name.padEnd(width)}  ${command.summary}`),
     "",
     "Options:",
-    "  -h, --help     Show this help",
+    "  -h, --help     Show this help; after a command, that command's usage",
     "  -V, --version  Show the version",
     "",
     "Exit codes: 0 ok, 1 error, 2 usage, 3 overlap or lost race",
@@ -86,6 +86,10 @@ async function main(argv: string[], io: Io): Promise<number> {
   } catch (error) {
     // A hook exits 0 on every internal error and stays quiet: it never breaks the agent.
     if (name === "hook") return EXIT.OK;
+    if (error instanceof HelpRequested) {
+      io.out(`${command.summary}\n\nUsage: ${error.usage}`);
+      return EXIT.OK;
+    }
     if (error instanceof CliError) {
       io.err(`huddle: ${error.message}`);
       return error.exitCode;
