@@ -75,9 +75,11 @@ async function bench(t: TestContext): Promise<Bench> {
     run: (clone, args, env = {}) =>
       clone.gitResult(args, { env: { PATH: `${dirname(BUNDLE_NODE)}${delimiter}${process.env.PATH ?? ""}`, HUDDLE_TEST_RECORD: file, ...env } }),
     async settled(hook, count) {
-      for (let i = 0; i < 2000; i++) {
+      // By the clock and not by a number of looks: on a busy machine a look takes as long as it takes.
+      for (const end = Date.now() + 120_000; ; ) {
         const found = records(hook);
         if (found.length >= count) return found;
+        if (Date.now() >= end) break;
         await new Promise((resolve) => setTimeout(resolve, 10));
       }
       throw new Error(`the ${hook} hook never reported ${count} time(s); records: ${JSON.stringify(records())}`);
@@ -914,24 +916,50 @@ async function vendor(clone: Clone): Promise<void> {
   await clone.write(".huddle/config.json", "{}\n");
 }
 
-async function until(what: string, done: () => boolean | Promise<boolean>): Promise<void> {
-  for (let i = 0; i < 1500; i++) {
-    if (await done()) return;
+/**
+ * How long a wait may take before it counts as never. Generous on purpose: a
+ * wait that comes true costs only what it took, and the machine may be busy
+ * with three other test runs.
+ */
+const NEVER_MS = 120_000;
+
+/**
+ * How long one hook gets to show what it did before a test fires its event
+ * again. A hook has a deadline of its own (150 ms and up, hooks/engine.ts)
+ * and gives up without a word when that passes, which on a loaded machine it
+ * does. Giving up is what it is meant to do. So a test that needs a hook's
+ * work does not wait longer for a hook that has already gone: it asks again,
+ * and calls it broken only when nothing gets through in NEVER_MS.
+ */
+const ONE_HOOK_MS = 3000;
+
+/** Did `done` come true within `withinMs`? Looks at least once. */
+async function reached(done: () => boolean | Promise<boolean>, withinMs: number): Promise<boolean> {
+  for (const end = Date.now() + withinMs; ; ) {
+    if (await done()) return true;
+    if (Date.now() >= end) return false;
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
-  throw new Error(`gave up waiting for ${what}`);
+}
+
+async function until(what: string, done: () => boolean | Promise<boolean>): Promise<void> {
+  if (!(await reached(done, NEVER_MS))) throw new Error(`gave up waiting for ${what}`);
 }
 
 /**
  * The post hooks run detached, so one may still be at work when a test ends
  * and its directories are removed. This fires one more with the clock pinned
- * and waits until it has left that time in the clone's state.
+ * and waits until it has left that time in the clone's state; and fires
+ * another when that one ran out of time (see ONE_HOOK_MS).
  */
 async function lastHookDone(b: Bench, clone: Clone): Promise<void> {
-  const at = new Date(Date.now() + 120_000).toISOString();
-  ok(await b.run(clone, ["checkout", "--quiet", "-b", `done-${Date.now()}`], { HUDDLE_NOW: at }));
   const { localFile } = await clone.paths();
-  await until("the last post hook to finish", () => existsSync(localFile) && readFileSync(localFile, "utf8").includes(at));
+  let attempt = 0;
+  await until("the last post hook to finish", async () => {
+    const at = new Date(Date.now() + 120_000 + attempt * 1000).toISOString();
+    ok(await b.run(clone, ["checkout", "--quiet", "-b", `done-${Date.now()}-${attempt++}`], { HUDDLE_NOW: at }));
+    return reached(() => existsSync(localFile) && readFileSync(localFile, "utf8").includes(at), ONE_HOOK_MS);
+  });
 }
 
 const huddleRefs = (h: Harness): Promise<string> => h.remoteGit("for-each-ref", "--format=%(refname)", "refs/huddle/");
@@ -1025,8 +1053,13 @@ test("git hooks, end to end: on a branch from before huddle was set up the hooks
   assert.equal(existsSync(stateDir), false, "no huddle state was created");
   assert.equal(await huddleRefs(b.h), "", "and nothing was published");
 
-  ok(await b.run(erin, ["checkout", "--quiet", "main"]));
-  await until("the post-checkout hook on main", () => existsSync(localFile));
+  // Back on main the bundle is there, and the first hook that gets its work done records the session.
+  await until("a post-checkout hook on main to record the session", async () => {
+    ok(await b.run(erin, ["checkout", "--quiet", "main"]));
+    if (await reached(() => existsSync(localFile), ONE_HOOK_MS)) return true;
+    ok(await b.run(erin, ["checkout", "--quiet", "old"])); // that one ran out of time: once more
+    return false;
+  });
   await lastHookDone(b, erin);
 });
 
@@ -1049,4 +1082,56 @@ test("git adapter: registered, and on for every repository with a working tree",
   assert.equal(await gitHooks.detect(nowhere), false);
   await assert.rejects(gitHooks.install({ repoRoot: nowhere, bundle: BUNDLE }), /this is not a git repository with a working tree/);
   assert.deepEqual(await gitHooks.check(nowhere), { installed: false, detail: "no git hooks: this is not a git repository with a working tree", notes: [] });
+});
+
+test("git hooks, end to end: a second commit a moment after the first, with nothing after it, still reaches teammates", { skip: !POSIX }, async (t) => {
+  const b = await bench(t);
+  const carol = await b.h.clone("carol");
+  await mkdir(join(carol.dir, ".huddle"), { recursive: true });
+  await copyFile(BUILT_BUNDLE, join(carol.dir, BUNDLE));
+  await carol.write(".huddle/config.json", '{ "syncIntervalSeconds": 5 }\n');
+  await carol.commit("Set up huddle");
+  await carol.push();
+  await install(carol);
+  const paths = await carol.paths();
+  const live = { HUDDLE_NO_BACKGROUND: "" };
+  const published = async (): Promise<string[]> => {
+    const refs = (await b.h.remoteGit("for-each-ref", "--format=%(refname)", "refs/huddle/actors")).split("\n").filter(Boolean);
+    const docs = await Promise.all(refs.map(async (ref) => JSON.parse(await b.h.remoteGit("cat-file", "-p", `${ref}:doc.json`)) as { sessions: Array<{ files: string[] }> }));
+    return docs.flatMap((doc) => doc.sessions.flatMap((session) => session.files));
+  };
+
+  const pending = join(paths.stateDir, "sync-pending");
+  const idle = (): boolean => !existsSync(pending) && !existsSync(paths.syncLock);
+  const commit = async (file: string): Promise<void> => {
+    await carol.write(file, "export {};\n");
+    ok(await b.run(carol, ["add", file]));
+    ok(await b.run(carol, ["commit", "--quiet", "--no-verify", "-m", file], live));
+  };
+
+  // Two commits, the second inside the sync interval of the first. Each is the work of one post-commit hook, and a
+  // hook that ran out of time has done nothing (ONE_HOOK_MS): then the pair is started again, with new files.
+  let round = 0;
+  let second = "";
+  let committed = 0;
+  await until("a commit inside the sync interval to be put down for a later sync", async () => {
+    const first = `src/one-${round}.ts`;
+    second = `src/two-${round++}.ts`;
+    await commit(first);
+    // The first sync of the clone, or the one an earlier round left for later: either way a sync has just happened.
+    if (!(await reached(async () => (await published()).includes(first), 10_000))) return false;
+    if (!(await reached(idle, 10_000))) return false;
+
+    // Inside the interval. Nothing follows: no other commit, no agent, no end of a turn.
+    await commit(second);
+    committed = Date.now();
+    // Not published at once, or it did not fall inside the interval and this round shows nothing.
+    if ((await published()).includes(second)) return false;
+    // What the hook leaves when it has put the sync down for later.
+    return reached(() => existsSync(pending), ONE_HOOK_MS);
+  });
+  await until("the second commit to be published", async () => (await published()).includes(second));
+  t.diagnostic(`round ${round}: the second commit reached the remote ${Date.now() - committed} ms after it was made; the interval is 5 s`);
+  await until("the deferred sync to finish", () => !existsSync(join(paths.stateDir, "sync-pending")) && !existsSync(paths.syncLock));
+  await lastHookDone(b, carol);
 });

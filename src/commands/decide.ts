@@ -8,6 +8,7 @@ import { cleanText, LIMITS } from "../core/docs.ts";
 import { EXIT, UsageError } from "../core/io.ts";
 import type { Io } from "../core/io.ts";
 import { resolveSession } from "../core/session.ts";
+import { scrubSecrets } from "../hooks/intent.ts";
 import { ID_RE } from "../core/types.ts";
 
 export const summary = "Record a decision others must follow: huddle decide \"<text>\"";
@@ -16,14 +17,26 @@ const USAGE = 'huddle decide [--supersedes <id>] [--] "<choice others must follo
 
 export async function run(args: string[], io: Io): Promise<number> {
   const { values, positionals } = parse(args, { supersedes: { type: "string", multiple: true } }, USAGE);
-  const typed = positionals.join(" ");
-  const text = cleanText(typed, LIMITS.decisionText);
-  if (text === "") throw new UsageError(`the decision is empty\nUsage: ${USAGE}`);
+  const typed = cleanText(positionals.join(" "), Number.MAX_SAFE_INTEGER);
+  if (typed === "") throw new UsageError(`the decision is empty\nUsage: ${USAGE}`);
   // A rule that others must follow is not cut short behind the author's back.
-  const length = Array.from(cleanText(typed, Number.MAX_SAFE_INTEGER)).length;
+  const length = Array.from(typed).length;
   if (length > LIMITS.decisionText) {
     throw new UsageError(`a decision is at most ${LIMITS.decisionText} characters; this one is ${length}. Say it shorter, or split it into two.`);
   }
+  // A decision is read by everyone who can read the repository, and it is never removed. What
+  // looks like a credential is not published (hooks/intent.ts; best effort). An intent is
+  // published with that part taken out, because the next prompt replaces it. A decision is the
+  // rule itself: with a part taken out it is a rule nobody can follow, for good. So it is refused.
+  const scrubbed = scrubSecrets(typed);
+  if (scrubbed !== typed) {
+    throw new UsageError(
+      "part of this looks like a credential, so the decision was NOT recorded: a decision is read by everyone who can read the repository and is never removed. " +
+        `What huddle would have published:\n  ${scrubbed}\n` +
+        "Say it without that part. A full commit id, a digest and a UUID look like a credential to huddle too: a short commit id is taken, and so is the name of the file or the setting that holds the value.",
+    );
+  }
+  const text = typed;
   const named = values.supersedes ?? [];
   if (named.length > 1) throw new UsageError(`a decision replaces one other decision; --supersedes was given ${named.length} times\nUsage: ${USAGE}`);
   const supersedes = named[0]?.trim();

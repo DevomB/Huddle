@@ -1,0 +1,8 @@
+{
+  "session_id": "7c1f0c4e-52b3-4a8e-9d6a-1b2e3f405a6b",
+  "transcript_path": "/home/dev/.gemini/tmp/acme/chats/session-2026-11-12T09-30-7c1f0c4e.json",
+  "cwd": "/home/dev/acme",
+  "hook_event_name": "SessionStart",
+  "timestamp": "2026-11-12T09:30:00.000Z",
+  "source": "startup"
+}
