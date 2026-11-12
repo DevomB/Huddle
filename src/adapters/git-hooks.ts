@@ -417,16 +417,6 @@ async function writeHook(file: string, text: string): Promise<void> {
 // install, remove, check, detect
 // ---------------------------------------------------------------------------
 
-/**
- * `files`: the hook files the team commits, changed by this run or not, which
- * init uses to say what is still to be committed. `broken`: the hooks are
- * there and cannot work as they are, which doctor warns about. Both are
- * optional fields of the contract that T2.3 adds to types.ts; until that is
- * merged they are spelled out here.
- */
-type Installed = InstallResult & { files?: string[] };
-type Check = CheckResult & { broken?: boolean };
-
 /** The hooks do nothing without node, and say nothing: so init and doctor say it. */
 const NODE_NOTE =
   "The git hooks need node on the PATH of whatever runs git. A graphical git client or an editor's source control panel may not have it there (nvm, fnm and volta set it up in the shell). The hooks then do nothing and say nothing, and commits made there do not reach teammates.";
@@ -464,7 +454,7 @@ function byHand(bundle: string): string {
  * install(), with the platform passed in for tests. Throws when no hook could
  * be installed at all, with the reason: `huddle init` reports it as a note.
  */
-export async function installGitHooks(opts: InstallOptions, platform: NodeJS.Platform = process.platform): Promise<Installed> {
+export async function installGitHooks(opts: InstallOptions, platform: NodeJS.Platform = process.platform): Promise<InstallResult> {
   const bundle = bundlePath(opts.bundle);
   if (!SHELL_INERT.test(bundle)) {
     throw new TypeError(`the bundle path ${JSON.stringify(bundle)} cannot be written into a shell command (letters, digits, ".", "_", "-" and "/" only)`);
@@ -537,7 +527,7 @@ export async function removeGitHooks(repoRoot: string, platform: NodeJS.Platform
 }
 
 /** check(), with the platform passed in for tests. */
-export async function checkGitHooks(repoRoot: string, platform: NodeJS.Platform = process.platform): Promise<Check> {
+export async function checkGitHooks(repoRoot: string, platform: NodeJS.Platform = process.platform): Promise<CheckResult> {
   const place = await findPlace(repoRoot);
   if (typeof place === "string") return { installed: false, detail: `no git hooks: ${place}`, notes: [] };
 

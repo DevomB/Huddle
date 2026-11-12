@@ -98,9 +98,9 @@ import { homedir } from "node:os";
 import { join, posix, win32 } from "node:path";
 import { CliError } from "../core/io.ts";
 import { asRecord, asText, checkHooks, contextOutput, exists, installHooks, onPath, plainCommand, twiceNote } from "./json-hooks.ts";
-import type { Check, HookFile, Installed, Json, Registration } from "./json-hooks.ts";
+import type { HookFile, Json, Registration } from "./json-hooks.ts";
 import { SILENT } from "./types.ts";
-import type { Adapter, HookEvent, HookInput, HookOutcome, HookOutput, InstallOptions } from "./types.ts";
+import type { Adapter, CheckResult, HookEvent, HookInput, HookOutcome, HookOutput, InstallOptions, InstallResult } from "./types.ts";
 
 const NAME = "gemini-cli";
 const SETTINGS = ".gemini/settings.json";
@@ -425,7 +425,7 @@ async function startsWithMark(repoRoot: string): Promise<boolean> {
   return text.startsWith(MARK);
 }
 
-async function install(opts: InstallOptions): Promise<Installed> {
+async function install(opts: InstallOptions): Promise<InstallResult> {
   let changed: boolean;
   let twice: string[];
   try {
@@ -507,7 +507,7 @@ function switchesIn(settings: Json | null | "invalid"): { enabled: boolean | und
 }
 
 /** check(), with the surroundings passed in. */
-export async function checkGeminiCli(repoRoot: string, around: Surroundings): Promise<Check> {
+export async function checkGeminiCli(repoRoot: string, around: Surroundings): Promise<CheckResult> {
   const { result, settings, twice } = await checkHooks(SETTINGS_FILE, repoRoot);
   if (!result.installed) {
     // With comments as the only obstacle the hooks in the file may well be running: Gemini CLI reads it. Not known to be broken.
