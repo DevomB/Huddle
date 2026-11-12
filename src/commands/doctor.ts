@@ -12,7 +12,7 @@ import { resolveBase } from "../core/files.ts";
 import { git } from "../core/git.ts";
 import { EXIT, NotImplementedError, UsageError } from "../core/io.ts";
 import type { Io } from "../core/io.ts";
-import { loadConfigReport } from "../core/paths.ts";
+import { loadConfigReport, settingsHome } from "../core/paths.ts";
 import { readCache, readLocal } from "../core/store.ts";
 import { actorRef, REF_PATTERN } from "../core/types.ts";
 import type { ActorDoc } from "../core/types.ts";
@@ -99,9 +99,29 @@ async function toolchain(ctx: Ctx): Promise<Check> {
   return check("toolchain", "ok", label);
 }
 
+/**
+ * Another checkout of this clone that is set up, when this one is not: a
+ * worktree on a branch from before huddle was set up. Commands typed here go
+ * by that checkout's settings (paths.settingsHome). Null when this checkout
+ * is set up itself, or none is.
+ */
+async function setUpElsewhere(ctx: Ctx): Promise<string | null> {
+  // settingsHome gives back another checkout only when this one is not set up and that one is.
+  const home = await settingsHome(ctx.paths);
+  return home.worktree === ctx.paths.worktree ? null : home.worktree;
+}
+
 async function bundle(ctx: Ctx): Promise<Check> {
   const vendored = await readText(ctx.paths.bundleFile);
   if (vendored === null) {
+    const elsewhere = await setUpElsewhere(ctx);
+    if (elsewhere !== null) {
+      // Running init here would set huddle up a second time, on this branch, and conflict with the first when the two meet.
+      return check("bundle", "warn", `${BUNDLE} is missing in this checkout; ${elsewhere} has it`, [
+        "this checkout's branch does not have huddle yet. An agent started here runs no huddle hooks until the branch gets .huddle: merge or rebase onto the branch that has it.",
+        "commands typed here work, with that checkout's settings",
+      ]);
+    }
     return check("bundle", "warn", `${BUNDLE} is missing`, ['run "huddle init" and commit the result, so teammates and agent hooks can run huddle from the repo']);
   }
   const version = bundleVersion(vendored);
@@ -130,9 +150,12 @@ async function config(ctx: Ctx): Promise<Check> {
   const capture = c.captureIntent
     ? "prompt capture is on: the first 200 characters of each prompt are shared with everyone who can read this repo (captureIntent: false turns it off)"
     : "prompt capture is off: agents announce what they are doing with huddle intent";
+  // The settings in force are those of a set-up checkout of the clone when this one has none; so are their problems.
+  const elsewhere = await setUpElsewhere(ctx);
   // A settings file that cannot be used is skipped, not fatal; what was skipped is said here.
-  const { problems } = await loadConfigReport(ctx.paths);
-  return check("config", problems.length > 0 ? "warn" : "info", detail, [...problems, capture]);
+  const { problems } = await loadConfigReport(await settingsHome(ctx.paths));
+  const from = elsewhere === null ? [] : [`this checkout has no .huddle: these are the settings of ${elsewhere}`];
+  return check("config", problems.length > 0 ? "warn" : "info", detail, [...from, ...problems, capture]);
 }
 
 /**

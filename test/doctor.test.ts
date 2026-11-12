@@ -358,6 +358,37 @@ test("a repo that never ran init gets warnings, not failures", async (t) => {
   assert.match(r.stdout, /huddle can work here; 1 thing to look at\./);
 });
 
+test("in a worktree whose branch has no .huddle, doctor says whose settings are in force and what the branch lacks", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  const old = await alice.addWorktree("old"); // a branch from before huddle was set up
+  assert.equal((await alice.huddle(["init", "--agent", "claude-code"])).code, 0);
+  await alice.write(".huddle/config.json", `${JSON.stringify({ ttlMinutes: 45 })}\n`);
+  await commitAll(h, alice, "Set up huddle");
+
+  const { code, report } = await doctorJson(old, ["--offline"]);
+  assert.equal(code, 0);
+  const config = find(report, "config");
+  assert.match(config.detail, /sessions expire after 45m/, "the settings a command typed here really runs on");
+  assert.match(config.notes[0] ?? "", /^this checkout has no \.huddle: these are the settings of .*[\\/]alice$/);
+  const bundle = find(report, "bundle");
+  assert.equal(bundle.level, "warn");
+  assert.match(bundle.detail, /^\.huddle\/huddle\.mjs is missing in this checkout; .*[\\/]alice has it$/);
+  assert.match(bundle.notes[0] ?? "", /An agent started here runs no huddle hooks until the branch gets \.huddle: merge or rebase onto the branch that has it\.$/);
+  assert.doesNotMatch(bundle.notes.join("\n"), /run "huddle init"/, "a second init on this branch would meet the first in a conflict");
+
+  // The checkout that is set up says nothing of the kind.
+  const main = (await doctorJson(alice, ["--offline"])).report;
+  assert.ok(!find(main, "config").notes.some((note) => note.includes("has no .huddle")));
+  assert.equal(find(main, "bundle").level, "ok");
+
+  // A settings file that cannot be used is the same problem seen from either checkout.
+  await alice.write(".huddle/config.json", "{ broken");
+  const broken = find((await doctorJson(old, ["--offline"])).report, "config");
+  assert.equal(broken.level, "warn");
+  assert.ok(broken.notes.some((note) => /^\.huddle\/config\.json is not valid JSON/.test(note)), broken.notes.join("\n"));
+});
+
 test("no base branch to compare with is a warning that says what is lost and how to fix it", async (t) => {
   const { alice } = await setUp(t);
   await alice.git("remote", "set-head", "origin", "--delete");
