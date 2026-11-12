@@ -3,6 +3,7 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { hostname, userInfo } from "node:os";
+import { join } from "node:path";
 import { LIMITS, cleanText, newId } from "./docs.ts";
 import { git } from "./git.ts";
 import { ensureStateDir } from "./paths.ts";
@@ -64,6 +65,42 @@ async function userName(paths: RepoPaths): Promise<string> {
   return "unknown";
 }
 
+/**
+ * Where getIdentity leaves the user name it resolved, for getIdentityFast.
+ * Local state like the actor file: never committed.
+ */
+function userFile(paths: RepoPaths): string {
+  return join(paths.stateDir, "user");
+}
+
+/**
+ * The remembered user name, or null when there is none that can be trusted:
+ * the file is missing, unreadable, empty, or holds anything other than one
+ * clean line within the published limit (anything cleanText would change).
+ */
+async function rememberedUser(paths: RepoPaths): Promise<string | null> {
+  try {
+    const stored = (await readFile(userFile(paths), "utf8")).replace(/\r?\n$/, "");
+    return stored !== "" && cleanText(stored, LIMITS.name) === stored ? stored : null;
+  } catch {
+    return null;
+  }
+}
+
+/** userName(), remembered for getIdentityFast. Remembering is best effort: the name is right for this call either way. */
+async function resolveUser(paths: RepoPaths): Promise<string> {
+  const [user, remembered] = await Promise.all([userName(paths), rememberedUser(paths)]);
+  if (user !== remembered) {
+    try {
+      await ensureStateDir(paths);
+      await writeFileAtomic(userFile(paths), `${user}\n`);
+    } catch {
+      // A read-only state directory, a full disk: the next call tries again.
+    }
+  }
+  return user;
+}
+
 /** The first label of the host name: enough to tell machines apart without publishing a full domain name. */
 function hostLabel(): string {
   return cleanText(hostname().split(".")[0], LIMITS.name) || "unknown";
@@ -75,9 +112,27 @@ function hostLabel(): string {
  * processes call it for the first time at once (they all end up with the same
  * id). `user` is git's user.name, falling back to the OS user name; `host` is
  * the first label of the machine's host name.
+ *
+ * Starts one git process to read user.name, and remembers the answer in the
+ * state directory for getIdentityFast.
  */
 export async function getIdentity(paths: RepoPaths): Promise<Identity> {
-  const [actor, user] = await Promise.all([loadOrMintActor(paths), userName(paths)]);
+  const [actor, user] = await Promise.all([loadOrMintActor(paths), resolveUser(paths)]);
+  return { actor, user, host: hostLabel() };
+}
+
+/**
+ * The same identity without starting git, for the hooks that run before every
+ * prompt and every edit. `user` is the name getIdentity last resolved in this
+ * clone, so a change to user.name shows here after the next sync or CLI
+ * command rather than at once. When nothing usable is remembered (first use,
+ * or a damaged file) this is getIdentity.
+ */
+export async function getIdentityFast(paths: RepoPaths): Promise<Identity> {
+  const [actor, user] = await Promise.all([
+    loadOrMintActor(paths),
+    rememberedUser(paths).then((remembered) => remembered ?? resolveUser(paths)),
+  ]);
   return { actor, user, host: hostLabel() };
 }
 
