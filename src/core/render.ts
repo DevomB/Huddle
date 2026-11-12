@@ -8,7 +8,7 @@
 // decisions, task titles) goes through cleanText again here, whatever the
 // cache gate already did, so nothing a teammate wrote can start a line of its
 // own or pose as huddle's framing. And none of it is shown with "<" or ">" in
-// it (see display()): the tags an agent's harness frames its context with are
+// it (see shownText()): the tags an agent's harness frames its context with are
 // made of those, and a teammate's text must not be able to write one.
 
 import { ELLIPSIS, cleanText } from "./docs.ts";
@@ -61,8 +61,13 @@ const RIGHT = String.fromCodePoint(0x203a); // single right-pointing angle quota
  * a teammate must not be able to close one or open one. A generic type in an
  * intent still reads as what it is. Only what is shown changes: the documents
  * keep the text as it was written.
+ *
+ * Exported for the commands that print a teammate's text without going
+ * through this file (a task's title or owner, a decision's text): whatever
+ * an agent may read in a terminal goes through here, not through cleanText
+ * alone. Not for what is stored or printed as JSON.
  */
-function display(value: unknown, max: number): string {
+export function shownText(value: unknown, max: number): string {
   return cleanText(value, max).replace(/</g, LEFT).replace(/>/g, RIGHT);
 }
 
@@ -75,11 +80,11 @@ function sentence(value: string): string {
 }
 
 function who(person: { user: string; agent: string }): string {
-  return `${display(person.user, 40) || "unknown"} / ${display(person.agent, 30) || "unknown"}`;
+  return `${shownText(person.user, 40) || "unknown"} / ${shownText(person.agent, 30) || "unknown"}`;
 }
 
 function branchOf(session: ViewSession): string {
-  return display(session.branch, 80) || "(no branch)";
+  return shownText(session.branch, 80) || "(no branch)";
 }
 
 /** "bob / codex on feat/login (2m ago)" */
@@ -90,7 +95,7 @@ function sessionHead(session: ViewSession, nowMs: number): string {
 
 /** `"Build the login page UI".` or `no stated intent.` */
 function intentOf(session: ViewSession): string {
-  const intent = display(session.intent, 200);
+  const intent = shownText(session.intent, 200);
   return intent === "" ? "no stated intent." : `${quote(intent)}.`;
 }
 
@@ -104,7 +109,7 @@ function fileList(files: string[], maxCount: number, maxChars: number): string {
   let used = 0;
   for (const file of files) {
     if (shown.length >= maxCount) break;
-    const name = display(file, 120);
+    const name = shownText(file, 120);
     if (shown.length > 0 && used + 2 + name.length > maxChars) break;
     used += (shown.length > 0 ? 2 : 0) + name.length;
     shown.push(name);
@@ -114,7 +119,7 @@ function fileList(files: string[], maxCount: number, maxChars: number): string {
 }
 
 function claimList(claims: string[], maxCount: number): string {
-  const shown = claims.slice(0, maxCount).map((claim) => display(claim, 120));
+  const shown = claims.slice(0, maxCount).map((claim) => shownText(claim, 120));
   const more = claims.length - shown.length;
   return more > 0 ? `${shown.join(", ")} (+${more} more)` : shown.join(", ");
 }
@@ -174,7 +179,7 @@ function decisionLines(decisions: ViewDecision[], fresh: boolean, detail: Level)
   if (decisions.length === 0) return [];
   const head = `Decisions (${decisions.length}${fresh ? " new" : ""})`;
   if (detail.decisions <= 0) return [`${head}: run \`huddle decisions\` to read them.`];
-  const shown = decisions.slice(0, detail.decisions).map((decision) => sentence(display(decision.text, detail.decisionChars)));
+  const shown = decisions.slice(0, detail.decisions).map((decision) => sentence(shownText(decision.text, detail.decisionChars)));
   const more = decisions.length - shown.length;
   if (shown.length === 1 && more === 0) return [`${head}: ${shown[0]}`];
   const lines = [`${head}:`, ...shown.map((line) => `- ${line}`)];
@@ -339,7 +344,7 @@ export function renderBriefing(view: TeamView, opts: BriefingOptions = {}): Brie
     for (const key of Object.keys(since).sort()) {
       if (!key.startsWith(SESSION_ITEM) || seen.items[key] !== undefined) continue;
       const value = since[key] ?? "";
-      left.push(display(value.slice(value.indexOf(" ") + 1), 160) || "a teammate's agent");
+      left.push(shownText(value.slice(value.indexOf(" ") + 1), 160) || "a teammate's agent");
     }
     const decisions = view.decisions.filter((decision) => since[decisionItem(decision)] !== seen.items[decisionItem(decision)]);
     const before = since[TASKS_ITEM] ?? "";
@@ -398,8 +403,8 @@ export function renderBriefing(view: TeamView, opts: BriefingOptions = {}): Brie
 const STATUS_FILES = 20;
 
 function taskLine(task: ViewTask, view: TeamView): string {
-  const id = display(task.id, 40);
-  const title = display(task.title, 200);
+  const id = shownText(task.id, 40);
+  const title = shownText(task.title, 200);
   const state = taskState(task);
   if (state === "open") return `- [${id}] open: ${title}`;
   const owner = task.owner === null ? "nobody" : who(task.owner);
@@ -413,7 +418,7 @@ function decisionLog(view: TeamView, notice: boolean): string[] {
   const nowMs = Date.parse(view.now);
   const lines = [`Decisions (${view.decisions.length}), newest first.${notice ? ` ${NOTICE}` : ""}`];
   for (const decision of view.decisions) {
-    lines.push(`- [${display(decision.id, 40)}] ${sentence(display(decision.text, 500))} (${who(decision)}, ${ageOf(decision.at, nowMs)})`);
+    lines.push(`- [${shownText(decision.id, 40)}] ${sentence(shownText(decision.text, 500))} (${who(decision)}, ${ageOf(decision.at, nowMs)})`);
   }
   return lines;
 }
@@ -464,12 +469,12 @@ export function renderStatus(view: TeamView): string {
 export function renderOverlaps(path: string, found: Overlap[], now: Date): string {
   if (found.length === 0) return "";
   const nowMs = now.getTime();
-  const lines = [`[huddle] ${display(path, 200)} overlaps teammates' work in flight. ${NOTICE}`];
+  const lines = [`[huddle] ${shownText(path, 200)} overlaps teammates' work in flight. ${NOTICE}`];
   for (const overlap of found) {
-    const match = display(overlap.match, 200);
+    const match = shownText(overlap.match, 200);
     let how: string;
     if (overlap.via === "claim") how = `claimed ${match}`;
-    else if (match === display(path, 200)) how = "has it in flight";
+    else if (match === shownText(path, 200)) how = "has it in flight";
     else how = `has ${match} in flight`;
     lines.push(`- ${sessionHead(overlap.session, nowMs)} ${how}: ${intentOf(overlap.session)}`);
   }

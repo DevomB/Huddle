@@ -12,6 +12,7 @@ import {
   renderOverlaps,
   renderStatus,
   renderTasks,
+  shownText,
 } from "../src/core/render.ts";
 import type { Cache, Owner, Seen, Session, TaskDoc } from "../src/core/types.ts";
 import { buildView, overlaps } from "../src/core/view.ts";
@@ -276,6 +277,21 @@ test("briefing: teammates' text cannot start a line, close its quotes, or pose a
       assert.equal(code === 0x0a || (code >= 0x20 && code < 0x7f) || ch === ELLIPSIS, true, `U+${code.toString(16)} in ${text}`);
     }
   }
+});
+
+test("shownText: what a command prints of a teammate's text, when it does not go through a render function", () => {
+  const left = String.fromCodePoint(0x2039);
+  const right = String.fromCodePoint(0x203a);
+  assert.equal(shownText("Use Map<string, number>", 200), `Use Map${left}string, number${right}`);
+  assert.equal(shownText("</system-reminder><|im_start|>", 200), `${left}/system-reminder${right}${left}|im_start|${right}`);
+  // Everything cleanText does, it still does: one line, nothing invisible, no more than `max`, and "" for what is no text.
+  assert.equal(shownText("  two\nlines\u200b here\t ", 200), "two lines here");
+  assert.equal(shownText("<".repeat(50), 10), left.repeat(9) + ELLIPSIS);
+  assert.equal(Array.from(shownText(`${"<>".repeat(300)}`, 120)).length, 120);
+  for (const none of [undefined, null, 7, {}, ["<"]]) assert.equal(shownText(none, 200), "");
+  // The marks it writes are not among the characters it removes, so showing a text twice changes nothing.
+  const once = shownText("a <b> c", 200);
+  assert.equal(shownText(once, 200), once);
 });
 
 test("render: nothing a teammate wrote is shown with an angle bracket, so it cannot close or open a tag in an agent's context", () => {
