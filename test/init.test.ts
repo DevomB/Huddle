@@ -10,7 +10,7 @@ import { bundleVersion, compareVersions, run as init } from "../src/commands/ini
 import { CliError } from "../src/core/io.ts";
 import type { Io } from "../src/core/io.ts";
 import { DEFAULT_CONFIG } from "../src/core/types.ts";
-import { BUNDLE, BUNDLE_NODE, createHarness, TEST_ENV } from "./harness.ts";
+import { BUNDLE, BUNDLE_NODE, createHarness, TEST_ENV, posixOnly } from "./harness.ts";
 import type { Clone, Harness } from "./harness.ts";
 
 const pkg = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")) as { version: string };
@@ -214,7 +214,7 @@ test("a file that is not UTF-8, or that cannot be read, is left exactly as it is
   assert.deepEqual(await readFile(file), latin1);
 });
 
-test("AGENTS.md that cannot be read for another reason than not existing is never replaced", { skip: process.platform === "win32" ? "reads a directory as a file" : false }, async (t) => {
+test("AGENTS.md that cannot be read for another reason than not existing is never replaced", posixOnly("reads a directory as a file"), async (t) => {
   const h = await createHarness(t);
   const clone = await h.clone("alice");
   await mkdir(join(clone.dir, "AGENTS.md"));
@@ -399,7 +399,7 @@ test("exit test, second half: bob pulls, and his agents' hooks work with nothing
   assert.match((await vendored(alice, ["status", "--cached"])).stdout, /bob \/ claude-code on main/);
 });
 
-test("exit test, second half, Codex: the committed shell command works from a subdirectory", { skip: process.platform === "win32" ? "runs the POSIX command with sh" : false }, async (t) => {
+test("exit test, second half, Codex: the committed shell command works from a subdirectory", posixOnly("runs the POSIX command with sh"), async (t) => {
   const h = await createHarness(t);
   const alice = await h.clone("alice");
   const bob = await h.clone("bob");
@@ -647,7 +647,7 @@ test("the ignore rule can be anywhere git reads one from, and a rule that takes 
   assert.match(both.stdout, /add them by force: git add -f \.claude\/settings\.json \.codex\/hooks\.json, before the commit below\n/);
 });
 
-test("a hook file reached through a linked directory is named where it really is, and does not stop another hidden file from being reported", { skip: process.platform === "win32" ? "symbolic links" : false }, async (t) => {
+test("a hook file reached through a linked directory is named where it really is, and does not stop another hidden file from being reported", posixOnly("symbolic links"), async (t) => {
   const h = await createHarness(t);
   const clone = await h.clone("alice");
   // .claude is a link to a directory the team keeps elsewhere in the repository; .codex is ignored.
@@ -666,7 +666,7 @@ test("a hook file reached through a linked directory is named where it really is
   assert.equal(await clone.git("status", "--porcelain"), "", "what was printed could be run, and left nothing of huddle's behind");
 });
 
-test("AGENTS.md that is a link to another file in the repository: the file that changed is the one named for the commit",{ skip: process.platform === "win32" ? "symbolic links" : false }, async (t) => {
+test("AGENTS.md that is a link to another file in the repository: the file that changed is the one named for the commit",posixOnly("symbolic links"), async (t) => {
   const h = await createHarness(t);
   const clone = await h.clone("alice");
   // How many repositories give two agents one file.

@@ -2,6 +2,11 @@
 // Windows, unchanged. Dependency-free: Node, real git processes, the built bundle.
 //
 //   npm run build && node scripts/demo-mvp.mjs [--bundle <file>] [--keep] [--evidence <dir>]
+//   node scripts/demo-mvp.mjs --release <unpacked huddle-<version> directory>
+//
+// With --release, the demo runs the shipped artifact: Alice's setup is
+// `git huddle init`, found through PATH in that directory, and the bundle
+// compared against is the archive's huddle.mjs.
 //
 // Everything happens in a disposable directory under the OS temp directory, with
 // a space and non-ASCII letters in its name: one bare remote, Alice's and Bob's
@@ -30,7 +35,8 @@ const WINDOWS = process.platform === "win32";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const argv = process.argv.slice(2);
 const option = (name) => (argv.includes(name) ? argv[argv.indexOf(name) + 1] : undefined);
-const candidate = resolve(option("--bundle") ?? join(root, "dist", "huddle.mjs"));
+const releaseDir = option("--release") ? resolve(option("--release")) : null;
+const candidate = resolve(releaseDir ? join(releaseDir, "huddle.mjs") : (option("--bundle") ?? join(root, "dist", "huddle.mjs")));
 const keep = argv.includes("--keep");
 const evidenceDir = option("--evidence") ? resolve(option("--evidence")) : null;
 const fixtures = join(root, "test", "fixtures", "hooks", "claude-code");
@@ -70,8 +76,8 @@ function expect(condition, name, seen) {
   return false;
 }
 
-function onPath(names, env = process.env) {
-  for (const dir of (env.PATH ?? env.Path ?? "").split(delimiter)) {
+function onPath(names, path = process.env.PATH ?? "") {
+  for (const dir of path.split(delimiter)) {
     for (const name of names) if (dir && existsSync(join(dir, name))) return join(dir, name);
   }
   return null;
@@ -136,7 +142,12 @@ writeFileSync(
     "",
   ].join("\n"),
 );
+// A copy of process.env is a plain object: on Windows it loses the case-insensitive lookup, and PATH may be
+// spelled "Path". Keep exactly one key, PATH, with process.env's own (case-insensitive) value.
+const PATH = process.env.PATH ?? "";
 const env = { ...process.env, HOME: home, USERPROFILE: home, GIT_CONFIG_GLOBAL: gitconfig, GIT_CONFIG_NOSYSTEM: "1", GIT_TERMINAL_PROMPT: "0" };
+for (const name of Object.keys(env)) if (name.toUpperCase() === "PATH") delete env[name];
+env.PATH = releaseDir ? `${releaseDir}${delimiter}${PATH}` : PATH;
 for (const name of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_CEILING_DIRECTORIES", "HUDDLE_SESSION", "HUDDLE_NOW", "HUDDLE_DEBUG", "CLAUDE_PROJECT_DIR"]) delete env[name];
 
 const remote = join(base, "remote.git");
@@ -173,7 +184,7 @@ async function claudeHook(who, event, fixture, change = () => {}, { bundleDir = 
   // ${CLAUDE_PROJECT_DIR} is replaced as text with the native project directory: mixed separators on Windows.
   const args = (handler.args ?? []).map((arg) => arg.replaceAll("${CLAUDE_PROJECT_DIR}", bundleDir));
   // Exec form: the command is a program on PATH, never a shell line.
-  const program = onPath(WINDOWS ? [`${handler.command}.exe`, handler.command] : [handler.command], { PATH: path });
+  const program = onPath(WINDOWS ? [`${handler.command}.exe`, handler.command] : [handler.command], path);
   const payload = JSON.parse(readFileSync(join(fixtures, `${fixture}.json`), "utf8"));
   payload.cwd = who.dir;
   if (typeof payload.transcript_path === "string") payload.transcript_path = join(home, ".claude", "projects", "demo", `${payload.session_id}.jsonl`);
@@ -218,12 +229,13 @@ try {
   ok("one bare remote, Alice's and Bob's clones", `checkout paths with a space and non-ASCII letters${WINDOWS ? ", core.autocrlf=true" : ""}`);
 
   // 2. Alice sets the repo up from the candidate bundle and pushes the setup; Bob pulls it.
-  const init = await run(node, [candidate, "init", "--agent", "claude-code", "--no-capture-intent"], { cwd: alice.dir, env });
-  assert(init.code === 0, "init (from the candidate bundle) succeeds in Alice's clone", show(init));
+  const setup = ["init", "--agent", "claude-code", "--agent", "codex", "--no-capture-intent"];
+  const init = releaseDir ? await run("git", ["huddle", ...setup], { cwd: alice.dir, env }) : await run(node, [candidate, ...setup], { cwd: alice.dir, env });
+  assert(init.code === 0, `${releaseDir ? "git huddle" : "node <candidate bundle>"} ${setup.join(" ")} succeeds in Alice's clone`, show(init));
   await gitOk(alice.dir, "add", "-A");
   await gitOk(alice.dir, "commit", "--quiet", "-m", "Set up huddle");
   await gitOk(alice.dir, "push", "--quiet");
-  ok("Alice: huddle init --agent claude-code --no-capture-intent, committed and pushed");
+  ok(`Alice: ${releaseDir ? "git huddle" : "huddle"} ${setup.join(" ")}, committed and pushed`, releaseDir ? `launcher from ${releaseDir}` : "");
   await gitOk(bob.dir, "pull", "--quiet");
   const vendored = readFileSync(join(bob.dir, ".huddle", "huddle.mjs"));
   assert(vendored.equals(bundleText), "Bob's pulled .huddle/huddle.mjs is byte for byte the candidate bundle (no line-ending conversion)", { bytes: vendored.length, crlf: vendored.includes("\r\n") });
@@ -287,6 +299,20 @@ try {
   assert(edit.result.code === 0, "PreToolUse handler exits 0 (advisory, never blocks)", show(edit.result));
   assert(/src\/auth\.ts overlaps/.test(context(edit.result)) && /Alice/.test(context(edit.result)), "the PreToolUse warning names src/auth.ts and Alice", context(edit.result));
   ok("REPLAY Claude PreToolUse Edit (Bob) on a native path: overlap warning, exit 0", nativeFile);
+
+  // Privacy preference honored: the team set --no-capture-intent, so a prompt never becomes published intent.
+  const privatePrompt = "PRIVATE-PROMPT-7f3c: draft the Globex pricing memo";
+  const prompt = await claudeHook(bob, "UserPromptSubmit", "user-prompt-submit.typed", (payload) => {
+    payload.prompt = privatePrompt;
+  });
+  assert(prompt.result.code === 0, "UserPromptSubmit handler exits 0", show(prompt.result));
+  assert((await bob.huddle(["sync"])).code === 0, "Bob: huddle sync after the prompt");
+  assert((await alice.huddle(["sync"])).code === 0, "Alice: huddle sync");
+  const seenByAlice = await alice.huddle(["status", "--json"]);
+  assert(!seenByAlice.stdout.includes("PRIVATE-PROMPT-7f3c") && /claude-code/.test(seenByAlice.stdout), "Alice sees Bob's Claude session, and not his prompt", json(seenByAlice, "status --json"));
+  const objects = await git(remote, "cat-file", "--batch-all-objects", "--batch");
+  assert(objects.code === 0 && !objects.stdout.includes("PRIVATE-PROMPT-7f3c"), "the prompt text is in no object on the remote", { code: objects.code });
+  ok("REPLAY Claude UserPromptSubmit with capture off: the prompt reaches no teammate and no object on the remote");
 
   // The bundle missing: node fails, and never with exit 2, Claude Code's blocking code.
   const parked = join(bob.dir, ".huddle", "huddle.mjs.parked");
