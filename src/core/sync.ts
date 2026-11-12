@@ -15,7 +15,7 @@ import type { RepoPaths } from "./paths.ts";
 import { toActorDoc } from "./session.ts";
 import { readCache, readLocal, removeSeen, updateLocal, withLock, writeCache } from "./store.ts";
 import { actorRef } from "./types.ts";
-import type { ActorDoc, Config, Doc, FailReason, LocalState, PublishResult } from "./types.ts";
+import type { ActorDoc, CacheEntry, Config, Doc, FailReason, LocalState, PublishResult } from "./types.ts";
 
 export interface SyncOptions {
   /** Ignore syncIntervalSeconds, and wait for a sync that is already running instead of skipping. */
@@ -123,7 +123,9 @@ async function round(ctx: Ctx): Promise<SyncResult> {
     return transport.publish(ownRef, doc, "own");
   };
 
-  const publishDue = shouldPublish(state.published, doc, hash, now, config);
+  // What teammates hold for each of our sessions, as far as the cache knows.
+  const shown = shownSeenAt(cache.refs[ownRef], state.published);
+  const publishDue = shouldPublish(state.published, doc, hash, now, config, shown);
   const [fetched, firstPublish] = await Promise.all([transport.fetchAll(known), publishDue ? publish() : Promise.resolve(null)]);
 
   let cacheChanged = false;
@@ -149,11 +151,17 @@ async function round(ctx: Ctx): Promise<SyncResult> {
     log(paths, "sync", `fetch failed: ${fetched.reason}`);
   }
 
-  // Our doc should be on the remote at the sha we last published. If it is not
-  // there (deleted, or overwritten by someone else), put it back.
   let published: PublishResult | null = firstPublish;
-  if (!published && fetched.ok && state.published && doc.sessions.length > 0 && cache.refs[ownRef]?.sha !== state.published.sha) {
-    published = await publish();
+  if (!published && fetched.ok && state.published && doc.sessions.length > 0) {
+    if (cache.refs[ownRef]?.sha !== state.published.sha) {
+      // Our doc should be on the remote at the sha we last published. It is not
+      // there (deleted, or overwritten by someone else): put it back.
+      published = await publish();
+    } else if (shown === null && shouldPublish(state.published, doc, hash, now, config, shownSeenAt(cache.refs[ownRef], state.published))) {
+      // The cache had no copy of our own doc (it was lost), so the rule could
+      // not see what teammates hold. The fetch has just brought that copy.
+      published = await publish();
+    }
   }
 
   if (published?.ok) {
@@ -249,6 +257,16 @@ async function inspectWorktree(worktree: string, config: Config): Promise<{ bran
 }
 
 /**
+ * For each of our sessions, the seenAt teammates hold: the one in `entry`,
+ * a copy of our own ref, when that copy is the document we published last.
+ * Null when it is not, or when there is no copy.
+ */
+function shownSeenAt(entry: CacheEntry | undefined, published: LocalState["published"]): Map<string, string> | null {
+  if (!published || !entry || entry.sha !== published.sha || entry.doc?.kind !== "actor") return null;
+  return new Map(entry.doc.sessions.map((session) => [session.id, session.seenAt] as const));
+}
+
+/**
  * A hash of what teammates would see change: everything except the timestamps
  * that move on every activity (updatedAt, seenAt), with lists in a fixed order.
  */
@@ -277,14 +295,36 @@ export function contentHash(doc: ActorDoc): string {
  * Step 4's rule. Publish when the content changed; or as a heartbeat, when the
  * last publish is older than heartbeatMinutes and some session has been active
  * since. A clone with no sessions that never published has nothing to say.
+ *
+ * One more case, inside the heartbeat interval. Teammates judge each session by
+ * the seenAt they hold for it (`shown`: session id to the seenAt in the last
+ * publish). A publish carries every session's seenAt as it was then, so a
+ * session that had been quiet for a while when another session of this clone
+ * caused the last publish is shown with its old seenAt. If it then wakes up,
+ * waiting out the interval would leave it looking expired to teammates while
+ * it is at work: its files and claims would vanish from their view and its
+ * tasks could be taken. So a session seen a heartbeat or more after what
+ * teammates hold for it is published at once.
  */
-export function shouldPublish(published: LocalState["published"], doc: ActorDoc, hash: string, now: Date, config: Config): boolean {
+export function shouldPublish(
+  published: LocalState["published"],
+  doc: ActorDoc,
+  hash: string,
+  now: Date,
+  config: Config,
+  shown: ReadonlyMap<string, string> | null = null,
+): boolean {
   if (!published) return doc.sessions.length > 0;
   if (published.hash !== hash) return true;
   const sinceLast = ageMs(published.at, now);
   if (Number.isNaN(sinceLast) || sinceLast < 0) return true;
-  if (sinceLast < config.heartbeatMinutes * 60_000) return false;
-  return doc.sessions.some((session) => Date.parse(session.seenAt) > Date.parse(published.at));
+  const heartbeat = config.heartbeatMinutes * 60_000;
+  if (sinceLast >= heartbeat) return doc.sessions.some((session) => Date.parse(session.seenAt) > Date.parse(published.at));
+  if (!shown) return false;
+  return doc.sessions.some((session) => {
+    const theirs = shown.get(session.id);
+    return theirs !== undefined && Date.parse(session.seenAt) - Date.parse(theirs) >= heartbeat;
+  });
 }
 
 export interface BackgroundOptions {
