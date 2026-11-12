@@ -181,20 +181,13 @@ function parse(input: HookInput): HookEvent | null {
  */
 const MAX_CONTEXT_CHARS = 6000;
 
-/**
- * `unshown`: format() was given a context and this event has no way to put it
- * in front of the agent. The engine is meant to leave what the session was
- * shown as it is, so that the same news comes up at the next event that can
- * carry it. The field is not in HookOutput yet; until the engine reads it, a
- * briefing built at a prompt is used up unseen.
- */
-type Output = HookOutput & { unshown?: boolean };
-
-function format(event: HookEvent, outcome: HookOutcome): Output {
+function format(event: HookEvent, outcome: HookOutcome): HookOutput {
   if (typeof outcome.context !== "string" || outcome.context.trim() === "") return SILENT;
   // Nothing is printed where no field reaches the agent. On stop the only
   // field there is, followup_message, would start another turn; on
   // beforeSubmitPrompt the only ones decide whether the prompt goes through.
+  // `unshown` tells the engine so: it leaves what the session was shown as it
+  // is, and the same news comes up at the next event that can carry it.
   if (!SPEAKS.has(asText(asRecord(event.native)?.event))) return { ...SILENT, unshown: true };
   // outcome.env is not used: see the top of the file. And no `permission` or
   // `continue` is ever printed, so huddle neither allows nor blocks anything.

@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { test } from "node:test";
 import type { TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -13,6 +13,11 @@ import { ADAPTERS, getAdapter } from "../src/adapters/index.ts";
 import { SILENT } from "../src/adapters/types.ts";
 import type { HookEvent, HookEventType, HookInput, HookOutput } from "../src/adapters/types.ts";
 import { CliError } from "../src/core/io.ts";
+import { OVERLAP_HINT } from "../src/core/render.ts";
+import { runHook } from "../src/hooks/engine.ts";
+import { DELTA_HEAD, FULL_FOOT, FULL_HEAD, ago, aliceBuildsAuth, aliceLine, at, authWarning, fire, forced, ioFor, publish, record, seenKeys, sessionOf, sessionsOf, text, throttled } from "./engine.kit.ts";
+import { BUNDLE as BUILT_BUNDLE, BUNDLE_NODE } from "./harness.ts";
+import type { Clone } from "./harness.ts";
 
 // The fixtures follow Cursor's hook reference as it read on 2026-11-12; none is recorded. See the README next to them.
 const FIXTURES = fileURLToPath(new URL("./fixtures/hooks/cursor/", import.meta.url));
@@ -20,7 +25,7 @@ const ROOT = "/home/dev/acme";
 const SESSION = "7c1d5a0e-93b4-4f6a-a2c8-51e0d9b7f3a6";
 
 type Json = Record<string, unknown>;
-type Output = HookOutput & { unshown?: boolean };
+type Output = HookOutput;
 
 function fixtureText(name: string): string {
   return readFileSync(join(FIXTURES, `${name}.json`), "utf8");
@@ -843,4 +848,165 @@ test("a payload of Cursor's is the Cursor adapter's alone: the Claude Code adapt
     assert.deepEqual(asClaude(JSON.stringify({ ...payload, cursor_version: "" })), asClaude(text), file);
   }
   assert.ok(handled > 10, "the Claude Code fixtures themselves are still handled");
+});
+
+// ---------------------------------------------------------------------------
+// Through the engine: what a Cursor session does to the team's picture, and hears of it
+// ---------------------------------------------------------------------------
+
+interface Ran {
+  code: number;
+  /** One entry per line printed. */
+  stdout: string[];
+  stderr: string[];
+}
+
+const QUIET: Ran = { code: 0, stdout: [], stderr: [] };
+/** Exit code 0 and one JSON object with the context under Cursor's key, nothing else. */
+const tells = (context: string): Ran => ({ code: 0, stdout: [JSON.stringify({ additional_context: context })], stderr: [] });
+
+/** A fixture as Cursor would send it from `clone`: the project directory in it becomes the clone's. */
+function payloadIn(clone: Clone, name: string, over: Json = {}): string {
+  const moved = (value: unknown): unknown => {
+    if (typeof value === "string") return value.split(ROOT).join(clone.dir);
+    if (Array.isArray(value)) return value.map(moved);
+    if (typeof value === "object" && value !== null) return Object.fromEntries(Object.entries(value).map(([key, inner]) => [key, moved(inner)]));
+    return value;
+  };
+  return JSON.stringify({ ...(moved(fixture(name)) as Json), ...over });
+}
+
+/** `huddle hook cursor <event>` in this process, in the clone, with the fixture on stdin and the clock at T0 + `seconds`. */
+async function cursorHook(clone: Clone, name: string, seconds: number, over: Json = {}): Promise<Ran> {
+  const io = ioFor(clone, { now: at(seconds), stdin: payloadIn(clone, name, over) });
+  const code = await runHook(["cursor", String(fixture(name).hook_event_name)], io);
+  return { code, stdout: io.stdout, stderr: io.stderr };
+}
+
+test("Cursor, through the engine: a briefing at the start, the intent from the prompt, the warning right after the edit, news with the next tool call, and never a word where Cursor would act on one", async (t) => {
+  const { alice, bob } = await aliceBuildsAuth(t);
+  const asked = record(t);
+  await mkdir(join(bob.dir, "packages", "api"), { recursive: true }); // where the shell command of the fixture ran
+  const run = (name: string, seconds: number, over: Json = {}): Promise<Ran> => cursorHook(bob, name, seconds, over);
+  const write = { tool_input: { file_path: join(bob.dir, "src", "auth.ts") } };
+
+  // sessionStart: the briefing, through the one field that reaches the agent.
+  assert.deepEqual(await run("session-start", 20), tells(text(FULL_HEAD, aliceLine(20), FULL_FOOT)));
+  assert.deepEqual(
+    (await sessionsOf(bob)).map((session) => [session.id, session.agent, session.worktree]),
+    [[SESSION, "cursor", bob.dir]],
+  );
+
+  // beforeSubmitPrompt: the start of the prompt is the intent, and nothing is printed, whatever there is to say.
+  assert.deepEqual(await run("before-submit-prompt", 22), QUIET);
+  assert.equal((await sessionOf(bob, SESSION))?.intent, "Add rate limiting to the login endpoint");
+
+  // The agent writes a file alice has in flight. Cursor leaves no place for a warning before the edit; it comes right after.
+  await bob.write("src/auth.ts", "export const auth = false;\n");
+  assert.deepEqual(await run("post-tool-use.write", 24, write), tells(authWarning(24)));
+  // afterFileEdit can say nothing; it is what gets the edit published. And the same file again is not warned about twice.
+  assert.deepEqual(await run("after-file-edit", 25, { file_path: join(bob.dir, "src", "auth.ts") }), QUIET);
+  assert.deepEqual(await run("post-tool-use.write", 26, write), QUIET);
+  // A shell command with nothing new to hear of: a sign of life.
+  assert.deepEqual(await run("post-tool-use.shell", 27), QUIET);
+  assert.equal((await sessionOf(bob, SESSION))?.seenAt, at(27));
+  // Events huddle does not register for are no events at all.
+  for (const name of ["pre-tool-use.write", "before-shell-execution", "subagent-stop", "workspace-open"]) assert.deepEqual(await run(name, 28), QUIET, name);
+  assert.equal((await sessionOf(bob, SESSION))?.seenAt, at(27));
+
+  // Alice moves on. The news is there when bob's next prompt goes in, and that hook cannot show it...
+  await fire(alice, "prompt", 30, { prompt: "Switch the JWT middleware to sessions" });
+  await publish(alice, 31);
+  await publish(bob, 32);
+  const before = await seenKeys(bob, SESSION);
+  assert.deepEqual(await run("before-submit-prompt", 35, { prompt: "Now the tests" }), QUIET);
+  assert.deepEqual(await seenKeys(bob, SESSION), before, "what could not be shown is not on record as shown");
+  // ...so it comes with the first tool call after it, once.
+  const news = text(DELTA_HEAD, `- alice / claude-code on main (${ago(30, 36)}): "Switch the JWT middleware to sessions". Files: src/auth.ts`, OVERLAP_HINT);
+  assert.deepEqual(await run("post-tool-use.shell", 36), tells(news));
+  assert.deepEqual(await run("post-tool-use.shell", 37), QUIET);
+
+  // stop: a word there would start another turn. sessionEnd: the session is gone.
+  assert.deepEqual(await run("stop", 40), QUIET);
+  assert.equal((await sessionsOf(bob)).length, 1);
+  assert.deepEqual(await run("session-end", 50), QUIET);
+  assert.deepEqual(await sessionsOf(bob), []);
+
+  // What bob's clone asked of the network on the way. One sync waited for, at the start. Then, each left behind:
+  // the intent at once (22), the edit through afterFileEdit (25) and the shell command (27) left to the throttle,
+  // the next intent at once (35), two more shell commands left to the throttle (36, 37), and the ends of the turn
+  // (40) and of the session (50) at once. The two overlap checks (24, 26) ask for nothing.
+  assert.equal(asked.waited.length, 1);
+  const asks = asked.background.filter((one) => one.worktree === bob.dir);
+  assert.deepEqual(asks, [forced(bob), throttled(bob), throttled(bob), forced(bob), throttled(bob), throttled(bob), forced(bob), forced(bob)]);
+});
+
+test("Cursor, through the engine: an edit whose file the payload does not name where huddle looks still counts, and brings the news instead of a warning", async (t) => {
+  const { bob } = await aliceBuildsAuth(t);
+  // Hooks installed in the middle of a session, or a cloud agent: no sessionStart came first.
+  await bob.write("src/auth.ts", "export const auth = false;\n");
+  const unnamed = await cursorHook(bob, "post-tool-use.write.unnamed", 20);
+  // Bob's clone has never synced, so there is nobody to brief on yet; the session is there all the same.
+  assert.equal(unnamed.code, 0);
+  assert.deepEqual(unnamed.stderr, []);
+  assert.deepEqual(
+    (await sessionsOf(bob)).map((session) => [session.id, session.agent, session.seenAt]),
+    [[SESSION, "cursor", at(20)]],
+  );
+  await publish(bob, 21);
+  // With the team's state fetched, the same payload is told what a prompt would be told: the briefing, not a warning.
+  const told = await cursorHook(bob, "post-tool-use.write.unnamed", 22);
+  assert.equal(told.stdout.length, 1);
+  const context = String((JSON.parse(told.stdout[0] ?? "{}") as Json).additional_context);
+  assert.ok(context.includes(aliceLine(22)), context);
+  assert.equal(context.includes("overlaps teammates' work in flight"), false, context);
+});
+
+test("Cursor running the hooks of .claude/settings.json: the Claude Code adapter does nothing with them, and the session is Cursor's alone", async (t) => {
+  const { bob } = await aliceBuildsAuth(t);
+  await publish(bob, 15);
+  for (const name of ["session-start", "before-submit-prompt", "post-tool-use.write", "stop"]) {
+    const io = ioFor(bob, { now: at(20), stdin: payloadIn(bob, name) });
+    assert.equal(await runHook(["claude-code"], io), 0, name);
+    assert.deepEqual([io.stdout, io.stderr], [[], []], name);
+  }
+  assert.deepEqual(await sessionsOf(bob), []);
+  await cursorHook(bob, "session-start", 21);
+  assert.deepEqual(
+    (await sessionsOf(bob)).map((session) => session.agent),
+    ["cursor"],
+  );
+});
+
+test("Cursor, through the bundle: the command install wrote, run from the project root, briefs a teammate who has only pulled", { skip: process.platform === "win32" }, async (t) => {
+  const { alice, bob } = await aliceBuildsAuth(t);
+  // What `huddle init` commits besides the config: the bundle and the hooks file. Bob gets both by pulling.
+  await mkdir(join(alice.dir, ".huddle"), { recursive: true });
+  await copyFile(BUILT_BUNDLE, join(alice.dir, BUNDLE));
+  await cursor.install({ repoRoot: alice.dir, bundle: BUNDLE });
+  await alice.commit("Add huddle's Cursor hooks");
+  await alice.push();
+  await bob.git("pull", "--quiet");
+  const hooks = (await readJson(join(bob.dir, ".cursor", "hooks.json"))).hooks as Record<string, Json[]>;
+  const env = { ...process.env, PATH: `${dirname(BUNDLE_NODE)}${delimiter}${process.env.PATH ?? ""}` };
+  const viaShell = (event: string, name: string, seconds: number): Promise<{ code: number | null; stdout: string; stderr: string }> =>
+    run("/bin/sh", ["-c", String(hooks[event]?.[0]?.command)], { cwd: bob.dir, env: { ...env, HUDDLE_NOW: at(seconds) }, stdin: payloadIn(bob, name) });
+
+  // sessionStart waits for one sync, so the briefing is of the team as it is on the remote.
+  const started = await viaShell("sessionStart", "session-start", 20);
+  assert.deepEqual([started.code, started.stderr], [0, ""]);
+  assert.deepEqual(JSON.parse(started.stdout), { additional_context: text(FULL_HEAD, aliceLine(20), FULL_FOOT) });
+  assert.equal(started.stdout, `${JSON.stringify({ additional_context: text(FULL_HEAD, aliceLine(20), FULL_FOOT) })}\n`, "one line and nothing around it");
+  assert.deepEqual(
+    (await sessionsOf(bob)).map((session) => [session.id, session.agent]),
+    [[SESSION, "cursor"]],
+  );
+  // And alice, after a sync of her own, sees a Cursor session on bob's clone.
+  await publish(alice, 22);
+  const status = await alice.huddle(["status"], { now: at(23) });
+  assert.match(status.stdout, /^- bob \/ cursor on main /m);
+
+  const ended = await viaShell("sessionEnd", "session-end", 30);
+  assert.deepEqual([ended.code, ended.stdout, ended.stderr], [0, "", ""]);
+  assert.deepEqual(await sessionsOf(bob), []);
 });
