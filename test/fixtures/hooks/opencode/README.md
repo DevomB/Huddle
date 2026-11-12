@@ -18,10 +18,12 @@ tests is a stand-in, written after the source of the two majors in use on
 - opencode 2: tag `v2.2.7` of github.com/anomalyco/opencode, the plugin API in
   `packages/plugin/src/promise/` (`ctx.session.hook("prompt")`,
   `ctx.tool.hook("execute.after")`, `ctx.session.hook("experimental.idle")`,
-  `ctx.session.hook("compaction")`, `ctx.session.get`, `ctx.session.synthetic`);
+  `ctx.session.hook("compaction")`, `ctx.session.get`, `ctx.session.synthetic`,
+  `ctx.event.subscribe` for `session.revert.committed`);
 - opencode 1: tag `v1.19.5`, `packages/plugin/src/index.ts` and
   `packages/opencode/src/plugin/index.ts` (`"chat.message"`,
-  `"tool.execute.after"`, `"shell.env"`, `event`, `dispose`).
+  `"tool.execute.after"`, `"shell.env"`, `event` with `session.status`,
+  `session.compacted`, `message.removed` and `message.part.removed`, `dispose`).
 
 What the stand-ins hand the plugin (the shape of a prompt event, of a tool
 call and its result, of a message's parts) is therefore read from source and
@@ -43,6 +45,9 @@ invented.
 | `prompt` | on `prompt`: what the user typed |
 | `tool` | on `tool`: opencode's name of the tool that finished |
 | `input` | on `tool`, for the edit tools only: `path`, `filePath` and `patchText` of the call, whichever it has. Never what was written into a file by `edit` or `write` |
+| `delivery` | on `start` and `prompt`, opencode 2 only: the prompt's delivery when it is not `"steer"` (`"queue"`: opencode queued it while a turn ran). Absent for a steered prompt and on opencode 1 |
+| `source` | on a `start` the plugin does not wait for: `"compact"` after a compaction, `"revert"` after opencode 2 committed a revert |
+| `brief` | on `tool`: `true` when the session is owed what a prompt could not carry, and the plugin waits for this call to carry it |
 
 ## Files
 
@@ -60,6 +65,9 @@ invented.
 | `tool.mcp` | a tool opencode does not ship (an MCP server's) |
 | `idle` | the session went idle: the end of a turn |
 | `end` | the plugin was unloaded with the session started |
+
+`delivery`, `source` and `brief` have no files of their own: each is one of
+the payloads above with that one key added, and the tests build them so.
 
 The plugin sends nothing for tools that only read (`read`, `glob`, `grep`,
 `lsp`, `question`, `skill`, `todowrite`, `webfetch`, `websearch`, `invalid`),
