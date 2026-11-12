@@ -4,7 +4,10 @@
 // they read on 2026-11-12, and against Gemini CLI's own source at the release
 // current then (tag v0.68.0): packages/core/src/hooks (types, hookRunner,
 // hookPlanner, hookAggregator, trustedHooks), packages/core/src/scheduler
-// (scheduler, hook-utils) and packages/core/src/utils/shell-utils.ts. No
+// (scheduler, hook-utils, tool-executor), packages/core/src/core/
+// coreToolHookTriggers.ts, packages/core/src/utils/shell-utils.ts,
+// packages/core/src/tools/definitions/base-declarations.ts (the tool names)
+// and packages/cli/src (config/settings.ts, ui/commands/clearCommand.ts). No
 // payload was recorded from a running Gemini CLI; the fixtures in
 // test/fixtures/hooks/gemini-cli are built from those two sources. Read the
 // docs again before changing how a payload is read or an answer is encoded.
@@ -14,7 +17,7 @@
 //   BeforeAgent        prompt                           timeout 5 s
 //   BeforeTool         pre-edit, shown to the user      timeout 5 s, matcher: write_file and replace
 //   AfterTool          pre-edit after write_file or     timeout 5 s, matcher: every tool but the
-//                      replace, post-edit otherwise       six that only read
+//                      replace, post-edit otherwise       ones in READ_ONLY_TOOLS
 //   AfterAgent         turn-end                         timeout 5 s
 //   SessionEnd         session-end                      timeout 5 s
 //
@@ -34,11 +37,18 @@
 //   that edit; now it counts, and neither is told a second time. For the
 //   agent that is later than on Claude Code or Codex, and it is the earliest
 //   Gemini CLI allows.
+// - Not after an edit that failed, though. For a tool that returned an error
+//   the model is given the error's message and nothing else (tool-executor.ts
+//   builds the response from error.message alone), so what a hook adds to
+//   that result is lost. A replace whose old_string is not found is an
+//   everyday thing. The warning is then not printed and reported as unshown,
+//   and it comes with the result of the attempt that works.
 // - AfterTool on every other tool is the engine's sign of life, a post-edit
 //   that names no file: a session that only runs shell commands still shows
 //   as live, and a shell command can edit files. Gemini CLI waits for every
-//   hook, there is no async form, so the tools that only read and are called
-//   in bursts are left out.
+//   hook, there is no async form, so the built-in tools that cannot change a
+//   file in the worktree are left out (READ_ONLY_TOOLS). Every other built-in
+//   tool and every tool of an MCP server costs one node process.
 // - The engine starts a background sync on post-edit and not on pre-edit, so
 //   an edit by itself asks for none: it is published by the sync that the
 //   next tool call of another kind asks for, or the end of the turn.
@@ -53,7 +63,17 @@
 //   exits 127 and says so. Hence the `; exit 0` at the end of the command:
 //   the hook exits 0 whatever became of node, and what node or the shell said
 //   on stderr is shown to the user as a message instead of deciding anything.
-// - `timeout` is in milliseconds.
+// - `timeout` is in milliseconds. It does not bound these hooks under bash:
+//   with `; exit 0` after it, bash starts node and waits for it instead of
+//   becoming it, Gemini CLI's timeout signals the shell, and node lives on
+//   with the pipes open, so the hook is over when node is. A hook that timed
+//   out is not a refusal either way. What bounds a hook is huddle's own
+//   deadline for the event (hooks/engine.ts).
+// - SessionStart after /clear is the one start whose additionalContext goes
+//   nowhere: clearCommand.ts takes the system message from the hook's answer
+//   and nothing else. The session has a new id and an empty context then. So
+//   that briefing is not printed and reported as unshown, and the first
+//   prompt brings it.
 // - Gemini CLI reads .gemini/settings.json from the directory it is started
 //   in and from nowhere above it, and runs hooks with that directory as their
 //   working directory. So the command names the bundle relative to it, and a
@@ -68,15 +88,16 @@
 //   them all off.
 // - "<" and ">" in additionalContext reach the model as "&lt;" and "&gt;".
 // - A payload does not say whether a subagent made the tool call, so every
-//   event counts as the session's own.
+//   event counts as the session's own: a warning that a subagent got with the
+//   result of its edit counts as said to the session.
 // - There is no way for a hook to set a variable in the agent's shell, so
 //   HUDDLE_SESSION is not passed on.
 
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, posix, win32 } from "node:path";
 import { CliError } from "../core/io.ts";
-import { asRecord, asText, checkHooks, contextOutput, exists, installHooks, onPath, readJsonObject } from "./json-hooks.ts";
+import { asRecord, asText, checkHooks, contextOutput, exists, installHooks, onPath } from "./json-hooks.ts";
 import type { HookFile, Json, Registration } from "./json-hooks.ts";
 import { SILENT } from "./types.ts";
 import type { Adapter, CheckResult, HookEvent, HookInput, HookOutcome, HookOutput, InstallOptions, InstallResult } from "./types.ts";
@@ -88,10 +109,33 @@ const SETTINGS = ".gemini/settings.json";
 const EDIT_TOOLS: readonly string[] = ["write_file", "replace"];
 
 /**
- * The tools that cannot change a file and that agents call in bursts.
- * search_file_content is the name grep_search had in older releases.
+ * The built-in tools that cannot change a file in the worktree: they read
+ * files, the web, the docs, an MCP server's resources or the task tracker, or
+ * talk to the user. No hook runs after them. The names are those of v0.68.0
+ * (base-declarations.ts, tool-names.ts); search_file_content is the name
+ * grep_search had in older releases. The other built-in tools are not all
+ * writers of files (write_todos, activate_skill, the plan mode pair,
+ * complete_task, the tracker's writing tools, invoke_agent); what they touch
+ * was not read up on, so they keep their sign of life.
  */
-const READ_ONLY_TOOLS: readonly string[] = ["read_file", "read_many_files", "list_directory", "glob", "grep_search", "search_file_content"];
+const READ_ONLY_TOOLS: readonly string[] = [
+  "read_file",
+  "read_many_files",
+  "list_directory",
+  "glob",
+  "grep_search",
+  "search_file_content",
+  "google_web_search",
+  "web_fetch",
+  "get_internal_docs",
+  "read_mcp_resource",
+  "list_mcp_resources",
+  "tracker_get_task",
+  "tracker_list_tasks",
+  "tracker_visualize",
+  "ask_user",
+  "update_topic",
+];
 
 // A tool matcher is a JavaScript regular expression, tested unanchored
 // against the tool's name: "replace" alone would also match an MCP tool
@@ -110,7 +154,8 @@ const REGISTRATIONS: readonly Registration[] = [
   { event: "BeforeTool", type: "pre-edit", timeout: 5, matcher: EDITS },
   { event: "AfterTool", type: "pre-edit", timeout: 5, matcher: NOT_READ_ONLY },
   { event: "AfterAgent", type: "turn-end", timeout: 5 },
-  // Gemini CLI does not wait for SessionEnd hooks, so the timeout only bounds a hook that hangs.
+  // Gemini CLI's docs say a SessionEnd hook is not waited for. Its source awaits it, on /clear and in the
+  // cleanup at exit, so a slow one delays both; the engine gives session-end one second.
   { event: "SessionEnd", type: "session-end", timeout: 5 },
 ];
 
@@ -174,13 +219,15 @@ function parsePayload(input: HookInput): HookEvent | null {
       break;
     }
     case "AfterTool": {
-      // Whether the edit worked is not looked at. An edit that failed on a
-      // contested file is tried again, and the warning is due either way.
       const path = editedPath(payload);
       if (path !== "") {
         event.type = "pre-edit";
         event.paths = [path];
       }
+      // tool_response.error is there exactly when the tool failed. The model
+      // then reads the error and nothing a hook adds: see format().
+      const error = asRecord(payload.tool_response)?.error;
+      if (error !== undefined && error !== null) event.native = { event: nativeEvent, failed: true };
       break;
     }
   }
@@ -201,24 +248,32 @@ function parse(input: HookInput): HookEvent | null {
 
 function format(event: HookEvent, outcome: HookOutcome): HookOutput {
   // On AfterAgent a decision makes Gemini CLI run the turn again, and text
-  // that is not JSON is shown to the user. SessionEnd is not waited for.
-  // Printing nothing and exiting 0 is success on both.
+  // that is not JSON is shown to the user. On SessionEnd there is nobody to
+  // tell. Printing nothing and exiting 0 is success on both.
   if (event.type === "turn-end" || event.type === "session-end") return SILENT;
   // outcome.env is not used: Gemini CLI has no channel from a hook to the agent's shell.
   const context = typeof outcome.context === "string" ? outcome.context : "";
   if (context.trim() === "") return SILENT;
 
   // A briefing is for the model alone: the user would be shown it at every prompt.
-  if (event.type === "session-start") return { stdout: contextOutput("SessionStart", context), stderr: "", exitCode: 0 };
+  if (event.type === "session-start") {
+    // After /clear Gemini CLI drops it. Not printed and not counted as said: the first prompt brings it.
+    if (event.source === "clear") return { ...SILENT, unshown: true };
+    return { stdout: contextOutput("SessionStart", context), stderr: "", exitCode: 0 };
+  }
   if (event.type === "prompt") return { stdout: contextOutput("BeforeAgent", context), stderr: "", exitCode: 0 };
 
   // On a tool event the context is an overlap warning. There is never a
   // decision in the answer: nothing is blocked, allowed, confirmed or rewritten.
-  if (asText(asRecord(event.native)?.event) === "BeforeTool") {
+  const native = asRecord(event.native);
+  if (asText(native?.event) === "BeforeTool") {
     // Only the user can be told here. The agent has not been, and the engine
     // has to know: the warning is due again after the edit.
     return { stdout: JSON.stringify({ systemMessage: context }), stderr: "", exitCode: 0, unshown: true };
   }
+  // After a tool that failed, the model is not given what a hook adds to the
+  // result. Nothing is printed, and the warning stays due for the next try.
+  if (native?.failed === true) return { ...SILENT, unshown: true };
   return { stdout: contextOutput("AfterTool", context), stderr: "", exitCode: 0 };
 }
 
@@ -365,6 +420,33 @@ function geminiHome(around: Surroundings): string {
 }
 
 /**
+ * The settings of the machine, which an administrator writes: the ones that
+ * outrank every other file, and the defaults next to them, which every other
+ * file outranks (getSystemSettingsPath and getSystemDefaultsPath in Gemini
+ * CLI's config/settings.ts).
+ */
+export function systemSettingsFiles(around: Surroundings): { settings: string; defaults: string } {
+  const byPlatform =
+    around.platform === "darwin" ? "/Library/Application Support/GeminiCli/settings.json" : around.platform === "win32" ? "C:\\ProgramData\\gemini-cli\\settings.json" : "/etc/gemini-cli/settings.json";
+  const settings = asText(around.env.GEMINI_CLI_SYSTEM_SETTINGS_PATH) || byPlatform;
+  const path = around.platform === "win32" ? win32 : posix;
+  return { settings, defaults: asText(around.env.GEMINI_CLI_SYSTEM_DEFAULTS_PATH) || path.join(path.dirname(settings), "system-defaults.json") };
+}
+
+/**
+ * A settings file other than the project's, read the way Gemini CLI reads
+ * every settings file: comments are taken out, then it is parsed. null when
+ * it is not there or is not a JSON object; it says nothing then.
+ */
+async function readSettings(path: string): Promise<Json | null> {
+  try {
+    return asRecord(JSON.parse(withoutComments(await readFile(path, "utf8"))));
+  } catch {
+    return null;
+  }
+}
+
+/**
  * What one settings file says about hooks: the whole system on or off
  * (undefined when it says nothing), and whether it disables huddle's. An
  * entry of hooksConfig.disabled is a hook's name, and only a hook that has no
@@ -384,17 +466,23 @@ export async function checkGeminiCli(repoRoot: string, around: Surroundings): Pr
   if (!result.installed) return (await commentsAreInTheWay(repoRoot)) ? { ...result, detail: COMMENTS_CHECK } : result;
   const notes = [START_NOTE, LATE_NOTE];
   const userFile = join(geminiHome(around), "settings.json");
-  const inProject = switchesIn(settings);
-  const inUser = switchesIn(await readJsonObject(userFile));
-  // Gemini CLI adds the lists of disabled hooks of all settings files together.
-  const disabledIn = inProject.disabled ? SETTINGS : inUser.disabled ? userFile : null;
-  if (disabledIn !== null) {
-    notes.unshift(`huddle's hooks are disabled by name for Gemini CLI here: hooksConfig.disabled in ${disabledIn} lists them. They will not run until that entry is removed, or until /hooks enable ${HOOK_NAME} is run in Gemini CLI.`);
+  const system = systemSettingsFiles(around);
+  const project = { file: SETTINGS, says: switchesIn(settings) };
+  const user = { file: userFile, says: switchesIn(await readSettings(userFile)) };
+  const machine = { file: system.settings, says: switchesIn(await readSettings(system.settings)) };
+  const defaults = { file: system.defaults, says: switchesIn(await readSettings(system.defaults)) };
+  // Gemini CLI adds the lists of disabled hooks of all settings files together. The file named is the one closest to hand.
+  const disabledIn = [project, user, machine, defaults].find((scope) => scope.says.disabled)?.file;
+  if (disabledIn !== undefined) {
+    // The project's file is committed: an entry in it is every teammate's.
+    const shared = disabledIn === SETTINGS ? ", and that file is the whole team's" : "";
+    notes.unshift(`huddle's hooks are disabled by name for Gemini CLI here: hooksConfig.disabled in ${disabledIn} lists them${shared}. They will not run until that entry is removed, or until /hooks enable ${HOOK_NAME} is run in Gemini CLI.`);
   }
-  // The project's settings outrank the user's: the first of the two that says anything decides.
-  const offIn = inProject.enabled === false ? SETTINGS : inProject.enabled === undefined && inUser.enabled === false ? userFile : null;
-  if (offIn !== null) {
-    notes.unshift(`Hooks are turned off for Gemini CLI here: hooksConfig.enabled is false in ${offIn}. huddle's hooks will not run until that is removed.`);
+  // For a single value the files outrank one another: the machine's settings, the project's, the user's, the
+  // machine's defaults. The first of them that says anything decides.
+  const decides = [machine, project, user, defaults].find((scope) => scope.says.enabled !== undefined);
+  if (decides?.says.enabled === false) {
+    notes.unshift(`Hooks are turned off for Gemini CLI here: hooksConfig.enabled is false in ${decides.file}. huddle's hooks will not run until that is removed.`);
   }
   return { ...result, notes };
 }

@@ -7,7 +7,8 @@ import { delimiter, join } from "node:path";
 import { test } from "node:test";
 import type { TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
-import { checkGeminiCli, detectGeminiCli, geminiCli, withoutComments } from "../src/adapters/gemini-cli.ts";
+import { checkGeminiCli, detectGeminiCli, geminiCli, systemSettingsFiles, withoutComments } from "../src/adapters/gemini-cli.ts";
+import type { Surroundings } from "../src/adapters/gemini-cli.ts";
 import { getAdapter } from "../src/adapters/index.ts";
 import { SILENT } from "../src/adapters/types.ts";
 import type { HookEvent, HookEventType, HookInput } from "../src/adapters/types.ts";
@@ -127,7 +128,8 @@ for (const [name, expected] of Object.entries(EXPECTED)) {
   test(`parse: ${name}`, () => {
     const event = parse(fixtureText(name));
     assert.deepEqual(bare(event), expected);
-    if (event !== null) assert.deepEqual(event.native, { event: fixture(name).hook_event_name });
+    // What the adapter keeps for itself: Gemini CLI's name of the event, and whether the tool failed.
+    if (event !== null) assert.deepEqual(event.native, name === "after-tool.replace.failed" ? { event: "AfterTool", failed: true } : { event: fixture(name).hook_event_name });
   });
 }
 
@@ -150,6 +152,25 @@ test("parse: an edit that names no file is still a sign of life, and no warning 
   for (const input of [undefined, null, "src/app.ts", ["src/app.ts"]]) {
     assert.deepEqual(bare(afterEdit({ tool_input: input })), { type: "post-edit", ...base }, JSON.stringify(input));
   }
+});
+
+test("parse: an AfterTool whose tool returned an error says so, and nothing else does", () => {
+  const failed = (event: HookEvent | null): unknown => (event?.native as Json | undefined)?.failed;
+  for (const name of Object.keys(EXPECTED)) assert.equal(failed(parse(fixtureText(name))), name === "after-tool.replace.failed" ? true : undefined, name);
+  // Gemini CLI hands a hook the tool's result with its error, and the error is there exactly when the tool failed.
+  for (const tool of ["write_file", "replace", "run_shell_command", "mcp_db_query"]) {
+    for (const error of [{ message: "0 occurrences found", type: "edit_no_occurrence_found" }, { message: "" }, {}, "failed"]) {
+      assert.equal(failed(afterEdit({ tool_name: tool, tool_response: { llmContent: "x", returnDisplay: "x", error } })), true, `${tool} ${JSON.stringify(error)}`);
+    }
+    for (const response of [{ llmContent: "ok", returnDisplay: "ok" }, { llmContent: "ok", error: null }, { llmContent: "the word error" }, {}, null, undefined, "error", ["error"], { llmContent: { error: { message: "x" } } }]) {
+      assert.equal(failed(afterEdit({ tool_name: tool, tool_response: response })), undefined, `${tool} ${JSON.stringify(response)}`);
+    }
+  }
+  // The file of an edit that failed is still named: the engine is asked, and format() holds the answer back.
+  assert.deepEqual(parse(fixtureText("after-tool.replace.failed"))?.paths, ["/home/dev/acme/src/auth/session.ts"]);
+  // Before a tool call there is no result, and a field that looks like one marks nothing.
+  assert.equal(failed(parse({ ...fixture("before-tool.write-file"), tool_response: { error: { message: "x" } } })), undefined);
+  assert.equal(failed(parse({ ...fixture("before-agent"), tool_response: { error: { message: "x" } } })), undefined);
 });
 
 test("parse: only write_file and replace name the file they write", () => {
@@ -284,12 +305,47 @@ test("format: after an edit the warning goes to the model with the edit's result
   }
 });
 
-test("format: only the answer before an edit is marked as not shown to the agent", () => {
+test("format: after a tool that failed nothing is printed, and what there was to say is reported as not shown", () => {
+  // The model gets a failed tool's error message and nothing a hook adds to the result (tool-executor.ts at v0.68.0).
+  for (const type of ["pre-edit", "post-edit"] as const) {
+    const event: HookEvent = { ...eventOf(type, "AfterTool"), native: { event: "AfterTool", failed: true } };
+    assert.deepEqual(geminiCli.format(event, { context: WARNING }), { stdout: "", stderr: "", exitCode: 0, unshown: true });
+    assert.equal(geminiCli.format(event, {}), SILENT);
+    assert.equal(geminiCli.format(event, { context: "  " }), SILENT);
+  }
+  assert.deepEqual(geminiCli.format(parse(fixtureText("after-tool.replace.failed")) as HookEvent, { context: WARNING }), { stdout: "", stderr: "", exitCode: 0, unshown: true });
+  // Only the adapter's own mark does this.
+  for (const failed of [false, "true", 1, null, undefined]) {
+    const output = geminiCli.format({ ...eventOf("pre-edit", "AfterTool"), native: { event: "AfterTool", failed } }, { context: WARNING });
+    assert.deepEqual(asGeminiReadsIt(output), { hookSpecificOutput: { hookEventName: "AfterTool", additionalContext: WARNING } }, String(failed));
+    assert.equal(output.unshown, undefined, String(failed));
+  }
+});
+
+test("format: the briefing at the start after /clear is not printed and is reported as not shown; at any other start it is printed", () => {
+  // clearCommand.ts at v0.68.0 uses the system message of the hook's answer and nothing else.
+  const start = (source?: string): HookEvent => ({ ...eventOf("session-start", "SessionStart"), ...(source === undefined ? {} : { source }) });
+  assert.deepEqual(geminiCli.format(start("clear"), { context: BRIEFING }), { stdout: "", stderr: "", exitCode: 0, unshown: true });
+  assert.deepEqual(geminiCli.format(parse(fixtureText("session-start.clear")) as HookEvent, { context: BRIEFING }), { stdout: "", stderr: "", exitCode: 0, unshown: true });
+  assert.equal(geminiCli.format(start("clear"), {}), SILENT);
+  for (const source of ["startup", "resume", "Clear", "clear ", "something-new", undefined]) {
+    const output = geminiCli.format(start(source), { context: BRIEFING });
+    assert.deepEqual(asGeminiReadsIt(output), { hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: BRIEFING } }, String(source));
+    assert.equal(output.unshown, undefined, String(source));
+  }
+  // The word belongs to the start: a prompt is answered whatever else the event carries.
+  const prompt = geminiCli.format({ ...eventOf("prompt", "BeforeAgent"), source: "clear" }, { context: BRIEFING });
+  assert.deepEqual(asGeminiReadsIt(prompt), { hookSpecificOutput: { hookEventName: "BeforeAgent", additionalContext: BRIEFING } });
+  assert.equal(prompt.unshown, undefined);
+});
+
+test("format: an answer is marked as not shown exactly where the model does not get it", () => {
+  // Before an edit, after a tool that failed, and at the start after /clear.
+  const unread = ["before-tool.write-file", "before-tool.replace", "after-tool.replace.failed", "session-start.clear"];
   for (const name of Object.keys(EXPECTED)) {
     const event = parse(fixtureText(name));
     if (event === null) continue;
-    const before = fixture(name).hook_event_name === "BeforeTool";
-    assert.equal(geminiCli.format(event, { context: WARNING }).unshown, before ? true : undefined, name);
+    assert.equal(geminiCli.format(event, { context: WARNING }).unshown, unread.includes(name) ? true : undefined, name);
     // With nothing to show there is nothing that was not shown.
     assert.equal(geminiCli.format(event, {}).unshown, undefined, name);
   }
@@ -315,7 +371,7 @@ test("format: no answer decides anything, on any event", () => {
     for (const key of decidingInside) assert.equal(key in inside, false, `${name}: hookSpecificOutput.${key}`);
     for (const key of Object.keys(inside)) assert.ok(["hookEventName", "additionalContext"].includes(key), `${name}: hookSpecificOutput.${key}`);
   }
-  assert.equal(answers, 11, "every fixture but the turn's end and the session's end gets an answer here");
+  assert.equal(answers, 9, "every fixture gets an answer here but the turn's end, the session's end, the start after /clear and the edit that failed");
 });
 
 test("format: nothing to say prints nothing", () => {
@@ -352,6 +408,8 @@ test("format: every fixture goes in and comes out under the same event name", ()
     const native = fixture(name).hook_event_name;
     if (native === "AfterAgent" || native === "SessionEnd") {
       assert.equal(output, SILENT, name);
+    } else if (name === "session-start.clear" || name === "after-tool.replace.failed") {
+      assert.deepEqual(output, { ...SILENT, unshown: true }, name);
     } else if (native === "BeforeTool") {
       assert.deepEqual(asGeminiReadsIt(output), { systemMessage: BRIEFING }, name);
     } else {
@@ -473,6 +531,83 @@ test("with the engine: a briefing at the start, the user warned before the edit,
   assert.deepEqual(asked.background, [forced(bob), throttled(bob), throttled(bob), forced(bob), forced(bob)]);
 });
 
+/** Alice's agent has src/auth/jwt.ts in flight, published; bob's Gemini CLI session is replayed against that. */
+async function bobBesideAlice(t: TestContext) {
+  const { alice, bob } = await team(t);
+  await fire(alice, "session-start", 0);
+  await fire(alice, "prompt", 5, { prompt: JWT_PROMPT });
+  await alice.write("src/auth/jwt.ts", "export const verify = true;\n");
+  await fire(alice, "post-edit", 10, { paths: [join(alice.dir, "src/auth/jwt.ts")] });
+  await publish(alice, 12);
+  const gemini = async (name: string, seconds: number, over: Json = {}): Promise<Ran> => {
+    const io = ioFor(bob, { now: at(seconds), stdin: payloadIn(name, bob, over) });
+    const code = await runHook(["gemini-cli"], io);
+    return { code, stdout: io.stdout, stderr: io.stderr };
+  };
+  return {
+    bob,
+    gemini,
+    aliceLine: (now: number): string => `- alice / claude-code on main (${ago(10, now)}): "${JWT_PROMPT}". Files: src/auth/jwt.ts`,
+    warning: (now: number): string => text(overlapHead("src/auth/jwt.ts"), `- alice / claude-code on main (${ago(10, now)}) has it in flight: "${JWT_PROMPT}".`, SAY_SO),
+    toModel: (event: string, context: string): Ran => ({ code: 0, stdout: [JSON.stringify({ hookSpecificOutput: { hookEventName: event, additionalContext: context } })], stderr: [] }),
+    toUser: (context: string): Ran => ({ code: 0, stdout: [JSON.stringify({ systemMessage: context })], stderr: [] }),
+    told: async (session: string = SESSION): Promise<boolean> => (await seenKeys(bob, session)).some((key) => key.endsWith("src/auth/jwt.ts")),
+  };
+}
+
+test("with the engine: an edit that failed on a contested file does not use up the warning, and the try that works brings it", async (t) => {
+  const { bob, gemini, warning, toModel, toUser, told } = await bobBesideAlice(t);
+  record(t);
+  // A replace of src/auth/jwt.ts, which alice has in flight.
+  const onJwt = { tool_input: { file_path: join(bob.dir, "src/auth/jwt.ts"), instruction: "Verify the audience as well.", old_string: "const verify = true;", new_string: "const verify = audience;" } };
+  await gemini("session-start.startup", 20);
+
+  assert.deepEqual(await gemini("before-tool.replace", 24, onJwt), toUser(warning(24)));
+  // old_string was not found. The model reads the tool's error and nothing a hook adds, so nothing is printed, and nothing counts as said.
+  assert.deepEqual(await gemini("after-tool.replace.failed", 25, onJwt), NOTHING);
+  assert.equal(await told(), false);
+  // It fails a second time.
+  assert.deepEqual(await gemini("before-tool.replace", 26, onJwt), toUser(warning(26)));
+  assert.deepEqual(await gemini("after-tool.replace.failed", 27, onJwt), NOTHING);
+  assert.equal(await told(), false);
+
+  // The try that works: the agent reads the warning with its result.
+  assert.deepEqual(await gemini("before-tool.replace", 28, onJwt), toUser(warning(28)));
+  assert.deepEqual(await gemini("after-tool.replace", 29, onJwt), toModel("AfterTool", warning(29)));
+  assert.equal(await told(), true);
+
+  // From here on there is nothing to say, whether an edit works or not.
+  assert.deepEqual(await gemini("before-tool.replace", 30, onJwt), NOTHING);
+  assert.deepEqual(await gemini("after-tool.replace.failed", 31, onJwt), NOTHING);
+  assert.deepEqual(await gemini("after-tool.replace", 32, onJwt), NOTHING);
+  assert.equal((await sessionOf(bob, SESSION))?.seenAt, at(32), "a failed edit is a sign of life too");
+});
+
+test("with the engine: after /clear the new session is briefed with its first prompt", async (t) => {
+  const { bob, gemini, aliceLine, toModel } = await bobBesideAlice(t);
+  record(t);
+  const CLEARED = "0d9b2f6a-3c41-4e7d-8a15-9f0e1d2c3b4a";
+  const briefing = (now: number): string => text(FULL_HEAD, aliceLine(now), FULL_FOOT);
+
+  assert.deepEqual(await gemini("session-start.startup", 20), toModel("SessionStart", briefing(20)));
+  assert.deepEqual(await gemini("before-agent", 22), NOTHING);
+
+  // /clear: the session ends, and one with a new id and an empty context starts.
+  assert.deepEqual(await gemini("session-end.exit", 30, { reason: "clear" }), NOTHING);
+  assert.deepEqual(await sessionsOf(bob), []);
+  // Gemini CLI would drop a briefing printed here. None is printed, and none is recorded as shown.
+  assert.deepEqual(await gemini("session-start.clear", 31, { session_id: CLEARED }), NOTHING);
+  assert.deepEqual(
+    (await sessionsOf(bob)).map((session) => session.id),
+    [CLEARED],
+  );
+  assert.deepEqual(await seenKeys(bob, CLEARED), []);
+
+  // The first prompt of the new session brings the whole briefing, and the next one has nothing to add.
+  assert.deepEqual(await gemini("before-agent", 33, { session_id: CLEARED }), toModel("BeforeAgent", briefing(33)));
+  assert.deepEqual(await gemini("before-agent", 35, { session_id: CLEARED, prompt: "continue" }), NOTHING);
+});
+
 test("with the engine: a hook that got no payload it knows prints nothing and exits 0", async (t) => {
   const { bob } = await team(t);
   for (const stdin of ["", "not json", "[]", JSON.stringify({ hook_event_name: "BeforeTool" }), payloadIn("before-tool.run-shell-command", bob), payloadIn("notification", bob)]) {
@@ -491,7 +626,8 @@ const BUNDLE = ".huddle/huddle.mjs";
 const COMMAND = "node .huddle/huddle.mjs hook gemini-cli; exit 0";
 const DESCRIPTION = "Shows this agent what teammates' agents are working on, and shows them what this one is. Installed by `huddle init`.";
 const EDITS = "^(?:write_file|replace)$";
-const NOT_READ_ONLY = "^(?!(?:read_file|read_many_files|list_directory|glob|grep_search|search_file_content)$)";
+const READ_ONLY = ["read_file", "read_many_files", "list_directory", "glob", "grep_search", "search_file_content", "google_web_search", "web_fetch", "get_internal_docs", "read_mcp_resource", "list_mcp_resources", "tracker_get_task", "tracker_list_tasks", "tracker_visualize", "ask_user", "update_topic"];
+const NOT_READ_ONLY = `^(?!(?:${READ_ONLY.join("|")})$)`;
 
 function handler(timeout: number, extra: Json = {}): Json {
   return { name: "huddle", type: "command", command: COMMAND, timeout, description: DESCRIPTION, ...extra };
@@ -605,16 +741,21 @@ test("install: what is written follows the rules in Gemini CLI's hook reference"
 
   // Before a tool call: the two edit tools and nothing that merely contains their names.
   assert.equal(hooks.BeforeTool?.[0]?.matcher, EDITS);
-  const tools = ["write_file", "replace", "run_shell_command", "read_file", "read_many_files", "list_directory", "glob", "grep_search", "search_file_content", "ask_user", "write_todos", "activate_skill", "web_fetch", "google_web_search", "mcp_db_replace_row", "mcp_fs_write_file", "mcp_fs_read_file", "write_file_v2", "replace_all", "my_replace", "read_file_lines"];
+  // Gemini CLI's 27 built-in tools at v0.68.0 (tool-names.ts), the name grep_search had before, and names an MCP server or a later release could bring.
+  const builtIn = ["glob", "write_todos", "write_file", "google_web_search", "web_fetch", "replace", "run_shell_command", "grep_search", "read_many_files", "read_file", "list_directory", "activate_skill", "ask_user", "tracker_create_task", "tracker_update_task", "tracker_get_task", "tracker_list_tasks", "tracker_add_dependency", "tracker_visualize", "get_internal_docs", "enter_plan_mode", "exit_plan_mode", "update_topic", "complete_task", "invoke_agent", "read_mcp_resource", "list_mcp_resources"];
+  assert.equal(new Set(builtIn).size, 27);
+  const tools = [...builtIn, "search_file_content", "mcp_db_replace_row", "mcp_fs_write_file", "mcp_fs_read_file", "write_file_v2", "replace_all", "my_replace", "read_file_lines", "web_fetch_all", "mcp_web_fetch", "ask_user_v2", "tracker_get_tasks"];
   assert.deepEqual(
     tools.filter((tool) => selects(hooks.BeforeTool?.[0]?.matcher, tool)),
     ["write_file", "replace"],
   );
-  // After a tool call: every tool but the ones that only read, by their whole names.
+  // After a tool call: every tool but the ones that cannot change a file in the worktree, by their whole names.
   assert.equal(hooks.AfterTool?.[0]?.matcher, NOT_READ_ONLY);
+  assert.deepEqual(tools.filter((tool) => !selects(hooks.AfterTool?.[0]?.matcher, tool)).sort(), [...READ_ONLY].sort());
+  // So a hook runs after 12 of the 27 built-in tools: the two edit tools, the shell, and nine whose writes were not read up on.
   assert.deepEqual(
-    tools.filter((tool) => !selects(hooks.AfterTool?.[0]?.matcher, tool)),
-    ["read_file", "read_many_files", "list_directory", "glob", "grep_search", "search_file_content"],
+    builtIn.filter((tool) => selects(hooks.AfterTool?.[0]?.matcher, tool)),
+    ["write_todos", "write_file", "replace", "run_shell_command", "activate_skill", "tracker_create_task", "tracker_update_task", "tracker_add_dependency", "enter_plan_mode", "exit_plan_mode", "complete_task", "invoke_agent"],
   );
   // The other events are matched by exact string against their own trigger, so they carry no matcher at all.
   for (const event of EVENTS.filter((name) => name !== "BeforeTool" && name !== "AfterTool")) assert.equal("matcher" in (hooks[event]?.[0] ?? {}), false, event);
@@ -978,6 +1119,15 @@ async function withBundle(root: string): Promise<void> {
   await writeFile(join(root, ".huddle", "huddle.mjs"), "// the vendored bundle\n");
 }
 
+/**
+ * Surroundings for check(): a home directory, and a machine whose own settings
+ * are looked for inside it and not in /etc, so that no test reads this
+ * machine's files.
+ */
+function aroundOf(home: string, env: NodeJS.ProcessEnv = {}): Surroundings {
+  return { env: { GEMINI_CLI_SYSTEM_SETTINGS_PATH: join(home, "machine", "settings.json"), ...env }, home };
+}
+
 async function emptyDir(t: TestContext): Promise<string> {
   const dir = await realpath(await mkdtemp(join(tmpdir(), "huddle-home-")));
   t.after(() => rm(dir, { recursive: true, force: true }));
@@ -985,7 +1135,7 @@ async function emptyDir(t: TestContext): Promise<string> {
 }
 
 test("check: reports what install left, and what is still missing", async (t) => {
-  const around = { env: {}, home: await emptyDir(t) };
+  const around = aroundOf(await emptyDir(t));
   const { root, file } = await scratchRepo(t);
   assert.deepEqual(await checkGeminiCli(root, around), { installed: false, detail: ".gemini/settings.json not found. Run huddle init.", notes: [] });
 
@@ -1026,7 +1176,7 @@ test("check: reports what install left, and what is still missing", async (t) =>
 });
 
 test("check: goes by the bundle the handlers run, wherever it is, and flags a command without the exit at its end", async (t) => {
-  const around = { env: {}, home: await emptyDir(t) };
+  const around = aroundOf(await emptyDir(t));
   const { root, file } = await scratchRepo(t);
   await geminiCli.install({ repoRoot: root, bundle: "tools/huddle-1.2/huddle.mjs" });
   // A bundle in the usual place is not the one these hooks run.
@@ -1055,7 +1205,7 @@ test("check: goes by the bundle the handlers run, wherever it is, and flags a co
 });
 
 test("check: a file with no huddle hooks, or that cannot be read, is not installed", async (t) => {
-  const around = { env: {}, home: await emptyDir(t) };
+  const around = aroundOf(await emptyDir(t));
   for (const content of ["{}", JSON.stringify(USER_SETTINGS)]) {
     const { root } = await scratchRepo(t, content);
     await withBundle(root);
@@ -1067,7 +1217,7 @@ test("check: a file with no huddle hooks, or that cannot be read, is not install
 
 test("check: says so when Gemini CLI has hooks turned off, the project's settings outranking the user's", async (t) => {
   const home = await emptyDir(t);
-  const around = { env: {}, home };
+  const around = aroundOf(home);
   const { root, file } = await scratchRepo(t);
   await geminiCli.install({ repoRoot: root, bundle: BUNDLE });
   await withBundle(root);
@@ -1097,6 +1247,11 @@ test("check: says so when Gemini CLI has hooks turned off, the project's setting
     await writeFile(userFile, JSON.stringify({ hooksConfig: { enabled } }));
     assert.equal(await off(), null, JSON.stringify(enabled));
   }
+  // The user's file is read as Gemini CLI reads it: comments are taken out first, and a comment mark inside a string is no comment.
+  await writeFile(userFile, '// my settings\n{\n  /* hooks are noisy */\n  "hooksConfig": { "enabled": false }, // for now\n  "ui": { "theme": "// not a comment" }\n}\n');
+  assert.equal(await off(), `Hooks are turned off for Gemini CLI here: hooksConfig.enabled is false in ${userFile}. huddle's hooks will not run until that is removed.`);
+  await writeFile(userFile, '{\n  // "hooksConfig": { "enabled": false }\n  "ui": { "theme": "GitHub" }\n}\n');
+  assert.equal(await off(), null, "a setting that is commented out is not set");
   // A user's settings file that cannot be read says nothing.
   for (const content of ["{ nope", "[]", "", '{ "hooksConfig": [] }', '{ "hooksConfig": null }']) {
     await writeFile(userFile, content);
@@ -1107,15 +1262,15 @@ test("check: says so when Gemini CLI has hooks turned off, the project's setting
   // GEMINI_CLI_HOME moves the user's settings: .gemini is looked for under it.
   await writeFile(userFile, JSON.stringify({ hooksConfig: { enabled: false } }));
   const elsewhere = await emptyDir(t);
-  assert.equal(await off({ env: { GEMINI_CLI_HOME: elsewhere }, home }), null);
+  assert.equal(await off(aroundOf(home, { GEMINI_CLI_HOME: elsewhere })), null);
   await mkdir(join(elsewhere, ".gemini"));
   await writeFile(join(elsewhere, ".gemini", "settings.json"), JSON.stringify({ hooksConfig: { enabled: false } }));
-  assert.match((await off({ env: { GEMINI_CLI_HOME: elsewhere }, home })) ?? "", new RegExp(`is false in ${join(elsewhere, ".gemini", "settings.json").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+  assert.match((await off(aroundOf(home, { GEMINI_CLI_HOME: elsewhere }))) ?? "", new RegExp(`is false in ${join(elsewhere, ".gemini", "settings.json").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
 });
 
 test("check: says so when huddle's hooks are disabled by name, in either settings file", async (t) => {
   const home = await emptyDir(t);
-  const around = { env: {}, home };
+  const around = aroundOf(home);
   const { root, file } = await scratchRepo(t);
   await geminiCli.install({ repoRoot: root, bundle: BUNDLE });
   await withBundle(root);
@@ -1149,12 +1304,167 @@ test("check: says so when huddle's hooks are disabled by name, in either setting
     assert.equal(await disabled(), null, JSON.stringify(list));
   }
 
+  // In the project's file the entry is every teammate's, and the note says so.
+  await writeFile(file, JSON.stringify({ hooksConfig: { disabled: ["huddle"] }, ...installed() }));
+  assert.equal(
+    await disabled(),
+    "huddle's hooks are disabled by name for Gemini CLI here: hooksConfig.disabled in .gemini/settings.json lists them, and that file is the whole team's. They will not run until that entry is removed, or until /hooks enable huddle is run in Gemini CLI.",
+  );
+  await writeFile(file, JSON.stringify(installed()));
+  // The user's file with a comment in it is read all the same.
+  await writeFile(userFile, '{\n  // linters off for now\n  "hooksConfig": { "disabled": ["slow-linter", "huddle"] }\n}\n');
+  assert.match((await disabled()) ?? "", new RegExp(`hooksConfig\\.disabled in ${userFile.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} lists them\\.`));
+  await writeFile(userFile, "{}");
+
   // Both at once: off as a whole comes first.
   await writeFile(file, JSON.stringify({ hooksConfig: { enabled: false, disabled: ["huddle"] }, ...installed() }));
   const both = (await checkGeminiCli(root, around)).notes;
   assert.equal(both.length, 4);
   assert.match(both[0] ?? "", /turned off/);
   assert.match(both[1] ?? "", /disabled by name/);
+});
+
+test("check: the machine's settings outrank the project's, and the machine's defaults are outranked by every other file", async (t) => {
+  const home = await emptyDir(t);
+  const around = aroundOf(home);
+  const { root, file } = await scratchRepo(t);
+  await geminiCli.install({ repoRoot: root, bundle: BUNDLE });
+  await withBundle(root);
+  const userFile = join(home, ".gemini", "settings.json");
+  const machineFile = join(home, "machine", "settings.json");
+  const defaultsFile = join(home, "machine", "system-defaults.json");
+  await mkdir(join(home, ".gemini"));
+  await mkdir(join(home, "machine"));
+  const says = async (path: string, hooksConfig: unknown): Promise<void> => {
+    const settings = hooksConfig === undefined ? {} : { hooksConfig };
+    await writeFile(path, JSON.stringify(path === file ? { ...settings, ...installed() } : settings));
+  };
+  /** The file the note blames for hooks being off, or null when they are on. */
+  const offIn = async (surroundings = around): Promise<string | null> => {
+    const note = (await checkGeminiCli(root, surroundings)).notes.find((one) => one.includes("turned off"));
+    return note === undefined ? null : (/is false in (.*)\. huddle's hooks will not run/.exec(note)?.[1] ?? "?");
+  };
+
+  // The defaults alone decide only while nothing else says anything.
+  await says(defaultsFile, { enabled: false });
+  assert.equal(await offIn(), defaultsFile);
+  await says(userFile, { enabled: true });
+  assert.equal(await offIn(), null, "the user's file outranks the machine's defaults");
+  await says(userFile, { enabled: false });
+  assert.equal(await offIn(), userFile);
+  await says(file, { enabled: true });
+  assert.equal(await offIn(), null, "the project's file outranks the user's");
+
+  // The machine's settings are the last word.
+  await says(machineFile, { enabled: false });
+  assert.equal(await offIn(), machineFile, "and the machine's settings outrank the project's");
+  await says(file, { enabled: false });
+  await says(machineFile, { enabled: true });
+  assert.equal(await offIn(), null, "in both directions");
+  await says(machineFile, { notifications: false });
+  assert.equal(await offIn(), ".gemini/settings.json", "a file that says nothing about it leaves it to the next");
+  // Read like every settings file: with its comments taken out.
+  await writeFile(machineFile, '{\n  // set by IT\n  "hooksConfig": { "enabled": true }\n}\n');
+  assert.equal(await offIn(), null);
+  await writeFile(machineFile, "{ nope");
+  assert.equal(await offIn(), ".gemini/settings.json", "one that cannot be read says nothing");
+
+  // Each of the two can be moved by its own variable.
+  await says(file, undefined);
+  await says(userFile, undefined);
+  await says(defaultsFile, undefined);
+  await says(machineFile, undefined);
+  const movedSettings = join(home, "moved-settings.json");
+  const movedDefaults = join(home, "moved-defaults.json");
+  await says(movedSettings, { enabled: false });
+  await says(movedDefaults, { enabled: false });
+  assert.equal(await offIn(), null);
+  assert.equal(await offIn(aroundOf(home, { GEMINI_CLI_SYSTEM_SETTINGS_PATH: movedSettings })), movedSettings);
+  assert.equal(await offIn(aroundOf(home, { GEMINI_CLI_SYSTEM_DEFAULTS_PATH: movedDefaults })), movedDefaults);
+
+  // The lists of disabled hooks add up over all four files; the note names the one closest to hand.
+  const disabledIn = async (): Promise<string | null> => {
+    const note = (await checkGeminiCli(root, around)).notes.find((one) => one.includes("disabled by name"));
+    return note === undefined ? null : (/hooksConfig\.disabled in (.*?) lists them/.exec(note)?.[1] ?? "?");
+  };
+  assert.equal(await disabledIn(), null);
+  await says(defaultsFile, { disabled: ["huddle"] });
+  assert.equal(await disabledIn(), defaultsFile);
+  await says(machineFile, { disabled: ["huddle"] });
+  assert.equal(await disabledIn(), machineFile);
+  await says(userFile, { disabled: ["huddle"] });
+  assert.equal(await disabledIn(), userFile);
+  await says(file, { disabled: ["huddle"] });
+  assert.equal(await disabledIn(), ".gemini/settings.json");
+  await says(file, { disabled: [] });
+  await says(userFile, { disabled: [] });
+  await says(machineFile, { disabled: [], enabled: true });
+  assert.equal(await disabledIn(), defaultsFile, "no file can take another file's entry back");
+});
+
+test("check: where the machine's settings are, by platform and by variable", () => {
+  // getSystemSettingsPath and getSystemDefaultsPath in Gemini CLI's config/settings.ts at v0.68.0.
+  const home = "/home/dev";
+  assert.deepEqual(systemSettingsFiles({ env: {}, home, platform: "linux" }), { settings: "/etc/gemini-cli/settings.json", defaults: "/etc/gemini-cli/system-defaults.json" });
+  assert.deepEqual(systemSettingsFiles({ env: {}, home }), { settings: "/etc/gemini-cli/settings.json", defaults: "/etc/gemini-cli/system-defaults.json" });
+  assert.deepEqual(systemSettingsFiles({ env: {}, home, platform: "darwin" }), {
+    settings: "/Library/Application Support/GeminiCli/settings.json",
+    defaults: "/Library/Application Support/GeminiCli/system-defaults.json",
+  });
+  assert.deepEqual(systemSettingsFiles({ env: {}, home, platform: "win32" }), {
+    settings: "C:\\ProgramData\\gemini-cli\\settings.json",
+    defaults: "C:\\ProgramData\\gemini-cli\\system-defaults.json",
+  });
+  // The defaults sit next to the settings, wherever those were moved to, unless they were moved themselves.
+  assert.deepEqual(systemSettingsFiles({ env: { GEMINI_CLI_SYSTEM_SETTINGS_PATH: "/opt/it/gemini.json" }, home, platform: "linux" }), { settings: "/opt/it/gemini.json", defaults: "/opt/it/system-defaults.json" });
+  assert.deepEqual(systemSettingsFiles({ env: { GEMINI_CLI_SYSTEM_DEFAULTS_PATH: "/opt/it/defaults.json" }, home, platform: "darwin" }), {
+    settings: "/Library/Application Support/GeminiCli/settings.json",
+    defaults: "/opt/it/defaults.json",
+  });
+  assert.deepEqual(systemSettingsFiles({ env: { GEMINI_CLI_SYSTEM_SETTINGS_PATH: "", GEMINI_CLI_SYSTEM_DEFAULTS_PATH: "" }, home, platform: "linux" }), { settings: "/etc/gemini-cli/settings.json", defaults: "/etc/gemini-cli/system-defaults.json" });
+});
+
+test("check and detect of the registered adapter look at this process's environment, and at this user's home", { skip: process.platform === "win32" }, async (t) => {
+  const saved = { PATH: process.env.PATH, HOME: process.env.HOME, GEMINI_CLI_HOME: process.env.GEMINI_CLI_HOME, GEMINI_CLI_SYSTEM_SETTINGS_PATH: process.env.GEMINI_CLI_SYSTEM_SETTINGS_PATH };
+  t.after(() => {
+    for (const [name, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  });
+  const home = await emptyDir(t);
+  const cliHome = await emptyDir(t);
+  const bareRepo = await scratchRepo(t);
+  process.env.PATH = "";
+  process.env.HOME = home;
+  delete process.env.GEMINI_CLI_HOME;
+  process.env.GEMINI_CLI_SYSTEM_SETTINGS_PATH = join(home, "machine", "settings.json");
+  assert.equal(await geminiCli.detect(bareRepo.root), false);
+
+  // The environment: gemini on this process's PATH, and GEMINI_CLI_HOME.
+  const bin = await emptyDir(t);
+  await writeFile(join(bin, "gemini"), "#!/bin/sh\n");
+  process.env.PATH = bin;
+  assert.equal(await geminiCli.detect(bareRepo.root), true, "gemini on PATH");
+  process.env.PATH = "";
+  await mkdir(join(cliHome, ".gemini"));
+  process.env.GEMINI_CLI_HOME = cliHome;
+  assert.equal(await geminiCli.detect(bareRepo.root), true, ".gemini under GEMINI_CLI_HOME");
+  delete process.env.GEMINI_CLI_HOME;
+  // The home directory.
+  await mkdir(join(home, ".gemini"));
+  assert.equal(await geminiCli.detect(bareRepo.root), true, "~/.gemini");
+
+  // check(): the user's settings in that home, and the machine's where the variable says.
+  const { root } = await scratchRepo(t);
+  await geminiCli.install({ repoRoot: root, bundle: BUNDLE });
+  await withBundle(root);
+  assert.equal((await geminiCli.check(root)).notes.length, 2);
+  await writeFile(join(home, ".gemini", "settings.json"), JSON.stringify({ hooksConfig: { enabled: false } }));
+  assert.match((await geminiCli.check(root)).notes[0] ?? "", /turned off/);
+  await mkdir(join(home, "machine"));
+  await writeFile(join(home, "machine", "settings.json"), JSON.stringify({ hooksConfig: { enabled: true } }));
+  assert.equal((await geminiCli.check(root)).notes.length, 2);
 });
 
 // ---------------------------------------------------------------------------
@@ -1182,6 +1492,17 @@ test("detect: any sign of Gemini CLI on the repo or the machine", async (t) => {
   await writeFile(join(otherBin, "gemini.cmd"), "@echo off\r\n");
   assert.equal(await detectGeminiCli(bareRepo.root, { env: { PATH: otherBin }, home, platform: "win32" }), true, "gemini.cmd on a Windows PATH");
   assert.equal(await detectGeminiCli(bareRepo.root, { env: { PATH: otherBin }, home, platform: "linux" }), false);
+  // Each of the names a Windows install can have counts by itself.
+  for (const name of ["gemini.cmd", "gemini.exe", "gemini.ps1", "gemini"]) {
+    const winBin = await emptyDir(t);
+    await writeFile(join(winBin, name), "");
+    assert.equal(await detectGeminiCli(bareRepo.root, { env: { PATH: winBin }, home, platform: "win32" }), true, `${name} on a Windows PATH`);
+    assert.equal(await detectGeminiCli(bareRepo.root, { env: { PATH: winBin }, home, platform: "linux" }), name === "gemini", `${name} elsewhere`);
+  }
+  const lookalike = await emptyDir(t);
+  await writeFile(join(lookalike, "gemini.bat"), "");
+  await writeFile(join(lookalike, "gemini-cli.exe"), "");
+  assert.equal(await detectGeminiCli(bareRepo.root, { env: { PATH: lookalike }, home, platform: "win32" }), false);
 
   // GEMINI_CLI_HOME is the directory .gemini is made in, not .gemini itself.
   const cliHome = await emptyDir(t);
