@@ -1,5 +1,6 @@
 // T1.4. huddle sync
 
+import { tmpdir } from "node:os";
 import { parse } from "../core/args.ts";
 import { openContext } from "../core/context.ts";
 import { currentBranch } from "../core/files.ts";
@@ -9,7 +10,7 @@ import { log } from "../core/log.ts";
 import { locateRepo } from "../core/paths.ts";
 import { currentView, resolveSession } from "../core/session.ts";
 import { touchSession } from "../core/store.ts";
-import { sync } from "../core/sync.ts";
+import { deferredSyncDue, deferSync, releaseDeferredSync, sync } from "../core/sync.ts";
 
 export const summary = "Publish this clone's sessions and refresh the team state";
 
@@ -18,11 +19,13 @@ const USAGE = "huddle sync [--background] [--force]";
 export async function run(args: string[], io: Io): Promise<number> {
   const { values, positionals } = parse(
     args,
-    { background: { type: "boolean", default: false }, force: { type: "boolean", default: false } },
+    // --deferred <token> is internal: it is how a deferred background sync is started (core/sync.ts deferSync).
+    { background: { type: "boolean", default: false }, force: { type: "boolean", default: false }, deferred: { type: "string" } },
     USAGE,
   );
   if (positionals.length > 0) throw new UsageError(`unexpected argument "${positionals[0]}"\nUsage: ${USAGE}`);
 
+  if (values.deferred !== undefined) return deferred(io, values.deferred);
   if (values.background) return background(io, values.force === true);
 
   const ctx = await openContext(io);
@@ -62,7 +65,8 @@ function explain(reason: string, remote: string): string {
 
 /**
  * What hooks start as a detached process. Quiet, throttled unless forced, and
- * it always exits 0: nobody is watching, and a failure is in the log.
+ * it always exits 0: nobody is watching, and a failure is in the log. A sync
+ * that was skipped is made up for when the interval ends.
  */
 async function background(io: Io, force: boolean): Promise<number> {
   const paths = await locateRepo(io.cwd).catch(() => null);
@@ -70,8 +74,40 @@ async function background(io: Io, force: boolean): Promise<number> {
     const ctx = await openContext(io);
     const result = await sync(ctx, { force });
     if (result.error) log(ctx.paths, "sync", `background sync: ${result.error}`);
+    if (!force && result.skipped) deferSync(ctx.paths, io.self, ctx.config, ctx.now);
   } catch (error) {
     log(paths, "sync", "background sync failed", error);
+  }
+  return EXIT.OK;
+}
+
+/**
+ * What deferSync starts as a detached process: waits for the end of the
+ * throttle interval, then syncs, unless a sync ran while it waited.
+ */
+async function deferred(io: Io, token: string): Promise<number> {
+  const paths = await locateRepo(io.cwd).catch(() => null);
+  if (!paths) return EXIT.OK;
+  try {
+    // While it waits, this process must not sit in the worktree: on Windows a
+    // directory that is some process's working directory cannot be renamed or removed.
+    const home = process.cwd();
+    try {
+      process.chdir(tmpdir());
+    } catch {
+      // Then it waits where it is.
+    }
+    if (!(await deferredSyncDue(paths, token))) return EXIT.OK;
+    process.chdir(home); // throws when the worktree is gone: nothing left to sync
+    // Opened after the wait: the round works with the clock and the settings as they are now.
+    const ctx = await openContext(io);
+    const result = await sync(ctx, { force: true });
+    if (result.error) log(ctx.paths, "sync", `deferred sync: ${result.error}`);
+    else if (!result.ran) log(ctx.paths, "sync", "deferred sync: another sync held the lock for too long");
+  } catch (error) {
+    log(paths, "sync", "deferred sync failed", error);
+  } finally {
+    releaseDeferredSync(paths, token);
   }
   return EXIT.OK;
 }
