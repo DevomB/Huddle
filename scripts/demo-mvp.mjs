@@ -299,6 +299,8 @@ try {
   // Node missing from PATH: the exec-form command cannot start; Claude Code reports a non-blocking hook error.
   const noNode = await claudeHook(bob, "PreToolUse", "pre-tool-use.edit", () => {}, { path: join(base, "empty-path") });
   assert(noNode.program === null, "with node missing from PATH the handler cannot start (no shell fallback)", { program: noNode.program });
+  // Claude Code treats a hook that cannot start as a non-blocking error unless the handler sets onFailure: "block".
+  assert(noNode.handler.onFailure === undefined || noNode.handler.onFailure !== "block", "the committed handler does not set onFailure: block", noNode.handler);
   ok("missing bundle → exit " + noBundle.result.code + " (not 2); missing node → spawn ENOENT, nothing blocks");
 
   // 7. A decision propagates.
