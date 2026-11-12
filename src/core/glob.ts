@@ -18,6 +18,14 @@
 const MAX_PATTERN_CHARS = 1024;
 const MAX_PATH_CHARS = 4096;
 
+/**
+ * How much matching this process has done: `walks` counts whole-pattern walks
+ * and `steps` counts every iteration of the two matching loops. Tests read the
+ * difference across a call to pin what it costs. A stopwatch cannot do that:
+ * it fails on a busy machine. Nothing but tests should read or reset it.
+ */
+export const matchWork = { walks: 0, steps: 0 };
+
 type Segment =
   | { kind: "globstar" }
   | { kind: "literal"; text: string }
@@ -100,6 +108,7 @@ function matchWild(pattern: string[], text: string[]): boolean {
   let star = -1;
   let mark = 0;
   while (t < text.length) {
+    matchWork.steps++;
     if (p < pattern.length && pattern[p] === "*") {
       star = p++;
       mark = t;
@@ -135,7 +144,9 @@ function matchSegments(pattern: Segment[], path: SplitPath, length: number): boo
   let s = 0;
   let star = -1;
   let mark = 0;
+  matchWork.walks++;
   while (s < length) {
+    matchWork.steps++;
     const segment = pattern[p];
     if (segment !== undefined && segment.kind === "globstar") {
       star = p++;
