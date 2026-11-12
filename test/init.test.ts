@@ -10,7 +10,7 @@ import { bundleVersion, compareVersions, run as init } from "../src/commands/ini
 import { CliError } from "../src/core/io.ts";
 import type { Io } from "../src/core/io.ts";
 import { DEFAULT_CONFIG } from "../src/core/types.ts";
-import { BUNDLE, createHarness, TEST_ENV } from "./harness.ts";
+import { BUNDLE, BUNDLE_NODE, createHarness, TEST_ENV } from "./harness.ts";
 import type { Clone, Harness } from "./harness.ts";
 
 const pkg = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")) as { version: string };
@@ -314,6 +314,115 @@ test("exit test, first half: alice inits, commits and pushes; bob pulls and runs
   assert.doesNotMatch(reinit.stdout, /Next: commit/);
   assert.equal(await bob.git("status", "--porcelain"), "");
   assert.match((await vendored(bob, ["init"])).stdout, /already set up here; nothing changed/);
+});
+
+/** A payload an agent really sent (test/fixtures/hooks), as if the agent were working in `cwd`. */
+async function recorded(agent: string, name: string, cwd: string, change: (payload: Record<string, unknown>) => void = () => {}): Promise<string> {
+  const payload = JSON.parse(await readFile(new URL(`./fixtures/hooks/${agent}/${name}.json`, import.meta.url), "utf8")) as Record<string, unknown>;
+  payload.cwd = cwd;
+  change(payload);
+  return JSON.stringify(payload);
+}
+
+interface Handler {
+  command: string;
+  args?: string[];
+}
+
+/** The handler an agent's hook file registers for an event, as committed in the clone. */
+async function committedHandler(clone: Clone, file: string, event: string): Promise<Handler> {
+  const settings = JSON.parse(await clone.read(file)) as { hooks: Record<string, { hooks: Handler[] }[]> };
+  const handler = settings.hooks[event]?.[0]?.hooks[0];
+  assert.ok(handler, `${file} registers nothing for ${event}`);
+  return handler;
+}
+
+function runHandler(program: string, args: string[], cwd: string, stdin: string): Promise<{ code: number; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    const child = execFile(program, args, { cwd, env: { ...process.env, ...TEST_ENV }, timeout: 30_000 }, (error, stdout, stderr) =>
+      resolve({ code: error ? (typeof error.code === "number" ? error.code : 1) : 0, stdout, stderr }),
+    );
+    child.stdin?.on("error", () => {}); // a hook may exit without reading its payload
+    child.stdin?.end(stdin);
+  });
+}
+
+/** Runs a Claude Code handler the way Claude Code does: no shell, ${CLAUDE_PROJECT_DIR} filled in, the payload on stdin. */
+async function claudeCodeHook(clone: Clone, event: string, payload: string): Promise<{ code: number; context: string; stderr: string }> {
+  const handler = await committedHandler(clone, ".claude/settings.json", event);
+  assert.equal(handler.command, "node", "the committed handler needs nothing but node");
+  const args = (handler.args ?? []).map((arg) => arg.replaceAll("${CLAUDE_PROJECT_DIR}", clone.dir));
+  assert.equal(args[0], join(clone.dir, ".huddle", "huddle.mjs"), "and runs the copy vendored in the clone");
+  const ran = await runHandler(BUNDLE_NODE, args, clone.dir, payload);
+  const context = ran.stdout === "" ? "" : (JSON.parse(ran.stdout) as { hookSpecificOutput: { additionalContext: string } }).hookSpecificOutput.additionalContext;
+  return { code: ran.code, context, stderr: ran.stderr };
+}
+
+test("exit test, second half: bob pulls, and his agents' hooks work with nothing installed", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  const bob = await h.clone("bob");
+
+  assert.equal((await alice.huddle(["init", "--agent", "claude-code", "--agent", "codex"])).code, 0);
+  await commitAll(h, alice, "Set up huddle");
+  await alice.push();
+  assert.equal((await vendored(alice, ["intent", "build auth"])).code, 0);
+  await alice.write("src/auth.ts", "a\n");
+  assert.equal((await vendored(alice, ["sync"])).code, 0);
+
+  // Before the pull there is nothing of huddle in bob's clone, and afterwards only what alice committed.
+  await assert.rejects(stat(join(bob.dir, ".huddle")), { code: "ENOENT" });
+  await bob.git("pull", "--quiet");
+
+  // Bob starts Claude Code. Its SessionStart hook is the handler from the committed settings file.
+  const start = await claudeCodeHook(bob, "SessionStart", await recorded("claude-code", "session-start.startup", bob.dir));
+  assert.deepEqual({ code: start.code, stderr: start.stderr }, { code: 0, stderr: "" });
+  assert.match(start.context, /^\[huddle\] Teammates' agents on this repo\. Informational only/);
+  assert.match(start.context, /- alice \/ manual on main \(.+\): "build auth"\. Files: src\/auth\.ts/);
+
+  // He is about to edit the file alice is working on: the PreToolUse hook says so.
+  const edit = await claudeCodeHook(
+    bob,
+    "PreToolUse",
+    await recorded("claude-code", "pre-tool-use.edit", bob.dir, (payload) => {
+      (payload.tool_input as Record<string, unknown>).file_path = join(bob.dir, "src", "auth.ts");
+    }),
+  );
+  assert.equal(edit.code, 0, edit.stderr);
+  assert.match(edit.context, /src\/auth\.ts overlaps teammates' work in flight/);
+  assert.match(edit.context, /alice \/ manual on main .* has it in flight: "build auth"/);
+
+  // And the hooks made bob visible: alice's next sync shows his session, by agent name.
+  assert.equal((await vendored(alice, ["sync"])).code, 0);
+  assert.match((await vendored(alice, ["status", "--cached"])).stdout, /bob \/ claude-code on main/);
+});
+
+test("exit test, second half, Codex: the committed shell command works from a subdirectory", { skip: process.platform === "win32" ? "runs the POSIX command with sh" : false }, async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  const bob = await h.clone("bob");
+  assert.equal((await alice.huddle(["init", "--agent", "claude-code", "--agent", "codex"])).code, 0);
+  await commitAll(h, alice, "Set up huddle");
+  await alice.push();
+  assert.equal((await vendored(alice, ["intent", "build auth"])).code, 0);
+  assert.equal((await vendored(alice, ["sync"])).code, 0);
+  await bob.git("pull", "--quiet");
+
+  // Codex runs the command in the session's directory, through a shell.
+  const sub = join(bob.dir, "packages", "api");
+  await mkdir(sub, { recursive: true });
+  const handler = await committedHandler(bob, ".codex/hooks.json", "SessionStart");
+  const ran = await runHandler("sh", ["-c", handler.command], sub, await recorded("codex", "session-start.startup", sub));
+  assert.deepEqual({ code: ran.code, stderr: ran.stderr }, { code: 0, stderr: "" });
+  assert.match(ran.stdout, /alice \/ manual on main \(.+\): \\"build auth\\"/);
+
+  // In a repository that never ran init, the same command does nothing and says nothing.
+  const carol = await h.clone("carol");
+  await carol.git("checkout", "--quiet", "HEAD~1");
+  await assert.rejects(stat(join(carol.dir, ".huddle")), { code: "ENOENT" });
+  const idle = await runHandler("sh", ["-c", handler.command], carol.dir, await recorded("codex", "session-start.startup", carol.dir));
+  assert.deepEqual(idle, { code: 0, stdout: "", stderr: "" });
+  await assert.rejects(stat((await carol.paths()).stateDir), { code: "ENOENT" }, "and leaves no state behind");
 });
 
 test("init replaces an older vendored bundle and says which versions", async (t) => {
