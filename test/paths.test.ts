@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { test } from "node:test";
 import { CliError } from "../src/core/io.ts";
-import { ensureStateDir, loadConfig, loadConfigReport, locateRepo, mergeConfig, requireRepo, seenFile } from "../src/core/paths.ts";
+import { ensureStateDir, isSetUp, listCheckouts, loadConfig, loadConfigReport, locateRepo, mergeConfig, requireRepo, sameDirectory, seenFile, settingsHome } from "../src/core/paths.ts";
 import { DEFAULT_CONFIG } from "../src/core/types.ts";
 import { createHarness } from "./harness.ts";
 
@@ -216,4 +216,80 @@ test("a team config that cannot be used turns prompt capture off and is reported
   assert.equal(localBroken.config.captureIntent, false);
   assert.equal(localBroken.problems.length, 1);
   assert.match(localBroken.problems[0] ?? "", /^the local override .* is not valid JSON$/);
+});
+
+test("listCheckouts names the checkouts of a clone, the main one first, and only those that are still there", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  const main = await alice.paths();
+  assert.deepEqual((await listCheckouts(main)).map((checkout) => checkout.worktree), [alice.dir]);
+
+  const one = await alice.addWorktree("one");
+  const two = await alice.addWorktree("two");
+  const fromTwo = await two.paths();
+  for (const asked of [main, fromTwo]) {
+    const found = await listCheckouts(asked);
+    assert.deepEqual(found.map((checkout) => checkout.worktree), [alice.dir, one.dir, two.dir]);
+    assert.deepEqual(found.map((checkout) => checkout.stateDir), [main.stateDir, main.stateDir, main.stateDir], "all of them share the clone's state");
+  }
+
+  // Removed with git, and removed by hand (git still lists that one, as prunable): neither is a checkout any more.
+  // The question is still answered when it is asked with the paths of the one that is gone.
+  await alice.git("worktree", "remove", "--force", two.dir);
+  await rm(one.dir, { recursive: true, force: true });
+  assert.deepEqual((await listCheckouts(fromTwo)).map((checkout) => checkout.worktree), [alice.dir]);
+  // Something else is at that path now, another repository: git still lists the path, and it is not a checkout of this clone.
+  await alice.git("init", "--quiet", one.dir);
+  assert.ok(await locateRepo(one.dir));
+  assert.deepEqual((await listCheckouts(main)).map((checkout) => checkout.worktree), [alice.dir]);
+
+  // Another clone is not a checkout of this one.
+  const bob = await h.clone("bob");
+  assert.deepEqual((await listCheckouts(await bob.paths())).map((checkout) => checkout.worktree), [bob.dir]);
+});
+
+test("settingsHome: a checkout without .huddle goes by a set-up checkout of its clone, the main one first", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  const main = await alice.paths();
+  const old = await alice.addWorktree("old");
+  const other = await alice.addWorktree("other");
+  const [oldPaths, otherPaths] = [await old.paths(), await other.paths()];
+
+  // Nobody ran init in this clone: every checkout goes by itself, on the defaults.
+  for (const paths of [main, oldPaths, otherPaths]) assert.equal((await settingsHome(paths)).worktree, paths.worktree);
+  assert.equal(await isSetUp(main), false);
+
+  // One linked worktree is set up, the main checkout is not: the others go by the one that is.
+  await other.write(".huddle/config.json", `${JSON.stringify({ remote: "team" })}\n`);
+  assert.equal(await isSetUp(otherPaths), true);
+  assert.equal((await settingsHome(otherPaths)).worktree, other.dir);
+  assert.equal((await settingsHome(oldPaths)).worktree, other.dir);
+  assert.equal((await settingsHome(main)).worktree, other.dir);
+  assert.equal((await loadConfig(await settingsHome(oldPaths))).remote, "team");
+
+  // The main checkout is set up as well, with other settings: it comes first for a checkout that has none,
+  // and a checkout that has its own keeps them.
+  await alice.write(".huddle/config.json", `${JSON.stringify({ remote: "upstream" })}\n`);
+  assert.equal((await settingsHome(oldPaths)).worktree, alice.dir);
+  assert.equal((await settingsHome(otherPaths)).worktree, other.dir);
+  assert.equal((await settingsHome(main)).worktree, alice.dir);
+
+  // A .huddle that is a file is not a set-up checkout.
+  await rm(join(alice.dir, ".huddle"), { recursive: true });
+  await writeFile(join(alice.dir, ".huddle"), "not a directory\n");
+  assert.equal(await isSetUp(main), false);
+  assert.equal((await settingsHome(oldPaths)).worktree, other.dir);
+});
+
+test("sameDirectory sees through a symlink and is false for a directory that is gone", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  const link = join(h.root, "link-to-alice");
+  await symlink(alice.dir, link);
+  assert.equal(await sameDirectory(alice.dir, link), true);
+  assert.equal(await sameDirectory(alice.dir, join(alice.dir, ".")), true);
+  assert.equal(await sameDirectory(alice.dir, h.root), false);
+  assert.equal(await sameDirectory(join(h.root, "gone"), join(h.root, "gone", "..", "gone")), true, "the same path is the same directory, there or not");
+  assert.equal(await sameDirectory(join(h.root, "gone"), alice.dir), false);
 });

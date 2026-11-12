@@ -100,8 +100,14 @@ export const TEST_ENV: Readonly<Record<string, string>> = Object.freeze({
   HUDDLE_NO_BACKGROUND: "1",
 });
 
-/** Variables from the developer's shell that would leak into tests. */
+/**
+ * Variables from the shell that runs the tests that would leak into them, or
+ * out of them: an agent running the suite may carry CLAUDE_ENV_FILE (Claude
+ * Code hands it to its SessionStart hooks), and a session-start replayed by a
+ * test would then append to that real file.
+ */
 const SCRUBBED = [
+  "CLAUDE_ENV_FILE",
   "GIT_DIR",
   "GIT_WORK_TREE",
   "GIT_INDEX_FILE",

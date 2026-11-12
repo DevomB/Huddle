@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
+import { pathToFileURL } from "node:url";
 import { BUNDLE, BUNDLE_NODE, createHarness, TEST_ENV } from "./harness.ts";
 
 test("clones share one remote: what alice pushes, bob pulls", async (t) => {
@@ -83,6 +85,15 @@ test("a snapshot is stable across reads and changes when the clone changes", asy
   const reconfigured = await clone.snapshot();
   assert.notEqual(reconfigured.config, configured.config, "a changed git config must show up in the snapshot");
   assert.deepEqual({ ...reconfigured, config: null }, { ...configured, config: null }, "and nothing else changed");
+});
+
+test("what the shell that runs the tests carries does not reach them: git's variables, a session id, an agent's env file", () => {
+  // In a process of its own: this one was cleaned when it loaded the harness.
+  const carried = { CLAUDE_ENV_FILE: "/somewhere/real", GIT_DIR: "/somewhere/.git", HUDDLE_SESSION: "the-agent", HUDDLE_NOW: "2001-01-01T00:00:00Z" };
+  const script = `await import(${JSON.stringify(pathToFileURL(join(import.meta.dirname, "harness.ts")).href)}); console.log(JSON.stringify(Object.keys(${JSON.stringify(carried)}).filter((name) => name in process.env)));`;
+  const run = spawnSync(process.execPath, ["--input-type=module", "-e", script], { env: { ...process.env, ...carried }, encoding: "utf8" });
+  assert.equal(run.status, 0, run.stderr);
+  assert.deepEqual(JSON.parse(run.stdout), []);
 });
 
 test("the bundle is run with HUDDLE_TEST_NODE when it is set, with this node otherwise", () => {
