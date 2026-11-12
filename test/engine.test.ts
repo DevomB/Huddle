@@ -1266,6 +1266,24 @@ test("a state directory that cannot be used costs the briefing, never the hook",
   }
 });
 
+test("an edit that names more paths than are checked says so, when somebody is there to overlap with", async (t) => {
+  const { bob } = await aliceBuildsAuth(t);
+  await fire(bob, "session-start", 20);
+  const auth = join(bob.dir, "src/auth.ts");
+  const many = Array.from({ length: 250 }, (_, index) => join(bob.dir, `gen/file-${index}.ts`));
+  const note = "[huddle] Only the first 200 of the 251 paths in this edit were checked for overlap: run `huddle check` with the rest of the paths.";
+  // The path alice is on is among the first 200: the warning, and after it that the rest was not looked at.
+  assert.deepEqual(await fire(bob, "pre-edit", 25, { paths: [auth, ...many] }), { context: text(authWarning(25), note) });
+  // It is the last of them, so it was not checked. Nothing was found, and that is not all there is to say.
+  assert.deepEqual(await fire(bob, "pre-edit", 26, { sessionId: "s-bob-2", paths: [...many, auth] }), { context: note });
+  // Exactly as many as are checked: nothing was left out, nothing is said.
+  assert.deepEqual(await fire(bob, "pre-edit", 27, { sessionId: "s-bob-3", paths: many.slice(0, 200) }), {});
+
+  // With nobody else in the repository the rest has nothing to overlap with either.
+  const alone = await team(t);
+  assert.deepEqual(await fire(alone.alice, "pre-edit", 5, { paths: [...many.map((path) => join(alone.alice.dir, relative(bob.dir, path))), join(alone.alice.dir, "src/auth.ts")] }), {});
+});
+
 // ---------------------------------------------------------------------------
 // Time budgets
 // ---------------------------------------------------------------------------

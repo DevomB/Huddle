@@ -657,6 +657,16 @@ function moreNote(count: number): string {
   return `[huddle] ${count} more of the paths in this edit overlap teammates' work as well: run \`huddle check\` with those paths.`;
 }
 
+/**
+ * The line for an event that named more paths than are checked (MAX_EVENT_PATHS): without it, silence about the rest
+ * would read as nothing found there. Empty when every path was checked.
+ */
+function uncheckedNote(run: Run): string {
+  const named = Array.isArray(run.event.paths) ? run.event.paths.length : 0;
+  if (named <= MAX_EVENT_PATHS) return "";
+  return `[huddle] Only the first ${MAX_EVENT_PATHS} of the ${named} paths in this edit were checked for overlap: run \`huddle check\` with the rest of the paths.`;
+}
+
 /** The line after the block of a path that has more sessions on it than the block names. The path is shown as the block's first line shows it. */
 function unnamedNote(count: number, path: string): string {
   return `[huddle] ${count} more ${count === 1 ? "session overlaps" : "sessions overlap"} ${shownText(path, 200)} as well: run \`huddle check\` with the path as it is in the repository to see them all.`;
@@ -778,7 +788,10 @@ async function overlapWarning(run: Run, targets: string[], brief = false): Promi
     }
   }
 
-  const { text, named } = composeWarning(news, now);
+  const composed = composeWarning(news, now);
+  const { named } = composed;
+  // Said only when somebody is there for the rest of the paths to overlap with.
+  const text = lines(composed.text, view.sessions.length === 0 ? "" : uncheckedNote(run));
   if (remember) {
     for (const [index, count] of named.entries()) {
       const one = news[index];
