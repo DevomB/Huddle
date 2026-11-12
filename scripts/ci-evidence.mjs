@@ -121,7 +121,11 @@ function summary(root) {
     const t = entry.totals;
     console.log(`tests ${t.tests ?? 0}  pass ${t.pass ?? 0}  fail ${t.fail ?? 0}  cancelled ${t.cancelled ?? 0}  skipped ${t.skipped ?? 0}  todo ${t.todo ?? 0}`);
     for (const job of entry.missing) console.log(`MISSING results: ${job}`);
-    for (const s of entry.skipped) console.log(`SKIP ${s.type === "todo" ? "(todo) " : ""}${s.name} — ${s.reason || "(no reason given)"}`);
+    // `{ skip: true }` reaches the junit report as the reason "true": a skip nobody explained.
+    const unlabelled = (s) => s.type !== "todo" && (!s.reason || s.reason === "true");
+    for (const s of entry.skipped) console.log(`SKIP ${s.type === "todo" ? "(todo) " : ""}${s.name} — ${unlabelled(s) ? "(NO REASON GIVEN)" : s.reason}`);
+    const bare = entry.skipped.filter(unlabelled).length;
+    console.log(bare > 0 ? `UNLABELLED skips: ${bare} (each skip should say why it cannot run here)` : "every skip gives its reason");
     for (const f of entry.failed) console.log(`FAIL ${f.name} — ${f.message}`);
     if (entry.failed.length > 0 || (t.fail ?? 0) > 0 || (t.cancelled ?? 0) > 0 || entry.missing.length > 0 || entry.shards === 0) bad = true;
   }
