@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
-import { BUNDLE, createHarness, TEST_ENV } from "./harness.ts";
+import { BUNDLE, BUNDLE_NODE, createHarness, TEST_ENV } from "./harness.ts";
 
 test("clones share one remote: what alice pushes, bob pulls", async (t) => {
   const h = await createHarness(t);
@@ -75,6 +75,18 @@ test("a snapshot is stable across reads and changes when the clone changes", asy
 
   await clone.git("fetch", "--quiet");
   assert.notEqual((await clone.snapshot()).fetchHead, null, "a plain fetch writes FETCH_HEAD");
+
+  // The repository's config is part of "the clone as the user left it".
+  const configured = await clone.snapshot();
+  assert.match(configured.config ?? "", /^[0-9a-f]{64}$/);
+  await clone.git("config", "remote.origin.pushurl", "https://example.invalid/x.git");
+  const reconfigured = await clone.snapshot();
+  assert.notEqual(reconfigured.config, configured.config, "a changed git config must show up in the snapshot");
+  assert.deepEqual({ ...reconfigured, config: null }, { ...configured, config: null }, "and nothing else changed");
+});
+
+test("the bundle is run with HUDDLE_TEST_NODE when it is set, with this node otherwise", () => {
+  assert.equal(BUNDLE_NODE, process.env.HUDDLE_TEST_NODE || process.execPath);
 });
 
 test("a linked worktree is the same clone in another directory", async (t) => {

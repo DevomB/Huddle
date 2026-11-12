@@ -16,6 +16,13 @@
 // still never write local refs, FETCH_HEAD, the index or the working tree:
 // fetch with --no-write-fetch-head, build docs with hash-object / mktree /
 // commit-tree, and push with --no-verify so user pre-push hooks do not fire.
+// The user's own git config can undo each of those from the side, and has to
+// be countered per command (transport.ts does): remote.<name>.tagOpt=--tags
+// makes a fetch write tags (--no-tags), a mirror-style fetch refspec makes
+// fetch and push write tracking refs (--refmap=, a stand-in remote),
+// push.gpgSign fails or prompts (--no-signed), push.pushOption rides along
+// (-c push.pushOption=), a partial clone's filter drops the blob (--no-filter),
+// and commit-tree needs an identity the machine may not have (a fixed one).
 
 import { spawn } from "node:child_process";
 
@@ -61,6 +68,13 @@ export class GitError extends Error {
 /** Options that go before the subcommand on every call. */
 const BASE_ARGS = ["-c", "gc.auto=0", "-c", "maintenance.auto=false"];
 
+/**
+ * Added for network calls. The HTTP counterpart of ssh's ServerAlive options:
+ * git itself gives up on a transfer that stays under 1000 bytes per second for
+ * 10 seconds, also when nobody is left to enforce our own timeout.
+ */
+const NETWORK_ARGS = ["-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=10"];
+
 /** Set by git when it runs a hook or an alias; they would point our calls at the wrong repo or index. */
 const INHERITED_LOCATION_VARS = [
   "GIT_DIR",
@@ -74,18 +88,34 @@ const INHERITED_LOCATION_VARS = [
   "GIT_NAMESPACE",
 ];
 
+/** The program an ssh command line starts with. A quoted path may contain spaces ("C:\Program Files\PuTTY\plink.exe"). */
+function sshProgram(command: string): string {
+  const quote = command[0];
+  if (quote === '"' || quote === "'") {
+    const end = command.indexOf(quote, 1);
+    return end > 0 ? command.slice(1, end) : command.slice(1);
+  }
+  return command.split(/\s+/)[0] ?? "";
+}
+
 /**
  * Makes an ssh command non-interactive and bounded. Options are appended, and
  * ssh uses the first value it sees for each option, so anything the user set in
  * their own core.sshCommand wins.
+ *
+ * ConnectTimeout bounds the connection attempt; the ServerAlive pair makes ssh
+ * give up on a connection that went silent after about 10 seconds by itself.
+ * That matters when the huddle process that owns the timeout is gone: an agent
+ * kills a hook at its own deadline, and the ssh it started would otherwise
+ * wait on a dead connection for as long as TCP lets it.
  */
 export function hardenSshCommand(base: string): string {
   const command = base.trim() || "ssh";
-  const program = (command.split(/\s+/)[0] ?? "").replace(/^["']|["']$/g, "");
-  if (/(^|[\\/])(tortoise)?plink(\.exe)?$/i.test(program)) {
+  if (/(^|[\\/])(tortoise)?plink(\.exe)?$/i.test(sshProgram(command))) {
+    // PuTTY's plink takes none of OpenSSH's -o options.
     return /(^|\s)-batch(\s|$)/.test(command) ? command : `${command} -batch`;
   }
-  return `${command} -o BatchMode=yes -o ConnectTimeout=10`;
+  return `${command} -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2`;
 }
 
 /**
@@ -177,7 +207,7 @@ function run(args: string[], opts: GitOptions, env: NodeJS.ProcessEnv): Promise<
 
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn("git", [...BASE_ARGS, ...args], {
+      child = spawn("git", [...BASE_ARGS, ...(opts.network ? NETWORK_ARGS : []), ...args], {
         cwd: opts.cwd,
         env,
         stdio: [opts.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
@@ -192,6 +222,9 @@ function run(args: string[], opts: GitOptions, env: NodeJS.ProcessEnv): Promise<
     const kill = () => {
       try {
         if (ownGroup && child.pid !== undefined) process.kill(-child.pid, "SIGKILL");
+        // Windows has no process groups to signal: this ends git but not the ssh or
+        // credential helper it started. Those end by themselves through the ssh and
+        // http limits set above.
         else child.kill("SIGKILL");
       } catch {
         // Already gone.

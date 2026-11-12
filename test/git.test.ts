@@ -149,23 +149,31 @@ test("network calls get the no-prompt environment", () => {
   assert.equal(net.GIT_TERMINAL_PROMPT, "0");
   assert.equal(net.GIT_ASKPASS, "");
   assert.equal(net.GCM_INTERACTIVE, "never");
-  assert.equal(net.GIT_SSH_COMMAND, "ssh -o BatchMode=yes -o ConnectTimeout=10");
+  assert.equal(net.GIT_SSH_COMMAND, "ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2");
 });
 
 test("an existing ssh command is extended, not replaced", () => {
   assert.equal(
     gitEnv({ GIT_SSH_COMMAND: "ssh -i ~/.ssh/work" }, { network: true, sshCommand: "ssh -p 2222" }).GIT_SSH_COMMAND,
-    "ssh -i ~/.ssh/work -o BatchMode=yes -o ConnectTimeout=10",
+    "ssh -i ~/.ssh/work -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2",
     "GIT_SSH_COMMAND wins over core.sshCommand, as in git",
   );
   assert.equal(
     gitEnv({}, { network: true, sshCommand: "ssh -p 2222" }).GIT_SSH_COMMAND,
-    "ssh -p 2222 -o BatchMode=yes -o ConnectTimeout=10",
+    "ssh -p 2222 -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2",
   );
   assert.equal(gitEnv({ GIT_SSH: "/opt/ssh" }, { network: true }).GIT_SSH_COMMAND, undefined, "GIT_SSH takes no options");
   assert.equal(hardenSshCommand("C:\\tools\\plink.exe -load work"), "C:\\tools\\plink.exe -load work -batch");
   assert.equal(hardenSshCommand("plink -batch"), "plink -batch");
-  assert.equal(hardenSshCommand(""), "ssh -o BatchMode=yes -o ConnectTimeout=10");
+  // PuTTY's default install path has a space in it, so the program is quoted.
+  assert.equal(hardenSshCommand('"C:\\Program Files\\PuTTY\\plink.exe" -load work'), '"C:\\Program Files\\PuTTY\\plink.exe" -load work -batch');
+  assert.equal(hardenSshCommand("'/opt/my tools/plink' -i key"), "'/opt/my tools/plink' -i key -batch");
+  assert.equal(hardenSshCommand('"C:\\Program Files\\TortoiseGit\\bin\\TortoisePlink.exe"'), '"C:\\Program Files\\TortoiseGit\\bin\\TortoisePlink.exe" -batch');
+  // A quoted OpenSSH, and a path that merely contains "plink", still get OpenSSH options.
+  assert.match(hardenSshCommand('"C:\\Program Files\\OpenSSH\\ssh.exe" -p 22'), /ssh\.exe" -p 22 -o BatchMode=yes /);
+  assert.match(hardenSshCommand("/opt/plink-tools/ssh"), /^\/opt\/plink-tools\/ssh -o BatchMode=yes /);
+  assert.match(hardenSshCommand('"/opt/plink dir/ssh" -v'), / -v -o BatchMode=yes /);
+  assert.equal(hardenSshCommand(""), "ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2");
 });
 
 test("a network call really runs the repo's core.sshCommand in batch mode", async (t) => {
@@ -183,6 +191,18 @@ test("a network call really runs the repo's core.sshCommand in batch mode", asyn
   assert.match(args, /-p 2222/, "the user's own options are kept");
   assert.match(args, /-o BatchMode=yes/);
   assert.match(args, /-o ConnectTimeout=10/);
+  assert.match(args, /-o ServerAliveInterval=5 -o ServerAliveCountMax=2/, "ssh gives up on a silent connection by itself");
+});
+
+test("network calls tell git to give up on a stalled HTTP transfer; local calls are left alone", async (t) => {
+  const h = await createHarness(t);
+  const clone = await h.clone("alice");
+  // `git config --get` sees the -c options of its own command line.
+  const get = (key: string, network: boolean) => git(["config", "--get", key], { cwd: clone.dir, network });
+  assert.equal((await get("http.lowSpeedLimit", true)).stdout.trim(), "1000");
+  assert.equal((await get("http.lowSpeedTime", true)).stdout.trim(), "10");
+  assert.equal((await get("http.lowSpeedTime", false)).ok, false, "not set on a local call");
+  assert.equal((await get("gc.auto", false)).stdout.trim(), "0");
 });
 
 test("an explicit env entry can remove a variable", () => {

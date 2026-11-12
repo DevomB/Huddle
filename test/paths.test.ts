@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { test } from "node:test";
 import { CliError } from "../src/core/io.ts";
-import { ensureStateDir, loadConfig, locateRepo, mergeConfig, requireRepo, seenFile } from "../src/core/paths.ts";
+import { ensureStateDir, loadConfig, loadConfigReport, locateRepo, mergeConfig, requireRepo, seenFile } from "../src/core/paths.ts";
 import { DEFAULT_CONFIG } from "../src/core/types.ts";
 import { createHarness } from "./harness.ts";
 
@@ -96,9 +96,9 @@ test("seenFile keeps every session id inside seen/ and distinct ids apart", asyn
 test("mergeConfig starts from the defaults and lets later sources win", () => {
   assert.deepEqual(mergeConfig(), { ...DEFAULT_CONFIG });
   assert.deepEqual(mergeConfig(undefined, null, "x", [], 3), { ...DEFAULT_CONFIG });
-  const merged = mergeConfig({ remote: "upstream", ttlMinutes: 30, captureIntent: false }, { ttlMinutes: 5 });
+  const merged = mergeConfig({ remote: "upstream", ttlMinutes: 30, captureIntent: false }, { ttlMinutes: 8 });
   assert.equal(merged.remote, "upstream");
-  assert.equal(merged.ttlMinutes, 5);
+  assert.equal(merged.ttlMinutes, 8);
   assert.equal(merged.captureIntent, false);
   assert.equal(merged.syncIntervalSeconds, DEFAULT_CONFIG.syncIntervalSeconds);
   assert.equal(Object.isFrozen(merged), false);
@@ -114,7 +114,8 @@ test("mergeConfig ignores values a teammate should not be able to set", () => {
     mode: "block",
     captureIntent: "yes",
   });
-  assert.deepEqual(hostile, { ...DEFAULT_CONFIG });
+  // Everything falls back to the default, except captureIntent: a value that is not `true` means off.
+  assert.deepEqual(hostile, { ...DEFAULT_CONFIG, captureIntent: false });
   for (const remote of ["https://evil.example/x.git", "git@evil.example:x.git", "ext::sh -c id", "../other", "a b", "", "-x"]) {
     assert.equal(mergeConfig({ remote }).remote, "origin", remote);
   }
@@ -143,4 +144,76 @@ test("loadConfig reads the team file, then the local override; broken files are 
 
   await writeFile(paths.localConfigFile, "{ not json");
   assert.equal((await loadConfig(paths)).ttlMinutes, 30);
+});
+
+test("the three intervals are reconciled with each other, not only checked one by one", () => {
+  // Each value is valid alone. Together an idle session would expire long before its next heartbeat.
+  const flapping = mergeConfig({ ttlMinutes: 1, heartbeatMinutes: 60, syncIntervalSeconds: 3600 });
+  assert.equal(flapping.heartbeatMinutes, 60);
+  assert.equal(flapping.ttlMinutes, 120, "the TTL spans two heartbeats");
+  assert.equal(flapping.syncIntervalSeconds, 3600);
+
+  const slowSync = mergeConfig({ heartbeatMinutes: 2, syncIntervalSeconds: 900 });
+  assert.equal(slowSync.syncIntervalSeconds, 120, "a sync at least as often as the heartbeat");
+  assert.equal(slowSync.ttlMinutes, DEFAULT_CONFIG.ttlMinutes);
+
+  // A later source can break what an earlier one had right.
+  assert.equal(mergeConfig({ ttlMinutes: 30, heartbeatMinutes: 10 }, { heartbeatMinutes: 20 }).ttlMinutes, 40);
+  assert.deepEqual(mergeConfig(), { ...DEFAULT_CONFIG }, "the defaults are consistent as they are");
+});
+
+test("captureIntent is on only when it is literally true", () => {
+  assert.equal(mergeConfig({}).captureIntent, true, "absent: the default");
+  assert.equal(mergeConfig({ captureIntent: true }).captureIntent, true);
+  for (const value of [false, "false", "true", 0, 1, null, [], {}]) {
+    assert.equal(mergeConfig({ captureIntent: value }).captureIntent, false, `captureIntent: ${JSON.stringify(value)}`);
+  }
+  assert.equal(mergeConfig({ captureIntent: false }, { captureIntent: true }).captureIntent, true, "a later source may turn it back on");
+  assert.equal(mergeConfig({ captureIntent: false }, {}).captureIntent, false, "a later source that does not mention it changes nothing");
+});
+
+test("a team config that cannot be used turns prompt capture off and is reported", async (t) => {
+  const h = await createHarness(t);
+  const clone = await h.clone("alice");
+  const paths = await clone.paths();
+
+  assert.deepEqual(await loadConfigReport(paths), { config: { ...DEFAULT_CONFIG }, problems: [] }, "no config files at all");
+
+  // A merge conflict in the file, on a team that had capture off on both sides.
+  await clone.write(
+    ".huddle/config.json",
+    ["{", "<<<<<<< HEAD", '  "captureIntent": false, "ttlMinutes": 30', "=======", '  "captureIntent": false, "ttlMinutes": 45', ">>>>>>> theirs", "}", ""].join("\n"),
+  );
+  const conflicted = await loadConfigReport(paths);
+  assert.equal(conflicted.config.captureIntent, false, "prompts must not start being published because of a conflict");
+  assert.equal(conflicted.config.remote, DEFAULT_CONFIG.remote);
+  assert.match(conflicted.problems[0] ?? "", /^\.huddle\/config\.json is not valid JSON \(it has merge conflict markers\)$/);
+  assert.match(conflicted.problems[1] ?? "", /prompt capture is off until \.huddle\/config\.json is fixed/);
+
+  for (const broken of ["[1, 2]", '"text"', "null", "{ nope"]) {
+    await clone.write(".huddle/config.json", broken);
+    const report = await loadConfigReport(paths);
+    assert.equal(report.config.captureIntent, false, broken);
+    assert.equal(report.problems.length, 2, broken);
+  }
+
+  // loadConfig gives the same config and writes the problems to the debug log.
+  assert.equal((await loadConfig(paths)).captureIntent, false);
+  assert.match(await readFile(paths.logFile, "utf8"), /\[config\] \.huddle\/config\.json is not valid JSON/);
+
+  // The local override is this machine's own choice and still applies.
+  await mkdir(paths.stateDir, { recursive: true });
+  await writeFile(paths.localConfigFile, JSON.stringify({ captureIntent: true, ttlMinutes: 20 }));
+  const overridden = await loadConfigReport(paths);
+  assert.equal(overridden.config.captureIntent, true);
+  assert.equal(overridden.config.ttlMinutes, 20);
+
+  // A broken local override is reported, and a good team file is still used.
+  await clone.write(".huddle/config.json", JSON.stringify({ captureIntent: false, remote: "upstream" }));
+  await writeFile(paths.localConfigFile, "{ nope");
+  const localBroken = await loadConfigReport(paths);
+  assert.equal(localBroken.config.remote, "upstream");
+  assert.equal(localBroken.config.captureIntent, false);
+  assert.equal(localBroken.problems.length, 1);
+  assert.match(localBroken.problems[0] ?? "", /^the local override .* is not valid JSON$/);
 });
