@@ -23,7 +23,7 @@ import type { Clone, Harness } from "./harness.ts";
 
 const T0 = Date.parse("2026-01-01T00:00:00Z");
 const at = (seconds: number) => new Date(T0 + seconds * 1000).toISOString();
-const posixOnly = process.platform === "win32" ? "uses a sh script as a server-side hook" : false;
+// The server-side hook below is a sh script; Git for Windows runs it through its own sh, so it runs everywhere.
 
 async function ok(clone: Clone, args: string[], now: string, cwd?: string) {
   const r = await clone.huddle(args, cwd === undefined ? { now } : { now, cwd });
@@ -422,7 +422,7 @@ test("offline, the decision is not recorded and the command says so with exit 1"
   assert.deepEqual(texts((await remoteLogs(h))[0]!.decisions), ["one"]);
 });
 
-test("a remote that refuses huddle refs: the decision is not recorded, exit 1", { skip: posixOnly }, async (t) => {
+test("a remote that refuses huddle refs: the decision is not recorded, exit 1", async (t) => {
   const h = await createHarness(t);
   const alice = await h.clone("alice");
   const hook = join(h.remote, "hooks", "update");

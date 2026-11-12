@@ -18,7 +18,8 @@ import type { TaskDoc, Transport } from "../src/core/types.ts";
 import { BUNDLE, createHarness } from "./harness.ts";
 import type { Clone, Harness, RunResult } from "./harness.ts";
 
-const posixOnly = process.platform === "win32" ? "uses sh scripts as remote hooks" : false;
+// The remote hooks below are sh scripts. Git for Windows runs server-side hooks through its own sh, so
+// they run on every platform; a path handed to one is written with forward slashes for that sh.
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -421,12 +422,12 @@ describe("huddle task", () => {
     assert.equal(remoteTask(h, id).owner?.session, "beta");
   });
 
-  test("a claim is published after its owner's session, never before", { skip: posixOnly }, async () => {
+  test("a claim is published after its owner's session, never before", async () => {
     // If the claim reached the remote first, a teammate syncing in between would see
     // a claim by a session that does not exist, and could take the task.
     const order = join(h.root, "push-order");
     const hook = join(h.remote, "hooks", "pre-receive");
-    writeFileSync(hook, `#!/bin/sh\nwhile read old new ref; do echo "$ref" >> "${order}"; done\nexit 0\n`);
+    writeFileSync(hook, `#!/bin/sh\nwhile read old new ref; do echo "$ref" >> "${order.replaceAll("\\", "/")}"; done\nexit 0\n`);
     chmodSync(hook, 0o755);
     try {
       const carol = await h.clone("carol");
@@ -509,7 +510,7 @@ describe("huddle task when the remote does not cooperate", () => {
     assert.equal(remoteGit(h, ["rev-parse", taskRef(id)]), refBefore);
   });
 
-  test("a remote that refuses huddle refs: the command says so and points at doctor", { skip: posixOnly }, async () => {
+  test("a remote that refuses huddle refs: the command says so and points at doctor", async () => {
     const strict = await createHarness();
     try {
       const gina = await strict.clone("gina");
