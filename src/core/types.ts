@@ -222,6 +222,8 @@ export interface Seen {
 export interface Identity {
   /** 8 random base32 characters, minted once per clone. */
   actor: string;
+  /** git's user.name, else the OS user name. One clean line. */
   user: string;
+  /** The first label of the machine's host name ("laptop", not "laptop.corp.example.com"): no domain is published. */
   host: string;
 }
