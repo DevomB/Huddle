@@ -1,0 +1,16 @@
+{
+  "session_id": "48cbc8c5-de5a-4f40-96e1-a29110c22e6e",
+  "transcript_path": "/home/dev/.claude/projects/-home-dev-acme/48cbc8c5-de5a-4f40-96e1-a29110c22e6e.jsonl",
+  "cwd": "/home/dev/acme",
+  "prompt_id": "ec30b516-b70d-4ce0-8821-424c4e77a979",
+  "permission_mode": "auto",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Read",
+  "tool_input": {
+    "file_path": "/home/dev/acme/nb.ipynb"
+  },
+  "tool_use_id": "toolu_01KhHyqTjXUy77dGShUkXcVG"
+}

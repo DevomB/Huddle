@@ -1,0 +1,9 @@
+{
+  "session_id": "6835a033-358b-4497-a94e-356ac1bac1e3",
+  "transcript_path": "/home/dev/.claude/projects/-home-dev-acme/6835a033-358b-4497-a94e-356ac1bac1e3.jsonl",
+  "cwd": "/home/dev/acme",
+  "prompt_id": "880fcd13-47df-4475-b7d0-23e800c91e73",
+  "permission_mode": "auto",
+  "hook_event_name": "UserPromptSubmit",
+  "prompt": "Do these steps in order. 1) Use the Write tool to create notes.txt containing the single word one. 2) Use the Edit tool to change one to two in notes.txt. 3) Run this exact Bash command: echo \"HS=$HUDDLE_SESSION\" 4) Reply with the output of that command on one line, then every string of the form MARKER-<WORD>-<digits> that appears anywhere in your context, one per line. Nothing else."
+}

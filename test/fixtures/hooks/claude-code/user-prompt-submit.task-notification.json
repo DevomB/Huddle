@@ -1,0 +1,9 @@
+{
+  "session_id": "728a523c-152f-4582-a03f-7f0309b72d19",
+  "transcript_path": "/home/dev/.claude/projects/-home-dev-acme/728a523c-152f-4582-a03f-7f0309b72d19.jsonl",
+  "cwd": "/home/dev/acme",
+  "prompt_id": "661b0726-b165-4bbd-9b8e-8130bb66714a",
+  "permission_mode": "auto",
+  "hook_event_name": "UserPromptSubmit",
+  "prompt": "<task-notification>\n<task-id>bghri8q2f</task-id>\n<tool-use-id>toolu_01PV1mBh9XdAdw9xNhMrVnzg</tool-use-id>\n<output-file>/tmp/claude-1000/-home-dev-acme/728a523c-152f-4582-a03f-7f0309b72d19/tasks/bghri8q2f.output</output-file>\n<status>completed</status>\n<summary>Background command \"Sleep 3 seconds then echo bgdone\" completed (exit code 0)</summary>\n</task-notification>"
+}
