@@ -27,9 +27,25 @@ export const LIMITS = {
   branch: 200,
 } as const;
 
-// C0 and C1 controls, line/paragraph separators, zero-width characters, bidi
-// embedding/override/isolate controls and the BOM.
-const UNSAFE_CHARS = /[\u0000-\u001f\u007f-\u009f  ​-‏‪-‮⁦-⁩﻿]/g;
+// Built from code points so that this file stays plain ASCII: several of these
+// characters are invisible, and two of them end a line.
+const UNSAFE_RANGES: ReadonlyArray<readonly [number, number]> = [
+  [0x0000, 0x001f], // C0 controls, including tab, CR and LF
+  [0x007f, 0x009f], // DEL and the C1 controls
+  [0x200b, 0x200f], // zero-width characters and direction marks
+  [0x2028, 0x2029], // line and paragraph separators
+  [0x202a, 0x202e], // bidi embeddings and overrides
+  [0x2066, 0x2069], // bidi isolates
+  [0xfeff, 0xfeff], // byte order mark
+];
+const escapeCodePoint = (codePoint: number) => "\\u" + codePoint.toString(16).padStart(4, "0");
+const UNSAFE_CHARS = new RegExp(
+  "[" + UNSAFE_RANGES.map(([from, to]) => `${escapeCodePoint(from)}-${escapeCodePoint(to)}`).join("") + "]",
+  "g",
+);
+
+/** U+2026, appended to text that was cut. */
+export const ELLIPSIS = String.fromCodePoint(0x2026);
 
 /**
  * One safe line of text: unsafe characters become spaces, whitespace runs
@@ -41,7 +57,7 @@ export function cleanText(value: unknown, max: number): string {
   const flat = value.replace(UNSAFE_CHARS, " ").replace(/\s+/g, " ").trim();
   const chars = Array.from(flat); // by code point, so a surrogate pair is never split
   if (chars.length <= max) return flat;
-  return chars.slice(0, Math.max(0, max - 1)).join("").trimEnd() + "…";
+  return chars.slice(0, Math.max(0, max - 1)).join("").trimEnd() + ELLIPSIS;
 }
 
 /** A repo-relative path or glob as data: unsafe characters removed, forward slashes, capped. "" when unusable. */
