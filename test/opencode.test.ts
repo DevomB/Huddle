@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
-import { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { test } from "node:test";
@@ -1565,7 +1565,8 @@ async function tree(root: string): Promise<Record<string, string>> {
 test("install: an empty repo gets the plugin, and nothing else", async (t) => {
   const root = await emptyRepo(t);
   const result = await opencode.install({ repoRoot: root, bundle: BUNDLE });
-  assert.deepEqual(result, { changed: [".opencode/plugins/huddle.js"], notes: [...NOTES] });
+  // `files`: the file the team commits, named on every run so that init can keep saying it is not committed yet.
+  assert.deepEqual(result, { changed: [".opencode/plugins/huddle.js"], notes: [...NOTES], files: [".opencode/plugins/huddle.js"] });
   assert.deepEqual(await tree(root), { ".opencode/plugins/huddle.js": pluginSource(BUNDLE) });
   assert.equal(PLUGIN, ".opencode/plugins/huddle.js");
 });
@@ -1577,7 +1578,7 @@ test("install: installing twice adds nothing", async (t) => {
   const first = await stat(file, { bigint: true });
   const text1 = await readFile(file, "utf8");
   for (const bundle of [BUNDLE, `./${BUNDLE}`, ".huddle\\huddle.mjs"]) {
-    assert.deepEqual(await opencode.install({ repoRoot: root, bundle }), { changed: [], notes: [...NOTES] }, bundle);
+    assert.deepEqual(await opencode.install({ repoRoot: root, bundle }), { changed: [], notes: [...NOTES], files: [PLUGIN] }, bundle);
   }
   const second = await stat(file, { bigint: true });
   assert.equal(await readFile(file, "utf8"), text1);
@@ -1668,7 +1669,12 @@ test("install: a copy left by another version, or edited by hand, is written aga
     await writeFile(join(root, "tools/huddle.mjs"), "");
     await writeFile(join(root, PLUGIN), content);
     if (content !== pluginSource("tools/huddle.mjs")) {
-      assert.deepEqual(await opencode.check(root), { installed: false, detail: ".opencode/plugins/huddle.js is not what this version installs. Run huddle init.", notes: [] }, content.slice(0, 200));
+      // huddle's plugin, and not one to rely on: doctor warns (broken).
+      assert.deepEqual(
+        await opencode.check(root),
+        { installed: false, broken: true, detail: ".opencode/plugins/huddle.js is not what this version installs. Run huddle init.", notes: [] },
+        content.slice(0, 200),
+      );
     }
     assert.deepEqual((await opencode.install({ repoRoot: root, bundle: BUNDLE })).changed, [PLUGIN]);
     assert.equal(await readFile(join(root, PLUGIN), "utf8"), current);
@@ -1686,7 +1692,7 @@ test("install: a checkout that holds the plugin with CRLF line ends has the same
   await writeFile(join(root, PLUGIN), crlf);
   assert.deepEqual((await opencode.install({ repoRoot: root, bundle: BUNDLE })).changed, []);
   assert.equal(await readFile(join(root, PLUGIN), "utf8"), crlf);
-  assert.deepEqual(await opencode.check(root), { installed: true, detail: "plugin in .opencode/plugins/huddle.js", notes: [...NOTES] });
+  assert.deepEqual(await opencode.check(root), { installed: true, detail: "plugin in .opencode/plugins/huddle.js", notes: [...NOTES], files: [PLUGIN] });
 });
 
 test("install: the plugin names the bundle it was installed for, and finds it from its own place", async (t) => {
@@ -1728,11 +1734,16 @@ test("check: reports what install left, and what is missing", async (t) => {
 
   await opencode.install({ repoRoot: root, bundle: BUNDLE });
   // The plugin is there and the bundle it runs is not: it would do nothing.
-  assert.deepEqual(await opencode.check(root), { installed: false, detail: ".opencode/plugins/huddle.js runs .huddle/huddle.mjs, which is not in this checkout. Run huddle init.", notes: [] });
+  assert.deepEqual(await opencode.check(root), {
+    installed: false,
+    broken: true,
+    detail: ".opencode/plugins/huddle.js runs .huddle/huddle.mjs, which is not in this checkout. Run huddle init.",
+    notes: [],
+  });
 
   await mkdir(join(root, ".huddle"), { recursive: true });
   await writeFile(join(root, BUNDLE), "");
-  assert.deepEqual(await opencode.check(root), { installed: true, detail: "plugin in .opencode/plugins/huddle.js", notes: [...NOTES] });
+  assert.deepEqual(await opencode.check(root), { installed: true, detail: "plugin in .opencode/plugins/huddle.js", notes: [...NOTES], files: [PLUGIN] });
 });
 
 test("check: goes by the bundle the plugin names, wherever that is", async (t) => {
@@ -1740,7 +1751,12 @@ test("check: goes by the bundle the plugin names, wherever that is", async (t) =
   await opencode.install({ repoRoot: root, bundle: "tools/huddle.mjs" });
   await mkdir(join(root, ".huddle"), { recursive: true });
   await writeFile(join(root, BUNDLE), "");
-  assert.deepEqual(await opencode.check(root), { installed: false, detail: ".opencode/plugins/huddle.js runs tools/huddle.mjs, which is not in this checkout. Run huddle init.", notes: [] });
+  assert.deepEqual(await opencode.check(root), {
+    installed: false,
+    broken: true,
+    detail: ".opencode/plugins/huddle.js runs tools/huddle.mjs, which is not in this checkout. Run huddle init.",
+    notes: [],
+  });
   await mkdir(join(root, "tools"), { recursive: true });
   await writeFile(join(root, "tools/huddle.mjs"), "");
   assert.equal((await opencode.check(root)).installed, true);
@@ -1750,11 +1766,109 @@ test("check: a plugin that cannot be read is not installed, and nothing throws",
   const root = await emptyRepo(t);
   // A directory where the file belongs.
   await mkdir(join(root, PLUGIN), { recursive: true });
-  assert.deepEqual(await opencode.check(root), { installed: false, detail: ".opencode/plugins/huddle.js cannot be read. Fix that, then run huddle init.", notes: [] });
+  assert.deepEqual(await opencode.check(root), { installed: false, detail: ".opencode/plugins/huddle.js cannot be read (it is a directory).", notes: [] });
   // A file where the directory belongs.
   const other = await emptyRepo(t);
   await writeFile(join(other, ".opencode"), "");
-  assert.equal((await opencode.check(other)).installed, false);
+  assert.deepEqual(await opencode.check(other), { installed: false, detail: ".opencode/plugins/huddle.js cannot be read (a file stands where one of its directories should be).", notes: [] });
+});
+
+test("install: a directory or a file in the plugin's way is said in a sentence, and nothing is written", async (t) => {
+  // A directory where the file belongs.
+  const root = await emptyRepo(t);
+  await mkdir(join(root, PLUGIN), { recursive: true });
+  await assert.rejects(opencode.install({ repoRoot: root, bundle: BUNDLE }), (error: unknown) => {
+    assert.ok(error instanceof CliError, `a message for the user, not a crash: ${String(error)}`);
+    assert.equal(error.message, ".opencode/plugins/huddle.js could not be read (it is a directory), so huddle left it alone.");
+    return true;
+  });
+  assert.deepEqual(await readdir(join(root, PLUGIN)), []);
+  // A file where one of its directories belongs.
+  const other = await emptyRepo(t);
+  await writeFile(join(other, ".opencode"), "mine\n");
+  await assert.rejects(opencode.install({ repoRoot: other, bundle: BUNDLE }), (error: unknown) => {
+    assert.ok(error instanceof CliError, String(error));
+    assert.equal(error.message, ".opencode/plugins/huddle.js could not be read (a file stands where one of its directories should be), so huddle left it alone.");
+    return true;
+  });
+  assert.deepEqual(await tree(other), { ".opencode": "mine\n" });
+});
+
+test("install: the plugin is written into the checkout and nowhere else", { skip: process.platform === "win32" }, async (t) => {
+  const outside = await emptyRepo(t);
+  const refusedAs = async (root: string, sentence: RegExp): Promise<void> => {
+    await assert.rejects(opencode.install({ repoRoot: root, bundle: BUNDLE }), (error: unknown) => {
+      assert.ok(error instanceof CliError, `a message for the user, not a crash: ${String(error)}`);
+      assert.match(error.message, sentence);
+      return true;
+    });
+    const checked = await opencode.check(root);
+    assert.deepEqual([checked.installed, sentence.test(checked.detail), checked.notes], [false, true, []], "doctor gives the same reason");
+  };
+
+  // .opencode is a link to a directory outside the checkout: opencode would run a plugin from there, and git would store the link.
+  const linkedDir = await emptyRepo(t);
+  await symlink(outside, join(linkedDir, ".opencode"));
+  await refusedAs(linkedDir, /^\.opencode\/plugins\/huddle\.js is, through a symbolic link, a file outside this checkout/);
+  assert.deepEqual(await readdir(outside), [], "nothing was created out there");
+
+  // The plugins directory alone is such a link.
+  const linkedPlugins = await emptyRepo(t);
+  await mkdir(join(linkedPlugins, ".opencode"));
+  await symlink(outside, join(linkedPlugins, ".opencode", "plugins"));
+  await refusedAs(linkedPlugins, /outside this checkout/);
+  assert.deepEqual(await readdir(outside), []);
+
+  // The file is a link to a file outside the checkout, even one huddle wrote.
+  const linkedFile = await emptyRepo(t);
+  await mkdir(join(linkedFile, ".opencode", "plugins"), { recursive: true });
+  const stale = pluginSource(BUNDLE).replace("ANSWER_MS = ", "ANSWER_MS = 1 + ");
+  assert.notEqual(stale, pluginSource(BUNDLE));
+  await writeFile(join(outside, "shared.js"), stale);
+  await symlink(join(outside, "shared.js"), join(linkedFile, PLUGIN));
+  await refusedAs(linkedFile, /outside this checkout/);
+  assert.equal(await readFile(join(outside, "shared.js"), "utf8"), stale, "untouched");
+
+  // A link that leads nowhere.
+  const dangling = await emptyRepo(t);
+  await mkdir(join(dangling, ".opencode", "plugins"), { recursive: true });
+  await symlink(join(dangling, "tools", "gone.js"), join(dangling, PLUGIN));
+  await refusedAs(dangling, /symbolic link to a place that does not exist/);
+  assert.equal(existsSync(join(dangling, "tools")), false);
+
+  // A link that stays inside the checkout is written through: the link stays a link, and its target is the plugin.
+  const inside = await emptyRepo(t);
+  await mkdir(join(inside, ".opencode", "plugins"), { recursive: true });
+  await mkdir(join(inside, "tools"));
+  await writeFile(join(inside, "tools", "huddle-plugin.js"), stale);
+  await symlink(join("..", "..", "tools", "huddle-plugin.js"), join(inside, PLUGIN));
+  assert.deepEqual((await opencode.install({ repoRoot: inside, bundle: BUNDLE })).changed, [PLUGIN]);
+  assert.equal((await lstat(join(inside, PLUGIN))).isSymbolicLink(), true);
+  assert.equal(await readFile(join(inside, "tools", "huddle-plugin.js"), "utf8"), pluginSource(BUNDLE));
+  await mkdir(join(inside, ".huddle"));
+  await writeFile(join(inside, BUNDLE), "");
+  assert.equal((await opencode.check(inside)).installed, true);
+});
+
+test("install: a copy that is read-only is left alone, and one that is rewritten keeps its mode", { skip: process.platform === "win32" || process.getuid?.() === 0 }, async (t) => {
+  const root = await emptyRepo(t);
+  await opencode.install({ repoRoot: root, bundle: BUNDLE });
+  const file = join(root, PLUGIN);
+  const stale = pluginSource(BUNDLE).replace("ANSWER_MS = ", "ANSWER_MS = 1 + ");
+  await writeFile(file, stale);
+  await chmod(file, 0o444);
+  await assert.rejects(opencode.install({ repoRoot: root, bundle: BUNDLE }), (error: unknown) => {
+    assert.ok(error instanceof CliError, `a message for the user, not a crash: ${String(error)}`);
+    assert.equal(error.message, ".opencode/plugins/huddle.js is read-only, so huddle left it alone. Make it writable, then run huddle init again.");
+    return true;
+  });
+  assert.equal(await readFile(file, "utf8"), stale);
+  assert.deepEqual(await readdir(join(root, ".opencode", "plugins")), ["huddle.js"], "no temporary file is left");
+
+  await chmod(file, 0o640);
+  assert.deepEqual((await opencode.install({ repoRoot: root, bundle: BUNDLE })).changed, [PLUGIN]);
+  assert.equal(await readFile(file, "utf8"), pluginSource(BUNDLE));
+  assert.equal((await stat(file)).mode & 0o777, 0o640);
 });
 
 // ---------------------------------------------------------------------------

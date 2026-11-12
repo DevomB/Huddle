@@ -86,14 +86,14 @@
 // puts the session id into the environment and is not told the session.
 // opencode 1 has "shell.env" with the session id, and gets it.
 
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { CliError } from "../core/io.ts";
-import { asRecord, asText, bundlePath, exists, onPath } from "./json-hooks.ts";
-import type { Json } from "./json-hooks.ts";
+import { asRecord, asText, bundlePath, exists, onPath, placeOf, reason, writeWhole } from "./json-hooks.ts";
+import type { Check, Installed, Json } from "./json-hooks.ts";
 import { SILENT } from "./types.ts";
-import type { Adapter, CheckResult, HookEvent, HookEventType, HookInput, HookOutcome, HookOutput, InstallOptions, InstallResult } from "./types.ts";
+import type { Adapter, HookEvent, HookEventType, HookInput, HookOutcome, HookOutput, InstallOptions } from "./types.ts";
 
 const NAME = "opencode";
 
@@ -559,7 +559,8 @@ const unix = (text: string): string => text.replace(/\r\n/g, "\n");
 
 const isOurs = (text: string): boolean => text.startsWith(MARKER);
 
-const BUNDLE_LINE = /^const BUNDLE_PATH = ("[^"\\\r\n]*");\r?$/m;
+// With the m flag "$" stands before a carriage return as well, so a copy with CRLF line ends is read the same way.
+const BUNDLE_LINE = /^const BUNDLE_PATH = ("[^"\\\r\n]*");$/m;
 
 /** The repo-relative bundle a plugin written by huddle runs, or null when it does not say. */
 function bundleOf(text: string): string | null {
@@ -569,40 +570,64 @@ function bundleOf(text: string): string | null {
   return typeof bundle === "string" && PLAIN_PATH.test(bundle) && !bundle.split("/").includes("..") ? bundle : null;
 }
 
-async function install(opts: InstallOptions): Promise<InstallResult> {
+/**
+ * The plugin is written where the hook files of the other agents are (the
+ * shared code in json-hooks.ts): into the checkout and nowhere else. A link
+ * at the file's place that stays inside the checkout is written through; one
+ * that leads out of it, or nowhere, is refused, and so is a directory on the
+ * way that does. This file is code that opencode runs: out there git would
+ * store the link and not the file, and whatever else uses that directory
+ * would load it.
+ *
+ * `files` names the plugin on every run, changed or not: it is the file the
+ * team commits, and init keeps saying so until it is.
+ */
+async function install(opts: InstallOptions): Promise<Installed> {
   const wanted = pluginSource(bundlePath(opts.bundle));
-  const file = join(opts.repoRoot, PLUGIN);
-  const before = await readText(file);
-  if (before !== null && unix(before) === wanted) return { changed: [], notes: [...NOTES] };
+  let target: string;
+  let before: string | null;
+  try {
+    target = await placeOf({ path: PLUGIN }, opts.repoRoot);
+    before = await readText(target);
+  } catch (error) {
+    if (error instanceof CliError) throw error;
+    throw new CliError(`${PLUGIN} could not be read (${reason(error)}), so huddle left it alone.`);
+  }
+  if (before !== null && unix(before) === wanted) return { changed: [], notes: [...NOTES], files: [PLUGIN] };
   if (before !== null && !isOurs(before)) {
     throw new CliError(`${PLUGIN} is there and was not written by huddle. huddle will not overwrite it: move it away, then run huddle init again.`);
   }
-  await mkdir(dirname(file), { recursive: true });
-  const temporary = `${file}.huddle-${process.pid}.tmp`;
   try {
-    await writeFile(temporary, wanted, "utf8");
-    await rename(temporary, file);
+    await writeWhole(target, wanted, PLUGIN);
   } catch (error) {
-    await rm(temporary, { force: true }).catch(() => {});
-    throw error;
+    if (error instanceof CliError) throw error;
+    throw new CliError(`${PLUGIN} could not be written (${reason(error)}).`);
   }
-  return { changed: [PLUGIN], notes: [...NOTES] };
+  return { changed: [PLUGIN], notes: [...NOTES], files: [PLUGIN] };
 }
 
-async function check(repoRoot: string): Promise<CheckResult> {
-  const no = (detail: string): CheckResult => ({ installed: false, detail, notes: [] });
+/**
+ * `broken`: a plugin of huddle's is there and cannot be relied on as it is
+ * (not what this version writes, or its bundle is gone), which doctor warns
+ * about. A plugin that is missing, or somebody else's file in its place, is
+ * huddle not installed, which doctor only mentions.
+ */
+async function check(repoRoot: string): Promise<Check> {
+  const no = (detail: string, broken = false): Check => (broken ? { installed: false, broken: true, detail, notes: [] } : { installed: false, detail, notes: [] });
   let text: string | null;
   try {
-    text = await readText(join(repoRoot, PLUGIN));
-  } catch {
-    return no(`${PLUGIN} cannot be read. Fix that, then run huddle init.`);
+    // Where init would write. A link that leads nowhere or out of the checkout is init's reason to refuse, and doctor's to say so.
+    text = await readText(await placeOf({ path: PLUGIN }, repoRoot));
+  } catch (error) {
+    if (error instanceof CliError) return no(error.message);
+    return no(`${PLUGIN} cannot be read (${reason(error)}).`);
   }
   if (text === null) return no(`${PLUGIN} not found. Run huddle init.`);
   if (!isOurs(text)) return no(`${PLUGIN} is there and was not written by huddle. Move it away, then run huddle init.`);
   const bundle = bundleOf(text);
-  if (bundle === null || unix(text) !== pluginSource(bundle)) return no(`${PLUGIN} is not what this version installs. Run huddle init.`);
-  if (!(await exists(join(repoRoot, bundle)))) return no(`${PLUGIN} runs ${bundle}, which is not in this checkout. Run huddle init.`);
-  return { installed: true, detail: `plugin in ${PLUGIN}`, notes: [...NOTES] };
+  if (bundle === null || unix(text) !== pluginSource(bundle)) return no(`${PLUGIN} is not what this version installs. Run huddle init.`, true);
+  if (!(await exists(join(repoRoot, bundle)))) return no(`${PLUGIN} runs ${bundle}, which is not in this checkout. Run huddle init.`, true);
+  return { installed: true, detail: `plugin in ${PLUGIN}`, notes: [...NOTES], files: [PLUGIN] };
 }
 
 export interface Surroundings {

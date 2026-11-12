@@ -370,7 +370,7 @@ async function readText(path: string): Promise<string | null> {
 }
 
 /** Why a file could not be read or written, in words where the error code has an everyday meaning. */
-function reason(error: unknown): string {
+export function reason(error: unknown): string {
   const code = (error as NodeJS.ErrnoException | null)?.code;
   if (code === "EISDIR") return "it is a directory";
   if (code === "ENOTDIR") return "a file stands where one of its directories should be";
@@ -413,7 +413,7 @@ async function realPlace(path: string): Promise<string> {
  * nothing; and because the file out there may be one the user shares between
  * projects, where huddle's hooks would then run without a bundle to run.
  */
-async function placeOf(file: HookFile, repoRoot: string): Promise<string> {
+export async function placeOf(file: Pick<HookFile, "path">, repoRoot: string): Promise<string> {
   let target: string;
   try {
     target = await realPlace(join(repoRoot, file.path));
@@ -435,7 +435,7 @@ async function placeOf(file: HookFile, repoRoot: string): Promise<string> {
  * `target` is from placeOf(), so a link is written through and not replaced;
  * the file keeps its mode. `shown` is the file's name in messages.
  */
-async function writeWhole(target: string, text: string, shown: string): Promise<void> {
+export async function writeWhole(target: string, text: string, shown: string): Promise<void> {
   await mkdir(dirname(target), { recursive: true });
   const mode = await stat(target).then(
     (found) => found.mode & 0o777,
