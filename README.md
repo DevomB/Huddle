@@ -241,6 +241,8 @@ Known and not fixed. Read these before you depend on it.
 - It is not real time. Two active agents see each other's changes within about 15 to 30 seconds; a plain `git commit` can take up to 15 seconds to reach teammates. On GitHub each exchange with the remote takes about a second. Two agents can still start the same thing inside that window; an explicit task claim closes it.
 - Liveness goes by each machine's clock. A clock several minutes off misreports who is live; a clock 15 minutes fast can take over any task.
 - Teammates may treat a session as gone between 12 and 15 minutes after it was last active, not exactly 15.
+- Hooks have deadlines: 150 ms before an edit, 300 ms at a prompt, 4 seconds at session start. On a slow or busy machine (a busy Windows machine, a slow disk, a scanner that reads every file first) a hook can run out of time before it has done its work. It then says nothing and writes a line to the debug log, `.git/huddle/log`, which `git huddle doctor` points at. `HUDDLE_HOOK_PATIENCE`, a number from 1 to 20 in the environment of whatever starts the agent, makes every deadline that many times longer. It gives no extra time for the remote.
+- A commit waits at most 1 second for a sync, so the first commit after a long pause may be checked against the older team state.
 
 **Sessions and claims**
 - A claim and a task both end with the session that holds them. A one-shot session (`claude -p`) releases everything when it exits.
