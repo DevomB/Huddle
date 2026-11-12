@@ -6,7 +6,7 @@ import { ageMs } from "./clock.ts";
 import type { Ctx } from "./context.ts";
 import { cleanText, LIMITS, normalizeDoc } from "./docs.ts";
 import { manualSessionId } from "./identity.ts";
-import { readCache, readLocal } from "./store.ts";
+import { readCache, readLocal, updateLocal } from "./store.ts";
 import { actorRef } from "./types.ts";
 import type { ActorDoc, Identity, LocalSession, LocalState, Session } from "./types.ts";
 import { buildView } from "./view.ts";
@@ -45,6 +45,47 @@ export async function resolveSession(ctx: Ctx, state?: LocalState): Promise<Curr
   if (here) return { id: here.id, agent: here.agent, session: here };
 
   return found(manualSessionId(ctx.paths, ctx.io.env));
+}
+
+/**
+ * Changes the session a command acts as, under the local lock. `change` sees
+ * the session as it is stored at that moment, not as it was when the command
+ * read it, so commands that run at once (an agent claiming in parallel tool
+ * calls) all take effect instead of the last one overwriting the others.
+ *
+ * A session that is not stored is created first when `create` is set;
+ * otherwise `change` is not called and the result is null. When `change`
+ * throws, nothing is written and the error reaches the caller.
+ */
+export async function changeSession(
+  ctx: Ctx,
+  me: CurrentSession,
+  opts: { create: boolean },
+  change: (session: LocalSession) => void,
+): Promise<LocalSession | null> {
+  const stamp = ctx.now.toISOString();
+  const state = await updateLocal(ctx.paths, (current) => {
+    let session = current.sessions.find((candidate) => candidate.id === me.id);
+    if (!session) {
+      if (!opts.create) return;
+      session = {
+        id: me.id,
+        agent: me.agent,
+        branch: "",
+        intent: "",
+        intentSource: "none",
+        files: [],
+        claims: [],
+        startedAt: stamp,
+        seenAt: stamp,
+        worktree: ctx.paths.worktree,
+      };
+      current.sessions.push(session);
+    }
+    change(session);
+    session.seenAt = stamp;
+  });
+  return state.sessions.find((candidate) => candidate.id === me.id) ?? null;
 }
 
 /** The published form of a local session: everything except the worktree path, which never leaves the machine. */
