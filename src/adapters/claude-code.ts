@@ -10,13 +10,15 @@
 //   SessionStart        session-start   timeout 10
 //   UserPromptSubmit    prompt          timeout 5
 //   PreToolUse          pre-edit        timeout 5, matcher: the file-editing tools
-//   PostToolUse         post-edit       timeout 5, async, every tool
+//   PostToolUse         post-edit       timeout 5, async, every tool but Read, Grep and Glob
 //   Stop                turn-end        timeout 5
 //   SessionEnd          session-end     timeout 5
 //
-// PostToolUse has no matcher on purpose. It is the session's heartbeat: a
+// PostToolUse is the session's heartbeat, not only a record of edits: a
 // session that only runs shell commands still shows as live, and a shell
-// command can edit files too. It is async so that no tool call waits for it,
+// command can edit files too. It leaves out the three tools that cannot
+// change a file and that agents call in bursts, each of which would start a
+// node process for nothing. It is async so that no tool call waits for it,
 // and Claude Code does not enforce `timeout` on an async hook: for that one
 // registration the only deadline is the engine's own.
 //
@@ -49,11 +51,20 @@ const LOCAL_SETTINGS = ".claude/settings.local.json";
  */
 const EDIT_TOOLS: readonly string[] = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
 
+/**
+ * Every tool except Read, Grep and Glob. A matcher with any character besides
+ * letters, digits, "_", "-", spaces, "," and "|" is a JavaScript regular expression, tested
+ * unanchored against the tool name, so this is a negative lookahead from the
+ * start of the name. Checked on Claude Code 2.1.322: with it the hook ran for
+ * Bash, Write and Edit and not for Read, Grep or Glob.
+ */
+const NOT_READ_ONLY = "^(?!(?:Read|Grep|Glob)$)";
+
 const REGISTRATIONS: readonly Registration[] = [
   { event: "SessionStart", type: "session-start", timeout: 10 },
   { event: "UserPromptSubmit", type: "prompt", timeout: 5 },
   { event: "PreToolUse", type: "pre-edit", timeout: 5, matcher: EDIT_TOOLS.join("|") },
-  { event: "PostToolUse", type: "post-edit", timeout: 5, async: true },
+  { event: "PostToolUse", type: "post-edit", timeout: 5, async: true, matcher: NOT_READ_ONLY },
   { event: "Stop", type: "turn-end", timeout: 5 },
   // SessionEnd hooks share 1.5 s unless a hook asks for longer, and
   // session-end has to finish a sync: the timeout is what buys the time.

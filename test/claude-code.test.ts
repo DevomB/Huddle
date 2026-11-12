@@ -492,6 +492,9 @@ function handler(timeout: number, extra: Json = {}): Json {
   return { type: "command", command: "node", args: [SCRIPT, "hook", "claude-code"], timeout, ...extra };
 }
 
+/** Every tool but the three that only read, as a regular expression on the tool name. */
+const NOT_READ_ONLY = "^(?!(?:Read|Grep|Glob)$)";
+
 /** What install() writes into an empty repo. */
 function installed(): Json {
   return {
@@ -499,7 +502,7 @@ function installed(): Json {
       SessionStart: [{ hooks: [handler(10)] }],
       UserPromptSubmit: [{ hooks: [handler(5)] }],
       PreToolUse: [{ matcher: "Edit|Write|MultiEdit|NotebookEdit", hooks: [handler(5)] }],
-      PostToolUse: [{ hooks: [handler(5, { async: true })] }],
+      PostToolUse: [{ matcher: NOT_READ_ONLY, hooks: [handler(5, { async: true })] }],
       Stop: [{ hooks: [handler(5)] }],
       SessionEnd: [{ hooks: [handler(5)] }],
     },
@@ -601,7 +604,18 @@ test("install: what is written follows the rules in Claude Code's hook reference
   // Only letters and "|": Claude Code reads that as a list of exact tool names, not as a regular expression.
   assert.match(hooks.PreToolUse?.[0]?.matcher ?? "", /^[A-Za-z|]+$/);
   assert.deepEqual((hooks.PreToolUse?.[0]?.matcher ?? "").split("|"), ["Edit", "Write", "MultiEdit", "NotebookEdit"]);
-  for (const event of ["SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd"]) assert.equal("matcher" in (hooks[event]?.[0] ?? {}), false, event);
+  for (const event of ["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"]) assert.equal("matcher" in (hooks[event]?.[0] ?? {}), false, event);
+  // The heartbeat runs after every tool except the three that only read, which agents call in bursts.
+  // Any character outside letters, digits, "_", "-", spaces, "," and "|" makes a matcher a JavaScript
+  // regular expression, tested unanchored with RegExp.prototype.test.
+  const heartbeat = hooks.PostToolUse?.[0]?.matcher ?? "";
+  assert.equal(heartbeat, "^(?!(?:Read|Grep|Glob)$)");
+  assert.equal(/^[A-Za-z0-9_\- ,|]*$/.test(heartbeat), false, "must be on the regular-expression path");
+  const fires = new RegExp(heartbeat);
+  for (const tool of ["Read", "Grep", "Glob"]) assert.equal(fires.test(tool), false, tool);
+  for (const tool of ["Bash", "PowerShell", "Edit", "Write", "MultiEdit", "NotebookEdit", "Agent", "Task", "WebFetch", "TodoWrite", "mcp__memory__create_entities", "ReadMcpResourceTool", "GlobalSearch", "Grepper", "read", ""]) {
+    assert.equal(fires.test(tool), true, tool);
+  }
   // No tool call waits for the heartbeat, and nothing else may run in the background:
   // an async hook's output arrives a turn late, and Stop and SessionEnd must finish.
   assert.equal(hooks.PostToolUse?.[0]?.hooks[0]?.async, true);
@@ -663,7 +677,7 @@ test("install: a user's existing hooks and settings survive, untouched and in pl
   assert.deepEqual(Object.keys(hooks), ["PreToolUse", "PostToolUse", "Stop", "Notification", "SessionStart", "UserPromptSubmit", "SessionEnd"]);
   const userHooks = USER_SETTINGS.hooks as Record<string, Json[]>;
   assert.deepEqual(hooks.PreToolUse, [...(userHooks.PreToolUse ?? []), { matcher: "Edit|Write|MultiEdit|NotebookEdit", hooks: [handler(5)] }]);
-  assert.deepEqual(hooks.PostToolUse, [...(userHooks.PostToolUse ?? []), { hooks: [handler(5, { async: true })] }]);
+  assert.deepEqual(hooks.PostToolUse, [...(userHooks.PostToolUse ?? []), { matcher: NOT_READ_ONLY, hooks: [handler(5, { async: true })] }]);
   assert.deepEqual(hooks.Stop, [...(userHooks.Stop ?? []), { hooks: [handler(5)] }]);
   assert.deepEqual(hooks.Notification, userHooks.Notification);
 
@@ -721,7 +735,7 @@ test("install: handlers left by an older or hand-edited install are brought up t
         { matcher: "Bash", hooks: [userGuard] },
         { matcher: "Edit|Write|MultiEdit|NotebookEdit", hooks: [handler(5)] },
       ],
-      PostToolUse: [{ hooks: [handler(5, { async: true })] }, { matcher: "Bash", hooks: [userGuard] }],
+      PostToolUse: [{ matcher: NOT_READ_ONLY, hooks: [handler(5, { async: true })] }, { matcher: "Bash", hooks: [userGuard] }],
       Stop: [{ matcher: "*", hooks: [{ timeout: 5, args: [SCRIPT, "hook", "claude-code"], command: "node", type: "command" }] }],
       SessionEnd: [{ hooks: [handler(5)] }, { hooks: [userGuard] }],
     },
@@ -729,6 +743,28 @@ test("install: handlers left by an older or hand-edited install are brought up t
   const text = await readFile(file, "utf8");
   assert.deepEqual((await claudeCode.install({ repoRoot: root, bundle: BUNDLE })).changed, []);
   assert.equal(await readFile(file, "utf8"), text);
+});
+
+test("install: an install from before PostToolUse had a matcher gains it in place", async (t) => {
+  const before = installed();
+  (before.hooks as Record<string, Json[]>).PostToolUse = [{ hooks: [handler(5, { async: true })] }];
+  const { root, file } = await scratchRepo(t, before);
+  await withBundle(root);
+  const around = { env: {}, home: await emptyHome(t) };
+  assert.match((await checkClaudeCode(root, around)).detail, /not what this version installs for PostToolUse\. Run huddle init\.$/);
+
+  assert.deepEqual((await claudeCode.install({ repoRoot: root, bundle: BUNDLE })).changed, [".claude/settings.json"]);
+  assert.deepEqual(await readJson(file), installed());
+  assert.equal((await checkClaudeCode(root, around)).installed, true);
+  assert.deepEqual((await claudeCode.install({ repoRoot: root, bundle: BUNDLE })).changed, []);
+
+  // Next to a user's handler in the same group, huddle's moves out and the user's stays as it was.
+  const userGuard = { type: "command", command: "./audit.sh" };
+  const shared = installed();
+  (shared.hooks as Record<string, Json[]>).PostToolUse = [{ hooks: [userGuard, handler(5, { async: true })] }];
+  const second = await scratchRepo(t, shared);
+  await claudeCode.install({ repoRoot: second.root, bundle: BUNDLE });
+  assert.deepEqual(((await readJson(second.file)).hooks as Record<string, Json[]>).PostToolUse, [{ hooks: [userGuard] }, { matcher: NOT_READ_ONLY, hooks: [handler(5, { async: true })] }]);
 });
 
 test("install: a new bundle location re-points the handlers instead of adding a second set", async (t) => {
