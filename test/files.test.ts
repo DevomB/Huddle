@@ -1,0 +1,196 @@
+// T1.4: src/core/files.ts against real repositories.
+
+import assert from "node:assert/strict";
+import { mkdir, rm, symlink } from "node:fs/promises";
+import { join } from "node:path";
+import { test } from "node:test";
+import { currentBranch, DETACHED, filesInFlight, resolveBase, toRepoPath, toRepoPattern } from "../src/core/files.ts";
+import { DEFAULT_CONFIG } from "../src/core/types.ts";
+import { createHarness } from "./harness.ts";
+
+const config = { ...DEFAULT_CONFIG };
+
+test("currentBranch names the branch, and says so when HEAD is detached", async (t) => {
+  const h = await createHarness(t);
+  const clone = await h.clone("alice");
+  assert.equal(await currentBranch(clone.dir), "main");
+  await clone.git("checkout", "--quiet", "-b", "feat/auth");
+  assert.equal(await currentBranch(clone.dir), "feat/auth");
+  await clone.git("checkout", "--quiet", "--detach");
+  assert.equal(await currentBranch(clone.dir), DETACHED);
+  assert.equal(await currentBranch(join(h.root, "nowhere")), DETACHED);
+});
+
+test("resolveBase prefers origin/HEAD, then origin/main, then origin/master", async (t) => {
+  const h = await createHarness(t);
+  const clone = await h.clone("alice");
+  assert.equal(await resolveBase(clone.dir, config), "refs/remotes/origin/HEAD");
+
+  await clone.git("remote", "set-head", "origin", "--delete");
+  assert.equal(await resolveBase(clone.dir, config), "refs/remotes/origin/main");
+
+  await clone.git("update-ref", "refs/remotes/origin/master", "HEAD");
+  await clone.git("update-ref", "-d", "refs/remotes/origin/main");
+  assert.equal(await resolveBase(clone.dir, config), "refs/remotes/origin/master");
+
+  await clone.git("update-ref", "-d", "refs/remotes/origin/master");
+  assert.equal(await resolveBase(clone.dir, config), null);
+});
+
+test("resolveBase honors an explicit base, remote first, and falls back when it does not exist", async (t) => {
+  const h = await createHarness(t);
+  const clone = await h.clone("alice");
+  await clone.git("update-ref", "refs/remotes/origin/develop", "HEAD");
+  assert.equal(await resolveBase(clone.dir, { ...config, base: "develop" }), "refs/remotes/origin/develop");
+  await clone.git("branch", "local-only");
+  assert.equal(await resolveBase(clone.dir, { ...config, base: "local-only" }), "refs/heads/local-only");
+  assert.equal(await resolveBase(clone.dir, { ...config, base: "missing" }), "refs/remotes/origin/HEAD");
+  assert.equal(await resolveBase(clone.dir, { ...config, remote: "upstream" }), null);
+});
+
+test("filesInFlight lists dirty files of every kind and leaves ignored ones out", async (t) => {
+  const h = await createHarness(t);
+  const clone = await h.clone("alice");
+  await clone.write("tracked.txt", "one\n");
+  await clone.write("to-delete.txt", "x\n");
+  await clone.write("to-rename.txt", "a file that is long enough to be detected as a rename\n");
+  await clone.write(".gitignore", "ignored/\n*.log\n");
+  await clone.commit("base files");
+  await clone.push();
+  assert.deepEqual(await filesInFlight(clone.dir, config), [], "a clean worktree level with its base has nothing in flight");
+
+  await clone.write("tracked.txt", "two\n"); // modified, unstaged
+  await clone.write("staged.txt", "s\n");
+  await clone.git("add", "staged.txt"); // added, staged
+  await clone.write("src/new/untracked.ts", "u\n"); // untracked, in a new directory
+  await rm(join(clone.dir, "to-delete.txt")); // deleted
+  await clone.git("mv", "to-rename.txt", "renamed.txt"); // renamed: both names matter
+  await clone.write("ignored/secret.txt", "i\n");
+  await clone.write("debug.log", "i\n");
+  await clone.write("name with spaces.txt", "w\n");
+
+  assert.deepEqual(await filesInFlight(clone.dir, config), [
+    "name with spaces.txt",
+    "renamed.txt",
+    "src/new/untracked.ts",
+    "staged.txt",
+    "to-delete.txt",
+    "to-rename.txt",
+    "tracked.txt",
+  ]);
+});
+
+test("filesInFlight adds files changed in commits since the merge-base with the base branch", async (t) => {
+  const h = await createHarness(t);
+  const alice = await h.clone("alice");
+  const bob = await h.clone("bob");
+
+  await alice.git("checkout", "--quiet", "-b", "feat/auth");
+  await alice.write("src/auth.ts", "a\n");
+  await alice.commit("auth");
+  await alice.write("src/jwt.ts", "j\n");
+  await alice.commit("jwt");
+  await alice.write("wip.txt", "w\n");
+
+  // main moves on after alice branched: bob's file is not alice's work.
+  await bob.write("src/unrelated.ts", "b\n");
+  await bob.commit("unrelated");
+  await bob.push();
+  await alice.git("fetch", "--quiet");
+
+  assert.deepEqual(await filesInFlight(alice.dir, config), ["wip.txt", "src/auth.ts", "src/jwt.ts"], "dirty first, then committed");
+
+  // Unpushed commits made directly on main count too.
+  await bob.write("src/direct.ts", "d\n");
+  await bob.commit("direct on main");
+  assert.deepEqual(await filesInFlight(bob.dir, config), ["src/direct.ts"]);
+  await bob.push();
+  assert.deepEqual(await filesInFlight(bob.dir, config), []);
+});
+
+test("filesInFlight is capped at 200, keeping dirty files ahead of committed ones", async (t) => {
+  const h = await createHarness(t);
+  const clone = await h.clone("alice");
+  await clone.git("checkout", "--quiet", "-b", "big");
+  for (let i = 0; i < 150; i++) await clone.write(`committed/c${String(i).padStart(3, "0")}.txt`, "c\n");
+  await clone.commit("many committed files");
+  for (let i = 0; i < 120; i++) await clone.write(`dirty/d${String(i).padStart(3, "0")}.txt`, "d\n");
+
+  const files = await filesInFlight(clone.dir, config);
+  assert.equal(files.length, 200);
+  assert.equal(files.filter((file) => file.startsWith("dirty/")).length, 120);
+  assert.equal(files.filter((file) => file.startsWith("committed/")).length, 80);
+  assert.equal(files[0], "dirty/d000.txt");
+});
+
+test("filesInFlight leaves the index, refs and working tree alone", async (t) => {
+  const h = await createHarness(t);
+  const clone = await h.clone("alice");
+  await clone.write("a.txt", "a\n");
+  await clone.git("add", "a.txt");
+  await clone.write("b.txt", "b\n");
+  const before = await clone.snapshot();
+  await filesInFlight(clone.dir, config);
+  await currentBranch(clone.dir);
+  await resolveBase(clone.dir, config);
+  assert.deepEqual(await clone.snapshot(), before);
+});
+
+test("filesInFlight outside a repository is empty rather than an error", async (t) => {
+  const h = await createHarness(t);
+  assert.deepEqual(await filesInFlight(h.root, config), []);
+  assert.deepEqual(await filesInFlight(join(h.root, "nowhere"), config), []);
+});
+
+test("toRepoPath makes agent-supplied paths repo-relative and rejects paths outside the worktree", async (t) => {
+  const h = await createHarness(t);
+  const clone = await h.clone("alice");
+  const paths = await clone.paths();
+  await mkdir(join(clone.dir, "src", "deep"), { recursive: true });
+  const deep = join(clone.dir, "src", "deep");
+
+  assert.equal(toRepoPath(paths, clone.dir, join(clone.dir, "src", "auth.ts")), "src/auth.ts", "absolute");
+  assert.equal(toRepoPath(paths, clone.dir, "src/auth.ts"), "src/auth.ts", "relative to the root");
+  assert.equal(toRepoPath(paths, deep, "file.ts"), "src/deep/file.ts", "relative to a subdirectory");
+  assert.equal(toRepoPath(paths, deep, "../../README.md"), "README.md");
+  assert.equal(toRepoPath(paths, clone.dir, "./src//auth.ts"), "src/auth.ts", "normalized");
+  assert.equal(toRepoPath(paths, clone.dir, "not/created/yet.ts"), "not/created/yet.ts", "need not exist");
+
+  assert.equal(toRepoPath(paths, clone.dir, clone.dir), null, "the root itself");
+  assert.equal(toRepoPath(paths, clone.dir, "."), null);
+  assert.equal(toRepoPath(paths, clone.dir, ""), null);
+  assert.equal(toRepoPath(paths, clone.dir, "../bob/src/auth.ts"), null, "a sibling clone");
+  assert.equal(toRepoPath(paths, clone.dir, "/etc/passwd"), null);
+  assert.equal(toRepoPath(paths, clone.dir, join(h.root, "alice-other", "x.ts")), null, "a directory that merely shares the prefix");
+});
+
+test("toRepoPath sees through a symlink to the worktree", async (t) => {
+  const h = await createHarness(t);
+  const clone = await h.clone("alice");
+  const paths = await clone.paths();
+  const link = join(h.root, "link-to-alice");
+  await symlink(clone.dir, link);
+  assert.equal(toRepoPath(paths, link, "src/auth.ts"), "src/auth.ts");
+  assert.equal(toRepoPath(paths, clone.dir, join(link, "src", "new", "file.ts")), "src/new/file.ts");
+});
+
+test("toRepoPattern resolves claim globs from where they were typed", async (t) => {
+  const h = await createHarness(t);
+  const clone = await h.clone("alice");
+  const paths = await clone.paths();
+  await mkdir(join(clone.dir, "src", "auth"), { recursive: true });
+  const sub = join(clone.dir, "src", "auth");
+
+  assert.equal(toRepoPattern(paths, clone.dir, "src/auth/**"), "src/auth/**");
+  assert.equal(toRepoPattern(paths, clone.dir, "./src/*.ts"), "src/*.ts");
+  assert.equal(toRepoPattern(paths, sub, "*.ts"), "src/auth/*.ts", "relative to the subdirectory");
+  assert.equal(toRepoPattern(paths, sub, "../payments/**"), "src/payments/**");
+  assert.equal(toRepoPattern(paths, sub, "/docs/**"), "docs/**", "a leading slash means the repo root");
+  assert.equal(toRepoPattern(paths, clone.dir, "src\\auth\\*.ts"), "src/auth/*.ts");
+
+  assert.equal(toRepoPattern(paths, clone.dir, "../outside/**"), null);
+  assert.equal(toRepoPattern(paths, sub, "../../../x"), null);
+  assert.equal(toRepoPattern(paths, h.root, "*.ts"), null, "typed outside the worktree");
+  assert.equal(toRepoPattern(paths, clone.dir, ""), null);
+  assert.equal(toRepoPattern(paths, clone.dir, "."), null);
+});

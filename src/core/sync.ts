@@ -1,12 +1,24 @@
 // T1.4. One sync round (plan.md §3 Sync), and starting one in the background.
 
+import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { stat, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { ageMs } from "./clock.ts";
 import type { Ctx } from "./context.ts";
-import { todo } from "./io.ts";
+import { normalizeDoc } from "./docs.ts";
+import { currentBranch, filesInFlight } from "./files.ts";
+import { log } from "./log.ts";
+import { ensureStateDir } from "./paths.ts";
 import type { RepoPaths } from "./paths.ts";
-import type { FailReason } from "./types.ts";
+import { toActorDoc } from "./session.ts";
+import { readCache, readLocal, removeSeen, updateLocal, withLock, writeCache } from "./store.ts";
+import { actorRef } from "./types.ts";
+import type { ActorDoc, Config, FailReason, LocalState, PublishResult } from "./types.ts";
 
 export interface SyncOptions {
-  /** Ignore syncIntervalSeconds. */
+  /** Ignore syncIntervalSeconds, and wait for a sync that is already running instead of skipping. */
   force?: boolean;
 }
 
@@ -18,8 +30,33 @@ export interface SyncResult {
   fetched: boolean;
   /** This clone's ActorDoc was pushed. */
   published: boolean;
-  /** Why the fetch or the publish failed, if either did. */
-  error?: FailReason;
+  /** Why the fetch or the publish failed, if either did; "internal" for a bug on our side. */
+  error?: FailReason | "internal";
+}
+
+/** A forced sync waits this long for a round that is already running. */
+const FORCED_LOCK_WAIT_MS = 20_000;
+/** A sync.lock whose holder stopped heartbeating for this long is taken over. */
+const SYNC_LOCK_STALE_MS = 60_000;
+
+/** When the last round started (ISO text). Local bookkeeping for the throttle; see stampFile. */
+function stampFile(paths: RepoPaths): string {
+  return join(paths.stateDir, "sync-stamp");
+}
+
+function throttledAt(stamp: string | null, config: Config, now: Date): boolean {
+  if (!stamp) return false;
+  const age = ageMs(stamp.trim(), now);
+  // A stamp from the future (clock change, pinned test clock) must not block syncing forever.
+  return age >= 0 && age < config.syncIntervalSeconds * 1000;
+}
+
+function readStamp(paths: RepoPaths): string | null {
+  try {
+    return readFileSync(stampFile(paths), "utf8");
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -27,21 +64,239 @@ export interface SyncResult {
  * 2. Recompute branch and files for each local session; drop sessions past the TTL.
  * 3. Refresh cache.json from the remote.
  * 4. Publish the ActorDoc if it changed or the last publish is older than heartbeatMinutes.
- * Never throws; network failures are logged and reported in the result.
+ * Steps 3 and 4 run concurrently. Never throws; failures are logged and reported in the result.
  */
 export async function sync(ctx: Ctx, opts: SyncOptions = {}): Promise<SyncResult> {
-  void ctx;
-  void opts;
-  return todo("sync.sync");
+  const skipped = (why: "throttled" | "locked"): SyncResult => ({ ran: false, skipped: why, fetched: false, published: false });
+  try {
+    await ensureStateDir(ctx.paths);
+    if (!opts.force && throttledAt(readStamp(ctx.paths), ctx.config, ctx.now)) return skipped("throttled");
+    const locked = await withLock(
+      ctx.paths,
+      "sync",
+      async () => {
+        // Another process may have synced while we waited for the lock.
+        if (!opts.force && throttledAt(readStamp(ctx.paths), ctx.config, ctx.now)) return skipped("throttled");
+        await writeFile(stampFile(ctx.paths), ctx.now.toISOString());
+        return round(ctx);
+      },
+      { waitMs: opts.force ? FORCED_LOCK_WAIT_MS : 0, staleMs: SYNC_LOCK_STALE_MS },
+    );
+    return locked.acquired ? locked.value : skipped("locked");
+  } catch (error) {
+    log(ctx.paths, "sync", "sync failed", error);
+    return { ran: false, fetched: false, published: false, error: "internal" };
+  }
+}
+
+async function round(ctx: Ctx): Promise<SyncResult> {
+  const { paths, config, identity, transport, now } = ctx;
+  const state = await refreshSessions(ctx);
+  const cache = await readCache(paths);
+  const ownRef = actorRef(identity.actor);
+
+  const doc = toActorDoc(identity, state.sessions, now, config.ttlMinutes);
+  const hash = contentHash(doc);
+  const known = new Map(Object.entries(cache.refs).map(([ref, entry]) => [ref, entry.sha]));
+
+  const publishDue = shouldPublish(state.published, doc, hash, now, config);
+  const [fetched, firstPublish] = await Promise.all([
+    transport.fetchAll(known),
+    publishDue ? transport.publish(ownRef, doc, "own") : Promise.resolve(null),
+  ]);
+
+  let cacheChanged = false;
+  if (fetched.ok) {
+    for (const [ref, entry] of fetched.changed) cache.refs[ref] = { sha: entry.sha, doc: entry.doc };
+    for (const ref of fetched.removed) delete cache.refs[ref];
+    cache.fetchedAt = now.toISOString();
+    cacheChanged = true;
+  } else {
+    log(paths, "sync", `fetch failed: ${fetched.reason}`);
+  }
+
+  // Our doc should be on the remote at the sha we last published. If it is not
+  // there (deleted, or overwritten by someone else), put it back.
+  let published: PublishResult | null = firstPublish;
+  if (!published && fetched.ok && state.published && doc.sessions.length > 0 && cache.refs[ownRef]?.sha !== state.published.sha) {
+    published = await transport.publish(ownRef, doc, "own");
+  }
+
+  if (published?.ok) {
+    const sha = published.sha;
+    await updateLocal(paths, (current) => {
+      current.published = { at: now.toISOString(), hash, sha };
+    });
+    // Applied after the fetch: the listing may predate our own push.
+    cache.refs[ownRef] = { sha, doc: normalizeDoc(doc) };
+    cacheChanged = true;
+  } else if (published) {
+    log(paths, "sync", `publish failed: ${published.reason}`);
+  }
+
+  if (cacheChanged) await writeCache(paths, cache);
+
+  const result: SyncResult = { ran: true, fetched: fetched.ok, published: published?.ok === true };
+  const failure = !fetched.ok ? fetched.reason : published && !published.ok ? published.reason : undefined;
+  if (failure) result.error = failure;
+  return result;
+}
+
+/** Step 2: drops sessions past the TTL and recomputes branch and files for the rest. Returns the new local state. */
+async function refreshSessions(ctx: Ctx): Promise<LocalState> {
+  const { paths, config, now } = ctx;
+  const ttlMs = config.ttlMinutes * 60_000;
+  const live = (seenAt: string) => ageMs(seenAt, now) < ttlMs;
+
+  const before = await readLocal(paths);
+  // Sessions that share a worktree share its branch and files: inspect each worktree once.
+  const worktrees = [...new Set(before.sessions.filter((session) => live(session.seenAt)).map((session) => session.worktree))];
+  const inspected = new Map<string, { branch: string; files: string[] }>();
+  await Promise.all(
+    worktrees.map(async (worktree) => {
+      const found = await inspectWorktree(worktree, config);
+      if (found) inspected.set(worktree, found);
+    }),
+  );
+
+  const dropped: string[] = [];
+  // Applied to whatever the state is now: a hook may have touched it while we ran git.
+  const after = await updateLocal(paths, (current) => {
+    current.sessions = current.sessions.filter((session) => {
+      if (live(session.seenAt)) return true;
+      dropped.push(session.id);
+      return false;
+    });
+    for (const session of current.sessions) {
+      const found = inspected.get(session.worktree);
+      if (found) {
+        session.branch = found.branch;
+        session.files = found.files;
+      }
+    }
+  });
+  await Promise.all(dropped.map((id) => removeSeen(paths, id).catch(() => {})));
+  return after;
+}
+
+/** Null when the worktree is gone; its sessions then keep what they last reported until the TTL drops them. */
+async function inspectWorktree(worktree: string, config: Config): Promise<{ branch: string; files: string[] } | null> {
+  try {
+    if (!(await stat(worktree)).isDirectory()) return null;
+  } catch {
+    return null;
+  }
+  const [branch, files] = await Promise.all([currentBranch(worktree), filesInFlight(worktree, config)]);
+  return { branch, files };
 }
 
 /**
- * Starts `huddle sync` as a detached process and returns immediately. `self`
- * is the path of the running huddle script (io.self). Never throws. Used by
- * the hook engine and the git-hooks adapter; the throttle lives in sync().
+ * A hash of what teammates would see change: everything except the timestamps
+ * that move on every activity (updatedAt, seenAt), with lists in a fixed order.
  */
-export function spawnBackgroundSync(paths: RepoPaths, self: string): void {
-  void paths;
-  void self;
-  return todo("sync.spawnBackgroundSync");
+export function contentHash(doc: ActorDoc): string {
+  const stable = [
+    doc.actor,
+    doc.user,
+    doc.host,
+    doc.sessions
+      .map((session) => [
+        session.id,
+        session.agent,
+        session.branch,
+        session.intent,
+        session.intentSource,
+        [...session.files].sort(),
+        [...session.claims].sort(),
+        session.startedAt,
+      ])
+      .sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
+  ];
+  return createHash("sha256").update(JSON.stringify(stable)).digest("hex");
+}
+
+/**
+ * Step 4's rule. Publish when the content changed; or as a heartbeat, when the
+ * last publish is older than heartbeatMinutes and some session has been active
+ * since. A clone with no sessions that never published has nothing to say.
+ */
+export function shouldPublish(published: LocalState["published"], doc: ActorDoc, hash: string, now: Date, config: Config): boolean {
+  if (!published) return doc.sessions.length > 0;
+  if (published.hash !== hash) return true;
+  const sinceLast = ageMs(published.at, now);
+  if (Number.isNaN(sinceLast) || sinceLast < 0) return true;
+  if (sinceLast < config.heartbeatMinutes * 60_000) return false;
+  return doc.sessions.some((session) => Date.parse(session.seenAt) > Date.parse(published.at));
+}
+
+export interface BackgroundOptions {
+  /** With `now`, do not even start a process when the last sync is under syncIntervalSeconds old. */
+  config?: Config;
+  now?: Date;
+  /** Pass --force to the background sync. */
+  force?: boolean;
+}
+
+function backgroundDisabled(): boolean {
+  return process.env.HUDDLE_NO_BACKGROUND === "1";
+}
+
+function startDetached(paths: RepoPaths, self: string, force: boolean) {
+  const child = spawn(process.execPath, [self, "sync", "--background", ...(force ? ["--force"] : [])], {
+    cwd: paths.worktree,
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true,
+  });
+  child.on("error", () => {});
+  return child;
+}
+
+/**
+ * Starts `huddle sync --background` as a detached process and returns
+ * immediately. `self` is the path of the running huddle script (io.self).
+ * Never throws. Does nothing when HUDDLE_NO_BACKGROUND=1 (tests). The throttle
+ * is enforced inside the sync; `opts.config` only saves starting a process
+ * that would be throttled anyway.
+ */
+export function spawnBackgroundSync(paths: RepoPaths, self: string, opts: BackgroundOptions = {}): void {
+  try {
+    if (backgroundDisabled() || !self) return;
+    if (!opts.force && opts.config && throttledAt(readStamp(paths), opts.config, opts.now ?? new Date())) return;
+    startDetached(paths, self, opts.force === true).unref();
+  } catch (error) {
+    log(paths, "sync", "could not start a background sync", error);
+  }
+}
+
+/**
+ * A forced sync with a deadline, for hooks with a time budget (session-start,
+ * session-end). The sync runs in a detached process, so reaching the deadline
+ * abandons the wait but not the sync: a push in flight still completes. True
+ * when the sync finished in time. With HUDDLE_NO_BACKGROUND=1 the sync runs
+ * in-process and the budget is not enforced.
+ */
+export async function syncWithin(ctx: Ctx, budgetMs: number): Promise<boolean> {
+  if (backgroundDisabled() || !ctx.io.self) {
+    await sync(ctx, { force: true });
+    return true;
+  }
+  try {
+    const child = startDetached(ctx.paths, ctx.io.self, true);
+    return await new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => {
+        child.unref();
+        resolve(false);
+      }, budgetMs);
+      const done = () => {
+        clearTimeout(timer);
+        resolve(true);
+      };
+      child.once("exit", done);
+      child.once("error", done);
+    });
+  } catch (error) {
+    log(ctx.paths, "sync", "could not start a sync", error);
+    return false;
+  }
 }
