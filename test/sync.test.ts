@@ -131,15 +131,62 @@ test("a sync with nothing new does not push; a change does; the heartbeat does a
   const second = await remoteRefs(h);
   assert.notEqual(second, first, "a changed doc was not pushed");
 
-  // Activity (a manual sync touches the session) inside the heartbeat interval: seenAt alone is not worth a push.
-  await ok(alice, ["sync"], at(4 * MIN + 60));
-  assert.equal(await remoteRefs(h), second, "seenAt alone caused a push inside the heartbeat interval");
+  // That push was made by a background sync, which is not activity: it carried the session as last seen at 0:01.
+  assert.equal((await actorDocs(h))[0]!.sessions[0]!.seenAt, at(1));
+
+  // Activity (a manual sync touches the session). The heartbeat interval has not passed, but what
+  // teammates hold for the session is five minutes old by now, so its sign of life goes out.
+  await ok(alice, ["sync"], at(5 * MIN));
+  const third = await remoteRefs(h);
+  assert.notEqual(third, second, "teammates were left with a seenAt five minutes behind");
+  assert.equal((await actorDocs(h))[0]!.sessions[0]!.seenAt, at(5 * MIN));
+
+  // More activity a minute later: seenAt alone, a minute ahead of what teammates hold, is not worth a push.
+  await ok(alice, ["sync"], at(6 * MIN));
+  assert.equal(await remoteRefs(h), third, "seenAt alone caused a push inside the heartbeat interval");
 
   // The same activity once the heartbeat interval has passed: publish, so teammates see she is still there.
   await ok(alice, ["sync"], at(8 * MIN));
-  const third = await remoteRefs(h);
-  assert.notEqual(third, second, "no heartbeat after the interval despite activity");
+  const fourth = await remoteRefs(h);
+  assert.notEqual(fourth, third, "no heartbeat after the interval despite activity");
   assert.equal((await actorDocs(h))[0]!.sessions[0]!.seenAt, at(8 * MIN));
+});
+
+test("a session that wakes up just after another session of its clone published is not shown as gone", async (t) => {
+  // A publish carries every session's seenAt as it was at that moment. Session
+  // "quiet" claims a directory and then says nothing for 13 minutes; session
+  // "busy" of the same clone publishes. Teammates now hold a 13-minute-old
+  // seenAt for "quiet". When it wakes up a minute later the heartbeat is not
+  // due, and waiting for it would let "quiet" pass the 15-minute TTL in
+  // teammates' eyes while it is at work.
+  const h = await createHarness(t);
+  const twin = await h.clone("twin");
+  const bob = await h.clone("bob");
+  const quiet = { HUDDLE_SESSION: "quiet" };
+  const busy = { HUDDLE_SESSION: "busy" };
+  const published = async (id: string) => (await actorDocs(h)).flatMap((doc) => doc.sessions).find((session) => session.id === id)?.seenAt;
+
+  await ok(twin, ["claim", "src/desk/**"], at(0), quiet);
+  await ok(twin, ["sync"], at(0), quiet);
+  await ok(twin, ["intent", "something else"], at(13 * MIN), busy);
+  await ok(twin, ["sync"], at(13 * MIN), busy);
+  assert.equal(await published("quiet"), at(0), "setup: the publish caused by the other session carries the old seenAt");
+  assert.equal(await published("busy"), at(13 * MIN));
+
+  // "quiet" is active again: a manual sync touches the session. Nothing but seenAt changed.
+  await ok(twin, ["sync"], at(14 * MIN), quiet);
+  assert.equal(await published("quiet"), at(14 * MIN), "its sign of life was not published");
+
+  // 15.5 minutes after the claim, 1.5 after the session was last active: bob still sees it.
+  await ok(bob, ["sync"], at(15 * MIN + 30));
+  const check = await bob.huddle(["check", "src/desk/lamp.ts"], { now: at(15 * MIN + 30) });
+  assert.equal(check.code, 3, `bob should be warned about the live claim: ${check.stdout}${check.stderr}`);
+  assert.match(check.stdout, /twin/);
+
+  // And no push for a session whose published seenAt is recent enough: one minute on, nothing is sent.
+  const before = await remoteRefs(h);
+  await ok(twin, ["sync"], at(15 * MIN), quiet);
+  assert.equal(await remoteRefs(h), before, "seenAt alone caused a push inside the heartbeat interval");
 });
 
 test("background syncs are throttled to one per syncIntervalSeconds; --force and manual syncs are not", async (t) => {
@@ -666,6 +713,31 @@ test("shouldPublish: changes always, heartbeats only after activity, silence whe
   assert.equal(shouldPublish(published, active, hash, new Date(at(3 * MIN)), config), true, "active and the heartbeat is due");
   assert.equal(shouldPublish({ ...published, at: at(999) }, d, hash, new Date(at(0)), config), true, "a publish time in the future is not trusted");
   assert.equal(shouldPublish({ ...published, at: "garbage" }, d, hash, new Date(at(0)), config), true);
+});
+
+test("shouldPublish: inside the heartbeat interval, a session seen a heartbeat after what teammates hold for it is published", () => {
+  const config = { ...DEFAULT_CONFIG };
+  // The last publish was at 13 minutes, caused by s2. It carried s1 as last seen at 0.
+  const shown = new Map([
+    ["s1", at(0)],
+    ["s2", at(13 * MIN)],
+  ]);
+  const sessions = (s1: string, s2 = at(13 * MIN)) => doc([session({ id: "s1", seenAt: s1 }), session({ id: "s2", seenAt: s2 })]);
+  const hash = contentHash(sessions(at(0)));
+  const published = { at: at(13 * MIN), hash, sha: "0".repeat(40) };
+  const now = new Date(at(14 * MIN));
+
+  assert.equal(shouldPublish(published, sessions(at(0)), hash, now, config, shown), false, "nobody has been active since");
+  assert.equal(shouldPublish(published, sessions(at(14 * MIN)), hash, now, config, shown), true, "s1 woke up; teammates hold a 14-minute-old seenAt for it");
+  assert.equal(shouldPublish(published, sessions(at(3 * MIN)), hash, now, config, shown), true, "exactly one heartbeat ahead");
+  assert.equal(shouldPublish(published, sessions(at(3 * MIN - 1)), hash, now, config, shown), false, "one second short of a heartbeat ahead");
+  assert.equal(shouldPublish(published, sessions(at(0), at(14 * MIN)), hash, now, config, shown), false, "s2 is one minute ahead of what teammates hold");
+  // Without knowing what teammates hold, the interval is the only rule.
+  assert.equal(shouldPublish(published, sessions(at(14 * MIN)), hash, now, config), false);
+  assert.equal(shouldPublish(published, sessions(at(14 * MIN)), hash, now, config, null), false);
+  // A session teammates have no seenAt for, or a broken one, decides nothing by itself.
+  assert.equal(shouldPublish(published, sessions(at(14 * MIN)), hash, now, config, new Map([["s2", at(13 * MIN)]])), false);
+  assert.equal(shouldPublish(published, sessions(at(14 * MIN)), hash, now, config, new Map([["s1", "garbage"]])), false);
 });
 
 // ---------------------------------------------------------------------------

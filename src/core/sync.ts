@@ -123,7 +123,14 @@ async function round(ctx: Ctx): Promise<SyncResult> {
     return transport.publish(ownRef, doc, "own");
   };
 
-  const publishDue = shouldPublish(state.published, doc, hash, now, config);
+  // What teammates hold for each of our sessions: the cached copy of our own
+  // ref, when it is the one we published last.
+  const held = cache.refs[ownRef];
+  const shown =
+    state.published && held && held.sha === state.published.sha && held.doc?.kind === "actor"
+      ? new Map(held.doc.sessions.map((session) => [session.id, session.seenAt] as const))
+      : null;
+  const publishDue = shouldPublish(state.published, doc, hash, now, config, shown);
   const [fetched, firstPublish] = await Promise.all([transport.fetchAll(known), publishDue ? publish() : Promise.resolve(null)]);
 
   let cacheChanged = false;
@@ -277,14 +284,36 @@ export function contentHash(doc: ActorDoc): string {
  * Step 4's rule. Publish when the content changed; or as a heartbeat, when the
  * last publish is older than heartbeatMinutes and some session has been active
  * since. A clone with no sessions that never published has nothing to say.
+ *
+ * One more case, inside the heartbeat interval. Teammates judge each session by
+ * the seenAt they hold for it (`shown`: session id to the seenAt in the last
+ * publish). A publish carries every session's seenAt as it was then, so a
+ * session that had been quiet for a while when another session of this clone
+ * caused the last publish is shown with its old seenAt. If it then wakes up,
+ * waiting out the interval would leave it looking expired to teammates while
+ * it is at work: its files and claims would vanish from their view and its
+ * tasks could be taken. So a session seen a heartbeat or more after what
+ * teammates hold for it is published at once.
  */
-export function shouldPublish(published: LocalState["published"], doc: ActorDoc, hash: string, now: Date, config: Config): boolean {
+export function shouldPublish(
+  published: LocalState["published"],
+  doc: ActorDoc,
+  hash: string,
+  now: Date,
+  config: Config,
+  shown: ReadonlyMap<string, string> | null = null,
+): boolean {
   if (!published) return doc.sessions.length > 0;
   if (published.hash !== hash) return true;
   const sinceLast = ageMs(published.at, now);
   if (Number.isNaN(sinceLast) || sinceLast < 0) return true;
-  if (sinceLast < config.heartbeatMinutes * 60_000) return false;
-  return doc.sessions.some((session) => Date.parse(session.seenAt) > Date.parse(published.at));
+  const heartbeat = config.heartbeatMinutes * 60_000;
+  if (sinceLast >= heartbeat) return doc.sessions.some((session) => Date.parse(session.seenAt) > Date.parse(published.at));
+  if (!shown) return false;
+  return doc.sessions.some((session) => {
+    const theirs = shown.get(session.id);
+    return theirs !== undefined && Date.parse(session.seenAt) - Date.parse(theirs) >= heartbeat;
+  });
 }
 
 export interface BackgroundOptions {
