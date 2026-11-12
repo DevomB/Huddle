@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 import { test } from "node:test";
 import type { TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -12,6 +12,7 @@ import { getAdapter } from "../src/adapters/index.ts";
 import { SILENT } from "../src/adapters/types.ts";
 import type { HookEvent, HookEventType, HookInput } from "../src/adapters/types.ts";
 import { CliError } from "../src/core/io.ts";
+import { posixOnly, removeDir, tempDir, windowsOnly } from "./harness.ts";
 
 // The fixtures follow Codex's wire schemas at rust-v0.167.0; see the README next to them.
 const FIXTURES = fileURLToPath(new URL("./fixtures/hooks/codex/", import.meta.url));
@@ -312,7 +313,7 @@ const BUNDLE = ".huddle/huddle.mjs";
 const COMMAND =
   'command -v node >/dev/null 2>&1 || exit 0; test -f "$(git rev-parse --show-toplevel 2>/dev/null)/.huddle/huddle.mjs" || exit 0; node "$(git rev-parse --show-toplevel)/.huddle/huddle.mjs" hook codex';
 const COMMAND_WINDOWS =
-  "where node >nul 2>nul || exit /b 0 & for /f \"delims=\" %i in ('git rev-parse --show-toplevel 2^>nul') do @if exist \"%i/.huddle/huddle.mjs\" node \"%i/.huddle/huddle.mjs\" hook codex";
+  "where node >nul 2>nul || exit /b 0 & git rev-parse --show-toplevel >nul 2>nul || exit /b 0 & for /f \"delims=\" %i in ('git rev-parse --path-format^=relative --show-toplevel 2^>nul') do @if exist \"%i/.huddle/huddle.mjs\" node \"%i/.huddle/huddle.mjs\" hook codex";
 
 function handler(timeout: number, extra: Json = {}): Json {
   return { type: "command", command: COMMAND, commandWindows: COMMAND_WINDOWS, timeout, ...extra };
@@ -418,7 +419,7 @@ test("install: what is written follows the rules in Codex's hook reference", asy
     );
     assert.equal(
       only.commandWindows,
-      "where node >nul 2>nul || exit /b 0 & for /f \"delims=\" %i in ('git rev-parse --show-toplevel 2^>nul') do @if exist \"%i/.huddle/huddle.mjs\" node \"%i/.huddle/huddle.mjs\" hook codex",
+      "where node >nul 2>nul || exit /b 0 & git rev-parse --show-toplevel >nul 2>nul || exit /b 0 & for /f \"delims=\" %i in ('git rev-parse --path-format^=relative --show-toplevel 2^>nul') do @if exist \"%i/.huddle/huddle.mjs\" node \"%i/.huddle/huddle.mjs\" hook codex",
     );
     assert.ok(typeof only.timeout === "number" && only.timeout >= 1, `${event}: a timeout in seconds`);
   }
@@ -643,7 +644,7 @@ test("install: a hooks file huddle cannot read safely is refused and left exactl
   }
 });
 
-test("install: writes through a symlinked hooks file and keeps the file's mode", { skip: process.platform === "win32" }, async (t) => {
+test("install: writes through a symlinked hooks file and keeps the file's mode", posixOnly("a symbolic link and a file mode"), async (t) => {
   const { root, file } = await scratchRepo(t);
   const real = join(root, "shared-hooks.json");
   await writeFile(real, '{\n\t"description": "shared"\n}\n');
@@ -661,15 +662,38 @@ test("install: writes through a symlinked hooks file and keeps the file's mode",
 // The installed command, run the way Codex runs it
 // ---------------------------------------------------------------------------
 
-function run(program: string, args: string[], options: { cwd: string; env: NodeJS.ProcessEnv; stdin?: string }): Promise<{ code: number | null; stdout: string; stderr: string }> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(program, args, { cwd: options.cwd, env: options.env, stdio: ["pipe", "pipe", "pipe"] });
+interface Ran {
+  code: number | null;
+  stdout: string;
+  stderr: string;
+}
+
+function run(
+  program: string,
+  args: string[],
+  options: { cwd: string; env: NodeJS.ProcessEnv; stdin?: string },
+  how: { windowsVerbatimArguments?: boolean; argv0?: string } = {},
+): Promise<Ran> {
+  return new Promise((done, reject) => {
+    const child = spawn(program, args, { ...how, cwd: options.cwd, env: options.env, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
+    // Nothing here takes a second. A command that hangs is ended with everything it started, so that the run can report it.
+    const patience = setTimeout(() => {
+      stderr += "\n(the test ended this command after 60 s)";
+      if (process.platform === "win32" && child.pid !== undefined) spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true }).on("error", () => {});
+      else child.kill("SIGKILL");
+    }, 60_000);
     child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
     child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
-    child.on("error", reject);
-    child.on("close", (code) => resolve({ code, stdout, stderr }));
+    child.on("error", (error) => {
+      clearTimeout(patience);
+      reject(error);
+    });
+    child.on("close", (code) => {
+      clearTimeout(patience);
+      done({ code, stdout, stderr });
+    });
     // A command may exit without reading its stdin (the one for a machine
     // without node does). Writing to the pipe it closed then fails with EPIPE,
     // which is no failure of the command: what it did is in the exit code.
@@ -686,7 +710,7 @@ function shellsOnThisMachine(): string[] {
   });
 }
 
-test("install: the command finds the bundle from any directory of the repo, in each shell on this machine", { skip: process.platform === "win32" }, async (t) => {
+test("install: the command finds the bundle from any directory of the repo, in each shell on this machine", posixOnly("the sh command line; the cmd.exe one has the test after this"), async (t) => {
   // Codex runs a hook as `$SHELL -lc "<command>"` in the session's cwd, with the payload on stdin.
   const base = await realpath(await mkdtemp(join(tmpdir(), "huddle codex shell-")));
   t.after(() => rm(base, { recursive: true, force: true }));
@@ -763,6 +787,108 @@ test("install: the command finds the bundle from any directory of the repo, in e
     for (const cwd of [root, deep]) {
       assert.deepEqual(await run(shell, ["-c", command], { cwd, env, stdin: fixtureText("stop") }), silent, `${shell} in ${cwd}, no bundle`);
     }
+  }
+});
+
+/** A variable of `env` by name, as Windows reads names: in any case ("ComSpec", "Path"). */
+function variable(env: NodeJS.ProcessEnv, name: string): string | undefined {
+  return Object.entries(env).find(([key]) => key.toUpperCase() === name.toUpperCase())?.[1];
+}
+
+/** `env` with one variable set, and no second spelling of its name left next to it. */
+function withVariable(env: NodeJS.ProcessEnv, name: string, value: string): NodeJS.ProcessEnv {
+  return { ...Object.fromEntries(Object.entries(env).filter(([key]) => key.toUpperCase() !== name.toUpperCase())), [name]: value };
+}
+
+/**
+ * Starts a hook command the way Codex does on Windows: the program COMSPEC
+ * names, "/C", and then the whole command line as one raw argument between a
+ * pair of double quotes, in the session's directory, with the payload on
+ * stdin (build_command in codex-rs/hooks/src/engine/command_runner.rs at
+ * rust-v0.167.0). cmd.exe takes the outer pair of quotes off and runs the rest.
+ */
+function runAsCodexOnWindows(command: string, options: { cwd: string; env: NodeJS.ProcessEnv; stdin?: string }): Promise<Ran> {
+  const shell = variable(options.env, "COMSPEC") ?? "cmd.exe";
+  return run(shell, ["/C", `"${command}"`], options, { windowsVerbatimArguments: true, argv0: `"${shell}"` });
+}
+
+test("install: the Windows command finds the bundle from any directory of the repo, run by cmd.exe the way Codex starts it", windowsOnly("cmd.exe /C"), async (t) => {
+  // A directory with a space and a letter outside ASCII in its name, as a user's own folder often has on Windows.
+  const base = await tempDir("codex cmd");
+  t.after(() => removeDir(base));
+  const root = join(base, "my repo");
+  const deep = join(root, "packages", "api server");
+  await mkdir(deep, { recursive: true });
+  await mkdir(join(root, ".huddle"));
+  const bundle = join(root, ".huddle", "huddle.mjs");
+  await writeFile(
+    bundle,
+    'let stdin = "";\nprocess.stdin.setEncoding("utf8");\nfor await (const chunk of process.stdin) stdin += chunk;\nconsole.log(JSON.stringify({ argv: process.argv.slice(2), script: process.argv[1], event: JSON.parse(stdin).hook_event_name }));\n',
+  );
+  // The machine's own environment, which cmd.exe, where.exe and git need, with git kept to itself: no system or user config.
+  const env: NodeJS.ProcessEnv = { ...process.env, HOME: base, USERPROFILE: base, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: join(base, "no-gitconfig"), GIT_TERMINAL_PROMPT: "0" };
+  const init = await run("git", ["init", "-q", root], { cwd: base, env });
+  assert.equal(init.code, 0, init.stderr);
+
+  await codex.install({ repoRoot: root, bundle: BUNDLE });
+  const hooks = (await readJson(join(root, ".codex", "hooks.json"))).hooks as Record<string, Array<{ hooks: Json[] }>>;
+  const command = String(hooks.Stop?.[0]?.hooks[0]?.commandWindows);
+  assert.equal(command, COMMAND_WINDOWS, "what is run below is what install wrote");
+  const stdin = fixtureText("stop");
+  const where = (cwd: string): string => (cwd === root ? "at the top of the repo" : `in ${cwd.slice(root.length + 1)}`);
+
+  for (const cwd of [root, deep]) {
+    const result = await runAsCodexOnWindows(command, { cwd, env, stdin });
+    assert.equal(result.code, 0, `${where(cwd)}: ${result.stderr}`);
+    assert.equal(result.stderr, "", where(cwd));
+    const said = JSON.parse(result.stdout) as { argv: string[]; script: string; event: string };
+    assert.deepEqual({ argv: said.argv, event: said.event }, { argv: ["hook", "codex"], event: "Stop" }, where(cwd));
+    assert.equal(resolve(said.script).toLowerCase(), bundle.toLowerCase(), `${where(cwd)}: the bundle that ran`);
+  }
+
+  // From here on, every way the command can find itself unable to run. Codex reports a hook that exits
+  // non-zero as failed, on every event, so each one has to end in success with no word on either stream.
+  const silent: Ran = { code: 0, stdout: "", stderr: "" };
+  const path = (variable(env, "PATH") ?? "").split(delimiter).filter((dir) => dir !== "");
+  const extensions = ["", ...(variable(env, "PATHEXT") ?? ".COM;.EXE;.BAT;.CMD").split(";")];
+  const holds = (dir: string, program: string): boolean => extensions.some((extension) => existsSync(join(dir, `${program}${extension}`)));
+
+  // A teammate without node: the PATH of this machine without the directories that hold one.
+  const noNode = withVariable(env, "PATH", path.filter((dir) => !holds(dir, "node")).join(delimiter));
+  assert.equal((await run("git", ["--version"], { cwd: root, env: noNode })).code, 0, "git is still on that PATH");
+  for (const cwd of [root, deep]) {
+    assert.deepEqual(await runAsCodexOnWindows(command, { cwd, env: noNode, stdin }), silent, `${where(cwd)}, no node on the PATH`);
+  }
+
+  // A directory that is not in any repository.
+  const outside = join(base, "not a repo");
+  await mkdir(outside);
+  assert.deepEqual(await runAsCodexOnWindows(command, { cwd: outside, env, stdin }), silent, "outside any repository");
+
+  // A clone inside the repo: git names the inner root, and the bundle is not there.
+  const nested = join(root, "vendor", "inner clone");
+  await mkdir(nested, { recursive: true });
+  assert.equal((await run("git", ["init", "-q", nested], { cwd: base, env })).code, 0);
+  assert.deepEqual(await runAsCodexOnWindows(command, { cwd: nested, env, stdin }), silent, "in a nested clone");
+
+  // node but no git on the PATH: node's own directory and the system's, where cmd.exe finds where.exe.
+  const system = join(variable(env, "SYSTEMROOT") ?? "C:\\Windows", "System32");
+  const nodeOnly = withVariable(env, "PATH", [dirname(process.execPath), system].join(delimiter));
+  assert.equal(holds(dirname(process.execPath), "git") || holds(system, "git"), false, "a PATH without git");
+  assert.deepEqual(await runAsCodexOnWindows(command, { cwd: root, env: nodeOnly, stdin }), silent, "no git on the PATH");
+
+  // What the command line was before it took this shape, on the same machine: the reasons for the second
+  // question to git and for the relative path, written into the report and judged by nobody.
+  const earlier = `where node >nul 2>nul || exit /b 0 & for /f "delims=" %i in ('git rev-parse --show-toplevel 2^>nul') do @if exist "%i/${BUNDLE}" node "%i/${BUNDLE}" hook codex`;
+  const absolute = await runAsCodexOnWindows(earlier, { cwd: root, env, stdin });
+  const empty = await runAsCodexOnWindows(earlier, { cwd: outside, env, stdin });
+  t.diagnostic(`the earlier command, with the root as an absolute path: ${absolute.stdout === "" ? "did not run" : "ran"} the bundle under ${JSON.stringify(base)} (exit ${absolute.code})`);
+  t.diagnostic(`the earlier command, without asking git first: exit ${empty.code} outside any repository`);
+
+  // The bundle is gone from the checkout (a sparse checkout, or a commit from before huddle init).
+  await rm(bundle);
+  for (const cwd of [root, deep]) {
+    assert.deepEqual(await runAsCodexOnWindows(command, { cwd, env, stdin }), silent, `${where(cwd)}, no bundle`);
   }
 });
 

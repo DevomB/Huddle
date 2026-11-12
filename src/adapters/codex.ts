@@ -202,13 +202,25 @@ function posixCommand(bundle: string): string {
 }
 
 /**
- * On Windows Codex runs `commandWindows` with cmd.exe /C, which has no "$( )".
- * The same two checks: outside a batch file "exit /b 0" ends cmd.exe itself,
- * with success, and "if exist" skips a bundle that is not there. The "@"
- * keeps cmd from echoing the command into the hook's output.
+ * On Windows Codex runs `commandWindows` as `%COMSPEC% /C "<command>"`, and
+ * cmd.exe has no "$( )". The same checks, each ending the hook in success:
+ * outside a batch file "exit /b 0" ends cmd.exe itself. No node on the PATH;
+ * no git, or a directory git does not take for a repository (a "for /f" over
+ * a command that printed nothing counts as failed, so git is asked first
+ * whether it has an answer); no bundle, which "if exist" skips.
+ *
+ * The root is asked for relative to the session's directory ("./", "../../"):
+ * "for /f" reads what git prints in the console's code page, which would
+ * spoil any letter outside ASCII in an absolute path. A git from before 2.31
+ * does not know --path-format, prints the option back and then the absolute
+ * path; the option's line names no bundle and is skipped. The "@" keeps cmd
+ * from echoing the command into the hook's output, and "^" keeps "=" and ">"
+ * for the command inside the quotes.
  */
 function windowsCommand(bundle: string): string {
-  return `where node >nul 2>nul || exit /b 0 & for /f "delims=" %i in ('git rev-parse --show-toplevel 2^>nul') do @if exist "%i/${bundle}" node "%i/${bundle}" hook ${NAME}`;
+  const root = "git rev-parse --show-toplevel >nul 2>nul || exit /b 0";
+  const each = `for /f "delims=" %i in ('git rev-parse --path-format^=relative --show-toplevel 2^>nul')`;
+  return `where node >nul 2>nul || exit /b 0 & ${root} & ${each} do @if exist "%i/${bundle}" node "%i/${bundle}" hook ${NAME}`;
 }
 
 /** The POSIX command exactly as posixCommand() writes it, with the bundle path captured where it is tested for. */

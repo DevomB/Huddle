@@ -14,6 +14,7 @@ import type { Io } from "../src/core/io.ts";
 import { OVERLAP_HINT, shownText } from "../src/core/render.ts";
 import type { ActorDoc } from "../src/core/types.ts";
 import { DEADLINE_MS, handleEvent, lifetimeMs, sessionIdOf } from "../src/hooks/engine.ts";
+import { readCache, writeCache } from "../src/core/store.ts";
 import { REDACTED } from "../src/hooks/intent.ts";
 import {
   ALONE,
@@ -59,7 +60,7 @@ import {
   timed,
   unnamedNote,
 } from "./engine.kit.ts";
-import { createHarness } from "./harness.ts";
+import { WINDOWS, createHarness } from "./harness.ts";
 import type { Clone } from "./harness.ts";
 
 /** Values shaped like a credential are put together at run time: see test/source.test.ts. */
@@ -1269,6 +1270,15 @@ test("a state directory that cannot be used costs the briefing, never the hook",
 // Time budgets
 // ---------------------------------------------------------------------------
 
+/**
+ * How late an event may come back and still count as inside its budget. The
+ * timer that ends its wait is the machine's: on Windows the clock ticks every
+ * 15.6 ms, and a hosted runner shares a few cores between every test file that
+ * runs at the same moment, so an event that gave up at 270 ms has been seen
+ * back at 338.
+ */
+const LATE_MS = WINDOWS ? 150 : 25;
+
 test("when the store is busy a hook gives up on recording the session, not on warning, and stays inside its budget", async (t) => {
   const { bob } = await aliceBuildsAuth(t);
   await fire(bob, "session-start", 20);
@@ -1285,7 +1295,7 @@ test("when the store is busy a hook gives up on recording the session, not on wa
       ({ ms, value: outcome } = await timed(() => fire(bob, "pre-edit", now, { ...edit, sessionId: `s-late-${attempt}` }, ON_THE_CLOCK)));
     }
     assert.equal(outcome.context, authWarning(now));
-    assert.ok(ms < DEADLINE_MS["pre-edit"] + 25, `pre-edit took ${Math.round(ms)} ms`);
+    assert.ok(ms < DEADLINE_MS["pre-edit"] + LATE_MS, `pre-edit took ${Math.round(ms)} ms`);
     assert.deepEqual(
       (await sessionsOf(bob)).map((session) => session.id),
       ["s-bob"],
@@ -1296,7 +1306,7 @@ test("when the store is busy a hook gives up on recording the session, not on wa
     for (const type of ["prompt", "post-edit", "turn-end", "session-end"] as const) {
       const run = await timed(() => fire(bob, type, 30, { prompt: "Add the login page" }, ON_THE_CLOCK));
       assert.deepEqual(run.value, {}, type);
-      assert.ok(run.ms < DEADLINE_MS[type] + 25, `${type} took ${Math.round(run.ms)} ms`);
+      assert.ok(run.ms < DEADLINE_MS[type] + LATE_MS, `${type} took ${Math.round(run.ms)} ms`);
     }
     const log = await logOf(bob);
     assert.match(log, /\[hook\] prompt: could not record the session/);
@@ -1335,7 +1345,13 @@ test("an event that cannot finish gives up at its deadline with nothing to say, 
       const run = runs[index]!;
       assert.deepEqual(run.value, {}, type);
       assert.ok(run.ms >= deadline - 5 && run.ms < deadline + 150, `${type} came back after ${Math.round(run.ms)} ms; its deadline is ${deadline} ms`);
-      assert.match(await logOf(clone), new RegExp(`\\[hook\\] ${type}: gave up at its deadline of ${deadline} ms`));
+      // An event records its session before it needs the actor id. Six of them start at once here, and on a machine
+      // where that write is still waiting close to the deadline (a hosted Windows runner) the event gives up there,
+      // 30 ms earlier, and that is the line it logs: either way it gave up in time and said so.
+      assert.match(
+        await logOf(clone),
+        new RegExp(`\\[hook\\] ${type}: (?:gave up at its deadline of ${deadline} ms|could not record the session: the store was still busy close to the deadline)`),
+      );
     }
   } finally {
     await Promise.all(releases.map((release) => release()));
@@ -1401,6 +1417,11 @@ test("HUDDLE_HOOK_PATIENCE makes every deadline that many times longer, and coun
 
 test("patience is for this machine and not for the remote: a sync is waited for no longer than without it", async (t) => {
   const { alice, bob } = await aliceBuildsAuth(t);
+  // Bob has synced before, long enough ago that his commit below waits for a sync first. What he gets told then is
+  // the same whether or not that sync is back inside its second, which on a slow machine it is not.
+  await publish(bob, 13);
+  const bobs = await bob.paths();
+  await writeCache(bobs, { ...(await readCache(bobs)), fetchedAt: at(-5 * MIN) });
   const asked = record(t);
   assert.ok(PATIENCE > 1, "these tests run with patience, as every test here does that is not about time");
 

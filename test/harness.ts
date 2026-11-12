@@ -81,6 +81,14 @@ export function posixOnly(mechanism: string): { skip: string | false } {
 }
 
 /**
+ * The other way round, for a test of something only Windows has: cmd.exe, a
+ * drive letter. It is skipped everywhere else, with the reason in the report.
+ */
+export function windowsOnly(mechanism: string): { skip: string | false } {
+  return { skip: WINDOWS ? false : `Windows-only: ${mechanism}` };
+}
+
+/**
  * What every temp directory of the harness starts with: a space and a letter
  * outside ASCII (precomposed, so that it is the same bytes on every file
  * system these tests run on).
