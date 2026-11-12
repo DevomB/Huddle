@@ -1,6 +1,8 @@
 // T1.4. "Which session am I?" for CLI commands, and the team view from where
 // that session stands. Agent hooks do not use resolveSession: their session id
-// comes from the hook payload.
+// comes from the hook payload. A hook event that names no session does (a git
+// hook, HookEvent.ambient): the hook engine resolves it here, so that a commit
+// and a command typed in the same worktree are the same session.
 
 import { ageMs } from "./clock.ts";
 import type { Ctx } from "./context.ts";

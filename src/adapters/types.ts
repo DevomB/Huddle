@@ -31,6 +31,14 @@ export interface HookEvent {
   reason?: string;
   /** The event came from a subagent of the session. */
   subagent?: boolean;
+  /**
+   * The event names no session: it comes from the worktree itself (a git
+   * hook). `sessionId` is ignored. The engine acts as the session a CLI
+   * command typed in the same place would act as (session.resolveSession),
+   * and treats the event like a subagent's: it keeps that session alive and
+   * is warned before an edit, and nothing else.
+   */
+  ambient?: boolean;
   /** Whatever the adapter needs to get back in format(), such as the native event name. The engine ignores it. */
   native?: unknown;
 }

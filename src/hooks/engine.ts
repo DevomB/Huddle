@@ -39,6 +39,14 @@
 // session to another worktree, record an intent, use up the parent's briefing
 // or end the session.
 //
+// An event can also name no session at all (event.ambient: a git hook, which
+// only knows the worktree it ran in). It is given the session a CLI command
+// typed in the same place would act as, so that a commit and `huddle intent`
+// are one presence and not two, and from there on it is handled like a
+// subagent's event. One thing differs. Its pre-edit is a commit, and between
+// two commits nothing keeps the team state fresh, so it may first wait up to
+// a second for a sync and has 1.5 s in all: see refreshFirst().
+//
 // What a session was shown is kept in seen/<session> (core/store.ts), in one
 // map: the items renderBriefing returns, "briefed" once a briefing was built
 // from them, and "w:<path>" for each overlap warning, so that the same warning
@@ -46,7 +54,7 @@
 
 import { createHash } from "node:crypto";
 import { appendFile, mkdir, readFile, realpath, stat } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { ADAPTERS, getAdapter } from "../adapters/index.ts";
 import type { HookEvent, HookEventType, HookOutcome, HookOutput } from "../adapters/types.ts";
 import { now as clockNow } from "../core/clock.ts";
@@ -57,11 +65,11 @@ import { getIdentity, getIdentityFast } from "../core/identity.ts";
 import { EXIT } from "../core/io.ts";
 import type { Io } from "../core/io.ts";
 import { log } from "../core/log.ts";
-import { loadConfig, locateRepo } from "../core/paths.ts";
+import { ensureStateDir, loadConfig, locateRepo } from "../core/paths.ts";
 import type { RepoPaths } from "../core/paths.ts";
 import { DEFAULT_BRIEFING_CHARS, formatAge, renderBriefing, renderOverlaps } from "../core/render.ts";
-import { currentView } from "../core/session.ts";
-import { readSeen, removeSeen, removeSession, updateLocal, writeSeen } from "../core/store.ts";
+import { currentView, resolveSession } from "../core/session.ts";
+import { readCache, readSeen, removeSeen, removeSession, updateLocal, writeFileAtomic, writeSeen } from "../core/store.ts";
 import { spawnBackgroundSync, syncWithin } from "../core/sync.ts";
 import { createTransport } from "../core/transport.ts";
 import type { Config, Identity, LocalSession, LocalState, Seen } from "../core/types.ts";
@@ -85,6 +93,17 @@ export const DEADLINE_MS: Readonly<Record<HookEventType, number>> = Object.freez
   "session-end": 1000,
 });
 
+/**
+ * The deadline of a pre-edit that names no session (event.ambient): a commit.
+ * It is longer because such an event may wait for a sync (refreshFirst), and
+ * nobody notices on a commit what would be felt before each of an agent's edits.
+ */
+const PATIENT_PRE_EDIT_MS = 1500;
+/** The longest that wait may be. A timer in this file: git's own network timeouts are far longer. */
+const MAX_REFRESH_WAIT_MS = 1000;
+/** What is kept back from the deadline for the check that follows the wait. */
+const CHECK_RESERVE_MS = 150;
+
 /** The payload is on stdin before node has even started; a hook whose payload has not arrived by now is not going to get one. */
 const STDIN_WAIT_MS = 300;
 /** What session-start keeps back from its deadline for everything that comes after the sync. */
@@ -92,7 +111,11 @@ const BRIEFING_RESERVE_MS = 300;
 /** A store lock is not waited for longer than this, nor into the last moments before the deadline. */
 const MAX_STORE_WAIT_MS = 1000;
 const STORE_MARGIN_MS = 30;
-/** A full briefing says so when the team state is older than this. */
+/**
+ * A full briefing says so when the team state is older than this. It is also
+ * when a commit waits for a sync first, and how long it is before the next
+ * commit in the same clone may wait again.
+ */
 const STALE_AFTER_MS = 2 * 60_000;
 const MAX_EVENT_PATHS = 200;
 /** An edit of many files at once names at most this many overlapping paths in full. */
@@ -127,8 +150,12 @@ function deadlineIn(startedMs: number, budgetMs: number): Deadline {
   return { left: () => end - performance.now() };
 }
 
-function deadlineFor(type: unknown): number {
-  return typeof type === "string" && Object.hasOwn(DEADLINE_MS, type) ? DEADLINE_MS[type as HookEventType] : DEADLINE_MS["pre-edit"];
+/** How long this event may take. Takes whatever it is given: an event that is not one gets the shortest deadline there is. */
+function deadlineFor(event: HookEvent | null | undefined): number {
+  const type: unknown = event?.type;
+  if (typeof type !== "string" || !Object.hasOwn(DEADLINE_MS, type)) return DEADLINE_MS["pre-edit"];
+  if (type === "pre-edit" && event?.ambient === true) return PATIENT_PRE_EDIT_MS;
+  return DEADLINE_MS[type as HookEventType];
 }
 
 type Settled<T> = { done: true; value: T } | { done: false };
@@ -232,6 +259,12 @@ interface Run {
   id: string;
   paths: RepoPaths;
   away: boolean;
+  /**
+   * The event does not speak for the session: it is a subagent's, or it names
+   * no session (event.ambient). It keeps the session alive and is warned
+   * before an edit, and that is all.
+   */
+  passive: boolean;
   /** Fixed for the event; honors HUDDLE_NOW in io.env. */
   now: Date;
   deadline: Deadline;
@@ -297,7 +330,7 @@ async function touch(run: Run, intent = ""): Promise<Touched | null> {
   const { event, id, paths, now } = run;
   const at = now.toISOString();
   const agent = cleanText(event.agent, LIMITS.name) || "unknown";
-  const subagent = event.subagent === true;
+  const { passive } = run;
   let created = false;
   let moved = false;
   let intentChanged = false;
@@ -312,8 +345,8 @@ async function touch(run: Run, intent = ""): Promise<Touched | null> {
           created = true;
         } else {
           session.seenAt = at;
-          if (!subagent) session.agent = agent;
-          if (!subagent && !run.away && session.worktree !== paths.worktree) {
+          if (!passive) session.agent = agent;
+          if (!passive && !run.away && session.worktree !== paths.worktree) {
             // Branch and files describe the worktree it left. The sync that follows fills them in again.
             session.worktree = paths.worktree;
             session.branch = "";
@@ -336,6 +369,15 @@ async function touch(run: Run, intent = ""): Promise<Touched | null> {
     log(paths, "hook", `${event.type}: could not record the session`, error);
     return null;
   }
+}
+
+/**
+ * Waits for one sync, for `budgetMs` at the most. Reaching that abandons the
+ * wait and never the sync. syncWithin keeps to the budget itself when it can
+ * run the sync in a process of its own; the timer here holds when it cannot.
+ */
+async function syncFor(ctx: Ctx, budgetMs: number): Promise<void> {
+  await before(deadlineIn(performance.now(), budgetMs), effects.syncWithin(ctx, budgetMs));
 }
 
 /** A background sync after an event: not throttled when teammates have something new to learn. */
@@ -395,7 +437,7 @@ async function sessionStart(run: Run): Promise<Prepared> {
     const [config, identity, touched] = await Promise.all([loadConfig(paths), getIdentity(paths), touch(run)]);
     const ctx = contextFor(run, config, identity);
     const budget = deadline.left() - BRIEFING_RESERVE_MS;
-    if (budget > 0) await effects.syncWithin(ctx, budget);
+    if (budget > 0) await syncFor(ctx, budget);
     else effects.spawnBackgroundSync(paths, io.self, { force: true });
     const view = await currentView(ctx, id, undefined, viewerOf(run, touched));
     const briefing = renderBriefing(view);
@@ -486,11 +528,12 @@ function capWarned(items: Record<string, string>): Record<string, string> {
  * one warning, a second teammate arriving on the file gives another, and a
  * session-start (a new or compacted context) starts over. A subagent is
  * always warned and nothing is remembered for it: its context is not the
- * session's, and it does not last.
+ * session's, and it does not last. The same goes for an event that names no
+ * session: whoever runs `git commit` has no context here at all.
  */
 async function overlapWarning(run: Run, targets: string[]): Promise<Prepared> {
-  const { event, id, paths, now } = run;
-  const remember = event.subagent !== true;
+  const { id, paths, now } = run;
+  const remember = !run.passive;
   const [identity, config, since] = await Promise.all([getIdentityFast(paths), loadConfig(paths), remember ? readSeen(paths, id) : null]);
   const view = await currentView(contextFor(run, config, identity), id, undefined, paths.worktree);
 
@@ -525,14 +568,66 @@ async function overlapWarning(run: Run, targets: string[]): Promise<Prepared> {
   return prepared;
 }
 
+/** When a hook in this clone last waited for a sync before a commit (ISO text). */
+function waitStamp(paths: RepoPaths): string {
+  return join(paths.stateDir, "wait-stamp");
+}
+
+/**
+ * Comes before the check of a pre-edit that names no session, which is a
+ * commit. An agent's own hooks sync every few seconds. Between two commits
+ * nothing does, and a teammate only counts for ttlMinutes after they were last
+ * seen, so a team state fetched half an hour ago shows nobody and the check
+ * could never find anything. When the state is older than STALE_AFTER_MS, one
+ * sync is therefore waited for first.
+ *
+ * The wait is bounded twice. A timer here ends it after MAX_REFRESH_WAIT_MS at
+ * the latest; that abandons the wait and not the sync, and the check goes
+ * ahead with the state there is. And the whole clone waits at most once per
+ * STALE_AFTER_MS, which is recorded before the wait begins, so that whoever is
+ * offline pays for it once and not at every commit.
+ *
+ * True when a sync was started and waited for. Says nothing either way: what
+ * the hook prints is the warning or nothing, whether the sync made it or not.
+ */
+async function refreshFirst(run: Run): Promise<boolean> {
+  const { paths, now, deadline } = run;
+  try {
+    const { fetchedAt } = await readCache(paths);
+    // A state dated in the future (a clock that was set back) counts as fresh: the next sync dates it again.
+    const stateAge = fetchedAt === null ? Number.POSITIVE_INFINITY : now.getTime() - Date.parse(fetchedAt);
+    if (!(stateAge >= STALE_AFTER_MS)) return false;
+    // A stamp from the future must not put the wait off for ever, so only an age that is not negative counts.
+    const stamp = waitStamp(paths);
+    const waitedAgo = now.getTime() - Date.parse((await readFile(stamp, "utf8").catch(() => "")).trim());
+    if (waitedAgo >= 0 && waitedAgo < STALE_AFTER_MS) return false;
+    const budget = Math.min(MAX_REFRESH_WAIT_MS, Math.floor(deadline.left()) - CHECK_RESERVE_MS);
+    if (budget <= 0) return false;
+    // Recorded first: if it cannot be, there is no limit on how often this would wait, so it does not wait at all.
+    await ensureStateDir(paths);
+    await writeFileAtomic(stamp, now.toISOString());
+    const [config, identity] = await Promise.all([loadConfig(paths), getIdentityFast(paths)]);
+    await syncFor(contextFor(run, config, identity), budget);
+    return true;
+  } catch (error) {
+    log(paths, "hook", "pre-edit: could not refresh the team state first", error);
+    return false;
+  }
+}
+
 async function preEdit(run: Run): Promise<Prepared> {
-  const { paths, io } = run;
-  // The session is recorded alongside the check, not before it: the check does not need it, and the budget is short.
-  const touching = touch(run).then((touched) => {
+  const { event, paths, io } = run;
+  const targets = targetPaths(run);
+  // A commit may wait for the team state; an agent's edit never does.
+  const patient = event.ambient === true && targets.length > 0;
+  const recorded = touch(run).then(async (touched) => {
+    // A sync that was waited for publishes a session that is new as well.
+    if (patient && (await refreshFirst(run))) return;
     if (touched !== null && (touched.created || touched.moved)) effects.spawnBackgroundSync(paths, io.self, { force: true });
   });
+  // Otherwise the session is recorded alongside the check, not before it: the check does not need it, and the budget is short.
+  if (patient) await recorded;
   let prepared: Prepared = { outcome: {} };
-  const targets = targetPaths(run);
   if (targets.length > 0) {
     try {
       prepared = await overlapWarning(run, targets);
@@ -540,7 +635,7 @@ async function preEdit(run: Run): Promise<Prepared> {
       log(paths, "hook", "pre-edit: could not check for overlap", error);
     }
   }
-  await touching;
+  await recorded;
   return prepared;
 }
 
@@ -583,15 +678,39 @@ async function sessionEnd(run: Run): Promise<Prepared> {
   return { outcome: {} };
 }
 
-async function prepare(event: HookEvent, io: Io, deadline: Deadline, trace: Trace): Promise<Prepared> {
-  const id = sessionIdOf(event.sessionId);
-  if (id === "" || typeof event.type !== "string" || !Object.hasOwn(DEADLINE_MS, event.type)) return { outcome: {} };
-  const where = await locate(event, io);
-  if (where === null) return { outcome: {} };
-  trace.paths = where.paths;
-  const run: Run = { event, io, id, paths: where.paths, away: where.away, now: clockNow(io.env), deadline };
+/**
+ * The session of an event that names none: the one a CLI command typed in the
+ * same worktree would act as (HUDDLE_SESSION, else the session last active in
+ * this worktree, else the worktree's manual session).
+ */
+async function ambientSession(run: Run): Promise<string> {
+  const [config, identity] = await Promise.all([loadConfig(run.paths), getIdentityFast(run.paths)]);
+  return (await resolveSession(contextFor(run, config, identity))).id;
+}
 
-  if (event.subagent === true && event.type !== "pre-edit") return heartbeat(run);
+async function prepare(event: HookEvent, io: Io, deadline: Deadline, trace: Trace): Promise<Prepared> {
+  if (typeof event.type !== "string" || !Object.hasOwn(DEADLINE_MS, event.type)) return { outcome: {} };
+  const ambient = event.ambient === true;
+  const named = ambient ? "" : sessionIdOf(event.sessionId);
+  if (!ambient && named === "") return { outcome: {} };
+  const where = await locate(event, io);
+  // An event that names no session says nothing about the sessions of a repository it did not happen in.
+  if (where === null || (ambient && where.away)) return { outcome: {} };
+  trace.paths = where.paths;
+  const run: Run = {
+    event,
+    io,
+    id: named,
+    paths: where.paths,
+    away: where.away,
+    passive: ambient || event.subagent === true,
+    now: clockNow(io.env),
+    deadline,
+  };
+  if (ambient) run.id = await ambientSession(run);
+  if (run.id === "") return { outcome: {} };
+
+  if (run.passive && event.type !== "pre-edit") return heartbeat(run);
   switch (event.type) {
     case "session-start":
       return sessionStart(run);
@@ -629,7 +748,7 @@ export async function handleEvent(event: HookEvent, io: Io): Promise<HookOutcome
   const trace: Trace = { paths: null };
   lastTrace = trace;
   try {
-    const budget = deadlineFor(event?.type);
+    const budget = deadlineFor(event);
     const deadline = deadlineIn(performance.now(), budget);
     const prepared = await before(deadline, prepare(event, io, deadline, trace));
     if (!prepared.done) {
@@ -652,8 +771,9 @@ export async function handleEvent(event: HookEvent, io: Io): Promise<HookOutcome
  * Appends each line to its file unless the file already has that line. Such a
  * file is run as shell code by the agent, so a "line" with a line break in it
  * is refused here whatever the adapter checked. Errors are swallowed.
+ * Exported for tests.
  */
-async function appendLines(entries: HookOutput["appendLines"]): Promise<void> {
+export async function appendLines(entries: HookOutput["appendLines"]): Promise<void> {
   if (!Array.isArray(entries)) return;
   for (const entry of entries) {
     try {
@@ -704,7 +824,7 @@ export async function runHook(args: string[], io: Io): Promise<number> {
     const event = adapter.parse({ args: rest, stdin: stdin.value, env: io.env, cwd: io.cwd });
     if (event === null || typeof event !== "object") return EXIT.OK; // not an event huddle cares about
 
-    const budget = deadlineFor(event.type);
+    const budget = deadlineFor(event);
     const deadline = deadlineIn(started, budget);
     const prepared = await before(deadline, prepare(event, io, deadline, trace));
     if (!prepared.done) {

@@ -30,7 +30,7 @@ const VALUE = `(?:"[^"\\n]{1,300}"|'[^'\\n]{1,300}'|[^\\s"',;]{1,300})`;
 /** A PEM block, to its END line or to the end of the window when the END line is beyond it. */
 const PEM_BLOCK = /-----BEGIN [A-Z0-9 ]{1,40}-----[\s\S]*?(?:-----END [A-Z0-9 ]{1,40}-----|$)/g;
 
-/** scheme://user:password@host */
+/** A user name and password in front of the host of a URL. What is kept is the scheme. */
 const URL_CREDENTIALS = /\b([a-z][a-z0-9+.-]{1,20}:\/\/)[^\s/:@]{1,256}:[^\s/@]{1,256}@/gi;
 
 /** The value of an Authorization header. */
