@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { LIMITS, normalizeDoc } from "../src/core/docs.ts";
 import type { Cache, DecisionDoc, TaskDoc } from "../src/core/types.ts";
+import { matchWork } from "../src/core/glob.ts";
 import { buildView, countTasks, overlaps, taskState } from "../src/core/view.ts";
 import { ME, NOW, cacheOf, loadTeam, makeSession } from "./fixtures/cache/team.ts";
 
@@ -332,7 +333,7 @@ test("overlaps: a teammate's file entry need not be in git's form to be recogniz
   assert.deepEqual(overlaps(view, "src/other.ts"), []);
 });
 
-test("overlaps: one actor at every cap, checked against a deep path, stays inside the pre-edit budget", () => {
+test("overlaps: one actor at every cap, checked against a deep path, costs one short walk per claim", () => {
   // The worst a single teammate's doc can be after the doc gate: 50 sessions,
   // each with 50 claims of nearly 400 characters, every claim a chain of
   // globstars and wildcards that the path's segments keep half-matching.
@@ -345,12 +346,16 @@ test("overlaps: one actor at every cap, checked against a deep path, stays insid
   const view = buildView(cacheOf([{ actor: "maxx2222", user: "max", sessions }]), ME, NOW);
   const deep = `${Array.from({ length: 60 }, (_, i) => `xa${i}ya${i}z`).join("/")}/file.ts`;
 
-  const started = performance.now();
+  // This runs on the pre-edit path, which has 150 ms. The cost is counted
+  // rather than timed, because a stopwatch bound fails on a busy machine.
+  const before = { ...matchWork };
   assert.deepEqual(overlaps(view, deep), []);
-  const elapsed = performance.now() - started;
-  // About 60 ms in a fresh process, 25 ms warm. Matching once per path prefix
-  // instead of once per claim took about 600 ms.
-  assert.ok(elapsed < 250, `2500 claims against a 61-segment path took ${elapsed.toFixed(0)} ms`);
+  const walks = matchWork.walks - before.walks;
+  const steps = matchWork.steps - before.steps;
+  // Matching once per path prefix instead would be 61 walks per claim and
+  // about 25,000 steps per claim; one walk reads the path about once (830).
+  assert.equal(walks, LIMITS.sessions * LIMITS.claims, "one walk per claim, however deep the path");
+  assert.ok(steps <= walks * 3 * deep.length, `${walks} claims against a ${deep.length}-character path took ${steps} steps`);
 
   // The same claims do match where they should.
   const hit = `${Array.from({ length: 42 }, (_, i) => `xa${i}ya${i}z`).join("/")}/zz7x3/src/file.ts`;

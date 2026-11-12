@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { claimMatches, globMatch, normalizePath } from "../src/core/glob.ts";
+import { claimMatches, globMatch, matchWork, normalizePath } from "../src/core/glob.ts";
 
 test("glob: a literal pattern matches only that path", () => {
   assert.equal(globMatch("src/auth.ts", "src/auth.ts"), true);
@@ -92,14 +92,28 @@ test("glob: empty, blank and oversized input never matches", () => {
   assert.equal(globMatch("**", "a/".repeat(3000)), false, "paths over the cap are rejected");
 });
 
-test("glob: patterns built to make a regex engine backtrack still finish at once", () => {
-  const started = performance.now();
-  // Translated to a RegExp, patterns like these backtrack catastrophically.
-  assert.equal(globMatch(`${"*a".repeat(40)}*b`, "a".repeat(400)), false);
-  assert.equal(globMatch(`${"**/".repeat(40)}nope`, `${"x/".repeat(200)}y`), false);
-  assert.equal(globMatch(`${"**/a/".repeat(30)}b`, `${"a/".repeat(300)}c`), false);
-  assert.equal(claimMatches(`${"*?".repeat(60)}z`, `${"q".repeat(300)}/${"q".repeat(300)}`), false);
-  assert.ok(performance.now() - started < 2000, "pathological patterns must not hang a pre-edit hook");
+test("glob: patterns built to make a regex engine backtrack cost no more than pattern length times path length", () => {
+  // Counted, not timed: a stopwatch bound fails on a busy machine. Translated
+  // to a RegExp, the first four backtrack exponentially. The last two are the
+  // worst this matcher can be made to do: a long tail after the final star.
+  const cases: Array<[pattern: string, path: string]> = [
+    [`${"*a".repeat(40)}*b`, "a".repeat(400)],
+    [`${"**/".repeat(40)}nope`, `${"x/".repeat(200)}y`],
+    [`${"**/a/".repeat(30)}b`, `${"a/".repeat(300)}c`],
+    [`${"*?".repeat(60)}z`, `${"q".repeat(300)}/${"q".repeat(300)}`],
+    [`*${"a".repeat(500)}b`, "a".repeat(1000)],
+    [`**/${"*a*/".repeat(100)}b`, `${"aa/".repeat(500)}c`],
+  ];
+  for (const [pattern, path] of cases) {
+    for (const match of [globMatch, claimMatches]) {
+      const before = { ...matchWork };
+      assert.equal(match(pattern, path), false);
+      const label = `${match.name}(${pattern.slice(0, 12)}..., ${path.slice(0, 8)}...)`;
+      assert.equal(matchWork.walks - before.walks, 1, `${label} is one walk`);
+      const steps = matchWork.steps - before.steps;
+      assert.ok(steps > 0 && steps <= pattern.length * path.length, `${label} took ${steps} steps for ${pattern.length} x ${path.length} characters`);
+    }
+  }
 });
 
 test("claims: a claim covers the path it matches and everything under a directory it matches", () => {
