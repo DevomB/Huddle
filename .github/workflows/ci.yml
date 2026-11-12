@@ -2,7 +2,8 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # main, and the MVP sprint branches: a pushed sprint branch runs at exactly its SHA.
+    branches: [main, "t/mvp-*"]
   pull_request:
 
 concurrency:
@@ -12,9 +13,14 @@ concurrency:
 permissions:
   contents: read
 
+# Minutes on the private repo are the user's, and Windows minutes count double.
+# A t/mvp-* branch already runs on push, so a pull request from one does not run
+# the same SHA again: every job below skips that case.
+
 jobs:
   test:
     name: Typecheck and test (Node 22, ${{ matrix.os }}, shard ${{ matrix.shard }}/3)
+    if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 't/mvp-')
     strategy:
       # Linux and native Windows are both MVP platforms: one failing must not
       # cancel the other's evidence.
@@ -34,10 +40,10 @@ jobs:
     env:
       # test/mvp-delivery-platform.test.ts fails unless the suite really runs here.
       HUDDLE_EXPECT_PLATFORM: ${{ matrix.os == 'windows-latest' && 'win32' || 'linux' }}
+      HUDDLE_JOB: ${{ matrix.os }}-shard${{ matrix.shard }}
     steps:
       # Windows runners default core.autocrlf to true. Keep that: users on
       # Windows check out the vendored bundle and fixtures with CRLF too.
-      - run: git config --global --get core.autocrlf; exit 0
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
@@ -45,38 +51,50 @@ jobs:
           cache: npm
       - name: Record the platform under test
         run: |
-          node -e "const os=require('node:os');console.log(JSON.stringify({platform:process.platform,arch:process.arch,release:os.release(),version:os.version(),node:process.version,shell:'pwsh '+process.env.PSVersion},null,1))"
-          $PSVersionTable.PSVersion.ToString()
-          git --version
-          npm --version
+          node scripts/ci-evidence.mjs platform evidence ($PSVersionTable.PSVersion.ToString())
           if ($IsWindows) { [System.Environment]::OSVersion.VersionString; cmd /c ver }
           git config --show-origin --show-scope --get-all core.autocrlf
-          "runner image: $env:ImageOS $env:ImageVersion"
           exit 0
       - run: npm ci
       - run: npm run typecheck
       - run: npm run build
       - name: Assert the platform matches the runner
         run: |
-          $expected = if ($IsWindows) { 'win32' } else { 'linux' }
-          node -e "if (process.platform !== process.argv[1]) { console.error('platform ' + process.platform + ' != ' + process.argv[1]); process.exit(1) }" $expected
+          node -e "if (process.platform !== process.argv[1]) { console.error('platform ' + process.platform + ' != ' + process.argv[1]); process.exit(1) }" $env:HUDDLE_EXPECT_PLATFORM
           node dist/huddle.mjs --version
           node dist/huddle.mjs --help
       - name: Test
         timeout-minutes: 30
-        run: node --test --test-shard=${{ matrix.shard }}/3 --test-reporter=spec --test-reporter-destination=stdout --test-reporter=junit --test-reporter-destination=test-results.xml "test/**/*.test.ts"
-      - name: Keep the test report
+        run: node --test --test-shard=${{ matrix.shard }}/3 --test-reporter=spec --test-reporter-destination=stdout --test-reporter=junit --test-reporter-destination=evidence/test-results.xml "test/**/*.test.ts"
+      - name: Keep the evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: test-results-${{ matrix.os }}-shard${{ matrix.shard }}
-          path: test-results.xml
+          name: evidence-${{ matrix.os }}-shard${{ matrix.shard }}
+          path: evidence
           if-no-files-found: ignore
+
+  evidence:
+    # One place to read the result per platform: SHA, OS build, architecture,
+    # shell, Node and git versions, totals, every skip with its reason, every failure.
+    name: Evidence summary (Linux and Windows)
+    needs: test
+    if: always() && (github.event_name != 'pull_request' || !startsWith(github.head_ref, 't/mvp-'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: evidence-*
+          path: all-evidence
+      - run: node scripts/ci-evidence.mjs summary all-evidence
 
   bundle-node20:
     name: CLI tests with the bundle on Node 20
+    if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 't/mvp-')
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       # Node 20 first, only to learn where it is installed. The tests themselves
