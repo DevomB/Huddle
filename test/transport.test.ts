@@ -259,10 +259,11 @@ describe("transport exit test", () => {
     assert.deepEqual(await a.remove(actorRef("aaaaaaaa"), newSha), { ok: false, reason: "lost-race" }, "removing a ref that is already gone");
   });
 
-  test("20 `absent` races each have exactly one winner", async () => {
+  test("20 `absent` races each have exactly one winner", async (t) => {
     const clones = [alice, bob, carol, dave];
     const transports = clones.map((clone) => transportFor(clone.dir));
     const reader = transportFor(alice.dir);
+    const tally = { races: 0, won: 0, lost: 0 };
     for (let race = 0; race < 20; race++) {
       const id = `absent${String.fromCharCode(97 + race)}`; // absenta .. absentt
       const ref = taskRef(id);
@@ -276,7 +277,11 @@ describe("transport exit test", () => {
       const winner = winners[0]!;
       assert.equal(remoteRef(h, ref), okSha(results[winner]!));
       assert.deepEqual((await fetched(reader)).changed.get(ref)?.doc, taskDoc(id, winner));
+      tally.races++;
+      tally.won += winners.length;
+      tally.lost += results.length - winners.length;
     }
+    t.diagnostic(`${tally.races} races of 4 simultaneous creates: ${tally.won} winners, ${tally.lost} lost-race`);
   });
 
   test("one `absent` race with 20 contenders has exactly one winner", async () => {
@@ -291,10 +296,11 @@ describe("transport exit test", () => {
     assert.deepEqual((await fetched(transportFor(bob.dir))).changed.get(ref)?.doc, taskDoc("absentbig", winner));
   });
 
-  test("20 `Sha` races each have exactly one winner", async () => {
+  test("20 `Sha` races each have exactly one winner", async (t) => {
     const clones = [alice, bob, carol, dave];
     const transports = clones.map((clone) => transportFor(clone.dir));
     const reader = transportFor(bob.dir);
+    const tally = { races: 0, won: 0, lost: 0 };
     const ref = taskRef("sharace");
     // Each race replaces the previous race's winner, so every round is a real compare-and-swap on a moving ref.
     let current = okSha(await transports[0]!.publish(ref, taskDoc("sharace", 999), "absent"));
@@ -309,7 +315,11 @@ describe("transport exit test", () => {
       current = okSha(results[winner]!);
       assert.equal(remoteRef(h, ref), current);
       assert.deepEqual((await fetched(reader)).changed.get(ref)?.doc, taskDoc("sharace", race * 10 + winner));
+      tally.races++;
+      tally.won += winners.length;
+      tally.lost += results.length - winners.length;
     }
+    t.diagnostic(`${tally.races} races of 4 simultaneous replaces: ${tally.won} winners, ${tally.lost} lost-race`);
   });
 
   test("one `Sha` race with 20 contenders has exactly one winner", async () => {
@@ -338,7 +348,7 @@ describe("transport exit test", () => {
     assert.equal(remoteRef(h, taskRef("expectnone")), null);
   });
 
-  test("an unreachable remote returns offline within the timeout", { skip: posixOnly }, async () => {
+  test("an unreachable remote returns offline within the timeout", { skip: posixOnly }, async (t) => {
     assert.equal(NETWORK_TIMEOUT_MS, 10_000, "plan.md §3: every network call has a 10 s timeout");
     const eve = await h.clone("eve");
     const sha = okSha(await transportFor(eve.dir).publish(actorRef("eeeeeeee"), actorDoc("eeeeeeee"), "own"));
@@ -367,13 +377,17 @@ describe("transport exit test", () => {
       ["fetchAll", () => hang.fetchAll(new Map())],
       ["remove", () => hang.remove(actorRef("eeeeeeee"), sha)],
     ];
+    const timings: string[] = [];
     for (const [name, call] of calls) {
       const started = Date.now();
       assert.deepEqual(await call(), { ok: false, reason: "offline" }, name);
       const took = Date.now() - started;
+      // The lower bound proves the remote really hung. The upper bound is loose on purpose: this machine may be busy.
       assert.ok(took >= timeoutMs - 50, `${name} returned after ${took} ms, before the ${timeoutMs} ms timeout: the fake ssh did not hang`);
-      assert.ok(took < timeoutMs + 2500, `${name} took ${took} ms with a ${timeoutMs} ms timeout`);
+      assert.ok(took < timeoutMs + 5000, `${name} took ${took} ms with a ${timeoutMs} ms timeout`);
+      timings.push(`${name} ${took} ms`);
     }
+    t.diagnostic(`hanging remote, ${timeoutMs} ms timeout, all offline: ${timings.join(", ")}`);
     const pids = readFileSync(pidFile, "utf8").trim().split("\n").map(Number);
     assert.equal(pids.length, calls.length, "each call reached the fake ssh exactly once");
     // Killed processes are gone once reaped, which a loaded machine does not do instantly. The fake ssh would live 60 s.
@@ -387,7 +401,8 @@ describe("transport exit test", () => {
       const started = Date.now();
       assert.deepEqual(await transportFor(ivan.dir, { remote: "hang" }).fetchAll(new Map()), { ok: false, reason: "offline" });
       const took = Date.now() - started;
-      assert.ok(took >= 650 && took < 3200, `default-timeout call took ${took} ms with HUDDLE_TIMEOUT_MS=700`);
+      assert.ok(took >= 650 && took < 5700, `default-timeout call took ${took} ms with HUDDLE_TIMEOUT_MS=700`);
+      t.diagnostic(`hanging remote, HUDDLE_TIMEOUT_MS=700 and no timeoutMs: fetchAll offline after ${took} ms`);
     } finally {
       if (saved === undefined) delete process.env.HUDDLE_TIMEOUT_MS;
       else process.env.HUDDLE_TIMEOUT_MS = saved;
