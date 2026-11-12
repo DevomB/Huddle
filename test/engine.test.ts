@@ -25,10 +25,13 @@ import {
   MIN,
   NEVER_FETCHED,
   NOTHING_ASKED,
+  ON_THE_CLOCK,
+  PATIENCE,
   SAY_SO,
   ago,
   aliceBuildsAuth,
   aliceLine,
+  ambient,
   at,
   authWarning,
   cacheTeam,
@@ -57,6 +60,7 @@ import {
   timed,
 } from "./engine.kit.ts";
 import { createHarness } from "./harness.ts";
+import type { Clone } from "./harness.ts";
 
 /** Values shaped like a credential are put together at run time: see test/source.test.ts. */
 const tok = (...parts: string[]) => parts.join("");
@@ -73,7 +77,7 @@ test("the deadlines are the time budgets of the plan, except session-end", () =>
 test("session-start records the session, waits for one sync and gives the full briefing", async (t) => {
   const { h, alice } = await team(t);
   const asked = record(t);
-  const outcome = await fire(alice, "session-start", 0, { source: "startup" });
+  const outcome = await fire(alice, "session-start", 0, { source: "startup" }, ON_THE_CLOCK);
 
   // HUDDLE_SESSION is for the agent's shell: `huddle intent` typed there lands in this session.
   assert.deepEqual(outcome, { env: { HUDDLE_SESSION: "s-alice" }, context: ALONE });
@@ -136,7 +140,7 @@ test("session-start says so when the team state could not be refreshed, or was n
 test("session-start does not wait for a sync that never comes back: the briefing is built from what there is", async (t) => {
   const { alice } = await team(t);
   const asked = record(t, never);
-  const { ms, value } = await timed(() => fire(alice, "session-start", 0));
+  const { ms, value } = await timed(() => fire(alice, "session-start", 0, {}, ON_THE_CLOCK));
 
   assert.deepEqual(value, { env: { HUDDLE_SESSION: "s-alice" }, context: text(ALONE, NEVER_FETCHED) });
   assert.ok(ms >= 3500 && ms < DEADLINE_MS["session-start"], `took ${Math.round(ms)} ms`);
@@ -1155,7 +1159,7 @@ test("when the store is busy a hook gives up on recording the session, not on wa
     let now = 25;
     for (let attempt = 0; attempt < 3 && outcome.context === undefined; attempt++) {
       now = 25 + attempt;
-      ({ ms, value: outcome } = await timed(() => fire(bob, "pre-edit", now, { ...edit, sessionId: `s-late-${attempt}` })));
+      ({ ms, value: outcome } = await timed(() => fire(bob, "pre-edit", now, { ...edit, sessionId: `s-late-${attempt}` }, ON_THE_CLOCK)));
     }
     assert.equal(outcome.context, authWarning(now));
     assert.ok(ms < DEADLINE_MS["pre-edit"] + 25, `pre-edit took ${Math.round(ms)} ms`);
@@ -1167,7 +1171,7 @@ test("when the store is busy a hook gives up on recording the session, not on wa
 
     // The other events have nothing but the session to record. They come back in time, empty-handed.
     for (const type of ["prompt", "post-edit", "turn-end", "session-end"] as const) {
-      const run = await timed(() => fire(bob, type, 30, { prompt: "Add the login page" }));
+      const run = await timed(() => fire(bob, type, 30, { prompt: "Add the login page" }, ON_THE_CLOCK));
       assert.deepEqual(run.value, {}, type);
       assert.ok(run.ms < DEADLINE_MS[type] + 25, `${type} took ${Math.round(run.ms)} ms`);
     }
@@ -1203,7 +1207,7 @@ test("an event that cannot finish gives up at its deadline with nothing to say, 
   record(t, never);
   const releases = await Promise.all(stuck.map(({ clone }) => hold(clone, "identity")));
   try {
-    const runs = await Promise.all(stuck.map(({ clone, type, over }) => timed(() => fire(clone, type, 0, over))));
+    const runs = await Promise.all(stuck.map(({ clone, type, over }) => timed(() => fire(clone, type, 0, over, ON_THE_CLOCK))));
     for (const [index, { clone, type, deadline }] of stuck.entries()) {
       const run = runs[index]!;
       assert.deepEqual(run.value, {}, type);
@@ -1215,6 +1219,94 @@ test("an event that cannot finish gives up at its deadline with nothing to say, 
     // What was abandoned runs on once the lock is free. Let it finish before the clones are removed under it.
     await sleep(400);
   }
+});
+
+test("HUDDLE_HOOK_PATIENCE makes every deadline that many times longer, and counts as 1 when it is not a number from 1 to 100", async (t) => {
+  const { alice } = await team(t);
+  record(t, never);
+  // No actor id yet, and the lock that minting one needs is held: every edit here is stuck until its deadline.
+  const cases: Array<[patience: string, deadline: number]> = [
+    ["1", 150],
+    ["2", 300],
+    ["1.5", 225],
+    ["", 150],
+    ["0", 150],
+    ["0.5", 150],
+    ["-2", 150],
+    ["101", 150],
+    ["ten", 150],
+    ["2x", 150],
+  ];
+  const release = await hold(alice, "identity");
+  try {
+    const runs = await Promise.all(
+      cases.map(([patience], index) => timed(() => fire(alice, "pre-edit", 0, { sessionId: `s-${index}`, paths: ["a.ts"] }, { HUDDLE_HOOK_PATIENCE: patience }))),
+    );
+    for (const [index, [patience, deadline]] of cases.entries()) {
+      const run = runs[index]!;
+      assert.deepEqual(run.value, {}, patience);
+      // Never before its deadline. How long after is up to the machine, with ten of them at once.
+      assert.ok(run.ms >= deadline - 5, `with ${JSON.stringify(patience)} it came back after ${Math.round(run.ms)} ms; its deadline is then ${deadline} ms`);
+    }
+    // What the log says is the deadline each event really had: none of them had more than it should.
+    const log = await logOf(alice);
+    for (const [deadline, times] of [[150, 8], [225, 1], [300, 1]] as const) {
+      assert.equal(log.split(`[hook] pre-edit: gave up at its deadline of ${deadline} ms`).length - 1, times, `${deadline} ms`);
+    }
+  } finally {
+    await release();
+    await sleep(400);
+  }
+});
+
+test("patience is for this machine and not for the remote: a sync is waited for no longer than without it", async (t) => {
+  const { alice, bob } = await aliceBuildsAuth(t);
+  const asked = record(t);
+  assert.ok(PATIENCE > 1, "these tests run with patience, as every test here does that is not about time");
+
+  // A session start has twenty times its 4 s here. The sync it waits for still gets the 3.7 s it always gets at
+  // the most, and what patience adds is kept for the work that comes after.
+  await fire(alice, "session-start", 20);
+  assert.deepEqual(asked.waited, [3700]);
+  // The same for the second that a commit may wait. (Alice was last seen at 10 as far as the remote knows: a session
+  // that was only seen again is not published again so soon.)
+  assert.deepEqual(await ambient(bob, "pre-edit", 25, { paths: ["src/auth.ts"] }), { context: authWarning(25) });
+  assert.deepEqual(asked.waited, [3700, 1000]);
+});
+
+test("what is kept back for the work after a sync grows with patience: after a slow start, the sync gets the rest of the deadline less that", async (t) => {
+  const { alice, bob } = await team(t);
+  /** By checkout: the budget its sync was given, and when. */
+  const waits = new Map<string, { budget: number; at: number }>();
+  record(t, (ctx, budgetMs) => {
+    waits.set(ctx.paths.worktree, { budget: budgetMs, at: performance.now() });
+    return Promise.resolve(false);
+  });
+  // Neither clone has an actor id yet. Minting one needs the identity lock, so both events are stuck while it is held.
+  const releases = await Promise.all([hold(alice, "identity"), hold(bob, "identity")]);
+  // With one and a half times its 4 s, a session start has 6 s and keeps 450 ms of them for the briefing.
+  const startBegan = performance.now();
+  const start = fire(alice, "session-start", 0, {}, { HUDDLE_HOOK_PATIENCE: "1.5" });
+  // With twice its 1.5 s, a commit has 3 s and keeps 300 ms of them for the check.
+  const commitBegan = performance.now();
+  const commit = ambient(bob, "pre-edit", 0, { paths: ["a.ts"] }, { HUDDLE_HOOK_PATIENCE: "2" });
+  // Two seconds in, each of them has less left than the longest wait and what it keeps back.
+  await sleep(2000);
+  await Promise.all(releases.map((release) => release()));
+  assert.deepEqual(await start, { env: { HUDDLE_SESSION: "s-alice" }, context: text(ALONE, NEVER_FETCHED) });
+  assert.deepEqual(await commit, {});
+
+  /** When the wait the event was given runs out, counted from when the event began. */
+  const waitEnds = (clone: Clone, began: number): number => {
+    const wait = waits.get(clone.dir);
+    assert.ok(wait, `the event in ${clone.name}'s clone waited for no sync`);
+    return wait.at - began + wait.budget;
+  };
+  // 6000 - 450 and 3000 - 300. With the 300 ms and 150 ms of a machine without patience, both would end 150 ms later.
+  const startEnds = waitEnds(alice, startBegan);
+  assert.ok(Math.abs(startEnds - 5550) < 50, `the session start's wait would have ended ${Math.round(startEnds)} ms in`);
+  const commitEnds = waitEnds(bob, commitBegan);
+  assert.ok(Math.abs(commitEnds - 2700) < 50, `the commit's wait would have ended ${Math.round(commitEnds)} ms in`);
 });
 
 test("on a quiet machine each event takes less than half of its budget", async (t) => {

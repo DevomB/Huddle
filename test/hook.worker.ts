@@ -1,7 +1,8 @@
 // A child process for hook.test.ts: a hook process in which something throws
-// where nothing catches it. Not a test file itself.
+// where nothing catches it, or in which something lives on after the event is
+// done. Not a test file itself.
 //
-//   node test/hook.worker.ts hook <clone> <throw | reject>
+//   node test/hook.worker.ts hook <clone> <throw | reject | linger>
 //
 // The first argument has to be "hook". It is how the guard in the first lines
 // of the bundle and the hook command both know that this is a hook process.
@@ -24,7 +25,7 @@ if (adapter === undefined) throw new Error("there is no codex adapter to borrow"
 adapter.parse = (): HookEvent => ({ type: "post-edit", agent: "codex", sessionId: "s-crash", cwd: clone });
 adapter.format = () => {
   if (how === "reject") void Promise.reject(new Error("boom in a promise"));
-  else {
+  if (how === "throw") {
     setTimeout(() => {
       throw new Error("boom in a timer");
     }, 0);
@@ -35,5 +36,8 @@ adapter.format = () => {
 // No script to start a background sync with: this process is not the bundle.
 await run(["codex"], { ...processIo(""), cwd: clone });
 
-// The guard ends the process the moment the error surfaces. If it has not by now, it never will.
-setTimeout(() => process.exit(7), 2000);
+// After a crash the guard ends the process the moment the error surfaces. A
+// process that lingers is ended by the limit on its lifetime, which the hook
+// command set. Whichever it is: if it has not ended the process by now, it
+// never will, and the exit code says so.
+setTimeout(() => process.exit(7), how === "linger" ? 30_000 : 10_000);
