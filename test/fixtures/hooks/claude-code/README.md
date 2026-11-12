@@ -54,6 +54,15 @@ Ids (`session_id`, `prompt_id`, `tool_use_id`, `agent_id`) are as recorded.
 - `tool_response.bashEditDiff` is absent unless Claude Code recorded the
   command's changes.
 
+## Not recorded
+
+- **A pasted prompt.** `claude -p` has no prompt box, so no recording holds a
+  paste. The tests build those prompts from the hook reference's description
+  of `UserPromptSubmit`: a collapsed paste arrives expanded, between a
+  `<pasted_content id="...">` line and a `</pasted_content id="...">` line in
+  sessions that mark pasted text. Recording one needs a person: paste more
+  than three lines into an interactive session and submit.
+
 ## Recording again
 
 Point every event in a scratch repository's `.claude/settings.json` at a script

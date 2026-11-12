@@ -11,6 +11,7 @@ import { getAdapter } from "../src/adapters/index.ts";
 import { SILENT } from "../src/adapters/types.ts";
 import type { HookEvent, HookEventType, HookInput } from "../src/adapters/types.ts";
 import { CliError } from "../src/core/io.ts";
+import { createHarness } from "./harness.ts";
 
 // The fixtures are payloads recorded from Claude Code 2.1.322; see the README next to them.
 const FIXTURES = fileURLToPath(new URL("./fixtures/hooks/claude-code/", import.meta.url));
@@ -150,15 +151,61 @@ test("parse: prompts a person typed are kept, whatever they start with", () => {
   }
 });
 
-test("parse: the lines Claude Code puts around pasted text are dropped, the pasted text is kept", () => {
+// No fixture holds a paste: every recording is a `claude -p` run, which has no
+// prompt box. These prompts are built from the hook reference's description of
+// UserPromptSubmit, read 2026-11-12: a collapsed paste "arrives expanded in
+// place", and where pastes are marked "that expanded content sits between a
+// `<pasted_content id="…">` line and a `</pasted_content id="…">` line".
+function pasted(id: string, ...lines: string[]): string {
+  return [`<pasted_content id="${id}">`, ...lines, `</pasted_content id="${id}">`].join("\n");
+}
+
+test("parse: a marked paste never reaches the prompt, which becomes the published intent", () => {
   const typed = fixture("user-prompt-submit.typed");
-  const wrapped = ['<pasted_content id="k3j9">', "TypeError: x is undefined", "    at login (src/auth.ts:12)", '</pasted_content id="k3j9">'].join("\n");
-  assert.equal(parse({ ...typed, prompt: wrapped })?.prompt, "TypeError: x is undefined\n    at login (src/auth.ts:12)");
-  assert.equal(parse({ ...typed, prompt: `Why does this fail?\n${wrapped}\nIt worked yesterday.` })?.prompt, "Why does this fail?\nTypeError: x is undefined\n    at login (src/auth.ts:12)\nIt worked yesterday.");
-  assert.equal(parse({ ...typed, prompt: wrapped.replace(/\n/g, "\r\n") })?.prompt, "TypeError: x is undefined\r\n    at login (src/auth.ts:12)");
-  assert.equal(parse({ ...typed, prompt: 'what does <pasted_content id="x"> mean in my prompt?' })?.prompt, 'what does <pasted_content id="x"> mean in my prompt?', "only whole marker lines go");
-  const emptyPaste = parse({ ...typed, prompt: '<pasted_content id="a">\n</pasted_content id="a">' });
+  const promptOf = (prompt: string): string | undefined => parse({ ...typed, prompt })?.prompt;
+  const secrets = pasted("k3j9", "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG", "DB_PASSWORD=hunter2", "", "STRIPE_KEY=sk_live_51H");
+
+  // Nothing but a paste: no prompt at all, not an empty one.
+  const onlyPaste = parse({ ...typed, prompt: secrets });
+  assert.equal(onlyPaste?.type, "prompt");
+  assert.equal(onlyPaste !== null && "prompt" in onlyPaste, false);
+  const emptyPaste = parse({ ...typed, prompt: pasted("a") });
   assert.equal(emptyPaste !== null && "prompt" in emptyPaste, false);
+
+  // What was typed around it stays, and nothing of the paste does.
+  assert.equal(promptOf(`Why does the deploy fail with this env?\n${secrets}\nIt worked yesterday.`), "Why does the deploy fail with this env?\nIt worked yesterday.");
+  assert.equal(promptOf(`${secrets}\nrotate these`), "rotate these");
+  assert.equal(promptOf(`compare\n${pasted("one", "first log")}\nwith\n${pasted("two", "second log")}\nplease`), "compare\nwith\nplease");
+  assert.equal(promptOf(`Why?\r\n${secrets.replace(/\n/g, "\r\n")}\r\nIt worked yesterday.`), "Why?\r\nIt worked yesterday.", "Windows line endings");
+  assert.equal(promptOf(`  ${secrets.replace(/\n/g, "\n  ")}\nindented markers`), "indented markers");
+  for (const prompt of [`Why?\n${secrets}\nIt worked yesterday.`, `${secrets}\nrotate these`, secrets.replace(/\n/g, "\r\n")]) {
+    const kept = promptOf(prompt) ?? "";
+    for (const leak of ["hunter2", "wJalrXUtnFEMI", "sk_live", "pasted_content", "k3j9"]) assert.equal(kept.includes(leak), false, `${leak} in ${JSON.stringify(kept)}`);
+  }
+});
+
+test("parse: pasted text cannot end its own block, and a block left open takes the rest", () => {
+  const typed = fixture("user-prompt-submit.typed");
+  const promptOf = (prompt: string): string | undefined => parse({ ...typed, prompt })?.prompt;
+
+  // The id is random so that a paste holding marker-like lines stays inside its block.
+  const tricky = pasted("r4nd0m", "first", "</pasted_content>", '</pasted_content id="other">', '<pasted_content id="inner">', "still pasted: token=abc123");
+  assert.equal(promptOf(`look at this\n${tricky}\nthanks`), "look at this\nthanks");
+
+  // Never closed by its own id: everything after the opening line goes.
+  assert.equal(promptOf('summarize\n<pasted_content id="x">\npassword=hunter2\n</pasted_content id="y">\nand then typed more'), "summarize");
+  assert.equal(promptOf('summarize\n<pasted_content id="x">\npassword=hunter2'), "summarize");
+
+  // Marker lines without an id are honored as a pair too, and a closing line with nothing open is dropped.
+  assert.equal(promptOf("before\n<pasted_content>\npassword=hunter2\n</pasted_content>\nafter"), "before\nafter");
+  assert.equal(promptOf("before\n</pasted_content>\nafter"), "before\nafter");
+  assert.equal(promptOf('before\n</pasted_content id="gone">\nafter'), "before\nafter");
+
+  // Only a whole line is a marker: a prompt that talks about the tag is typed text.
+  const about = 'what does <pasted_content id="x"> mean in my prompt?';
+  assert.equal(promptOf(about), about);
+  assert.equal(promptOf("is </pasted_content> a closing tag?"), "is </pasted_content> a closing tag?");
+  assert.equal(promptOf('<pasted_content id="x"> and more on the line\nkept'), '<pasted_content id="x"> and more on the line\nkept');
 });
 
 test("parse: cwd is the agent's live directory from the payload, not the hook's own", () => {
@@ -507,12 +554,27 @@ function countOurs(settings: Json): Record<string, number> {
 
 const ONE_EACH = Object.fromEntries(EVENTS.map((event) => [event, 1]));
 
+/**
+ * What init and doctor have to tell every teammate, because nothing in the
+ * settings file can: where to start claude, that it needs node, and the trust
+ * dialog. Each one is a way for the hooks to do nothing without a word.
+ */
+function assertStandingNotes(notes: readonly string[]): void {
+  assert.equal(notes.length, 3, notes.join("\n"));
+  const [root, node, trust] = notes as [string, string, string];
+  assert.match(root, /^Start claude at the root of the checkout\./);
+  assert.match(root, /started in a subdirectory, or moved with \/cd, runs none of huddle's hooks/);
+  assert.match(node, /Node 20 or later on the PATH that Claude Code itself sees/);
+  assert.match(node, /hook error on every event/);
+  assert.match(trust, /^In an interactive session /);
+  assert.match(trust, /workspace trust dialog/);
+}
+
 test("install: an empty repo gets .claude/settings.json with one exec-form handler per event", async (t) => {
   const { root, file } = await scratchRepo(t);
   const result = await claudeCode.install({ repoRoot: root, bundle: BUNDLE });
   assert.deepEqual(result.changed, [".claude/settings.json"]);
-  assert.equal(result.notes.length, 1);
-  assert.match(result.notes[0] ?? "", /workspace trust dialog/);
+  assertStandingNotes(result.notes);
 
   const text = await readFile(file, "utf8");
   assert.deepEqual(JSON.parse(text), installed());
@@ -557,7 +619,7 @@ test("install: installing twice adds nothing", async (t) => {
   for (let run = 0; run < 3; run++) {
     const again = await claudeCode.install({ repoRoot: root, bundle: BUNDLE });
     assert.deepEqual(again.changed, [], "nothing to report as changed");
-    assert.match(again.notes[0] ?? "", /workspace trust dialog/);
+    assertStandingNotes(again.notes);
   }
   assert.ok((await readFile(file)).equals(first), "byte for byte the same");
   const after = await stat(file);
@@ -691,6 +753,8 @@ test("install: other tools' hooks that merely look similar are not huddle's", as
     { type: "command", command: "node", args: ["${CLAUDE_PROJECT_DIR}/.huddle/huddle.mjs", "sync"] },
     { type: "command", command: "node", args: ["${CLAUDE_PROJECT_DIR}/tools/not-huddle.mjs", "hook", "claude-code"] },
     { type: "command", command: "node .huddle/huddle.mjs hook claude-code-extras" },
+    { type: "command", command: "node tools/not-huddle.mjs hook claude-code" },
+    { type: "command", command: 'node "$CLAUDE_PROJECT_DIR/tools/my_huddle.mjs" hook claude-code' },
     { type: "command", command: "echo huddle.mjs hook" },
     { type: "http", url: "http://localhost/huddle.mjs hook claude-code" },
   ];
@@ -829,8 +893,7 @@ test("check: reports what install left, and what is still missing", async (t) =>
   const ok = await checkClaudeCode(root, around);
   assert.equal(ok.installed, true);
   assert.equal(ok.detail, "6 hooks in .claude/settings.json");
-  assert.equal(ok.notes.length, 1);
-  assert.match(ok.notes[0] ?? "", /workspace trust dialog/);
+  assertStandingNotes(ok.notes);
 
   // The same answer through the adapter, when the repo itself settles it.
   assert.equal((await claudeCode.check(root)).installed, true);
@@ -911,7 +974,9 @@ test("check: says so when Claude Code has hooks turned off, following its settin
   assert.equal(await off(), `Hooks are turned off for Claude Code here: "disableAllHooks" is true in ${userFile}. huddle's hooks will not run until that is removed.`);
   const result = await checkClaudeCode(root, around);
   assert.equal(result.installed, true, "the config is in place; the note says why it does nothing");
-  assert.equal(result.notes.length, 2);
+  assert.equal(result.notes.length, 4);
+  assert.match(result.notes[0] ?? "", /disableAllHooks/, "what stops the hooks outright comes first");
+  assertStandingNotes(result.notes.slice(1));
 
   // The project's settings outrank the user's, and the local file outranks both.
   const projectFile = join(root, ".claude", "settings.json");
@@ -933,6 +998,77 @@ test("check: says so when Claude Code has hooks turned off, following its settin
   const elsewhere = await emptyHome(t);
   assert.equal(await off(), `Hooks are turned off for Claude Code here: "disableAllHooks" is true in ${userFile}. huddle's hooks will not run until that is removed.`);
   assert.equal((await checkClaudeCode(root, { env: { CLAUDE_CONFIG_DIR: elsewhere }, home })).notes.some((note) => note.includes("disableAllHooks")), false);
+});
+
+test("check: in a linked worktree, the local settings that count are the main checkout's", async (t) => {
+  // The settings page: for .claude/settings.local.json, "In a worktree, it uses the file at the main checkout's root."
+  const home = await emptyHome(t);
+  const around = { env: {}, home };
+  const harness = await createHarness(t);
+  const main = await harness.clone("alice");
+  await claudeCode.install({ repoRoot: main.dir, bundle: BUNDLE });
+  await withBundle(main.dir);
+  await main.commit("huddle init");
+  const linked = await main.addWorktree("feature");
+  const off = async (root: string, surroundings: { env: NodeJS.ProcessEnv; home: string; platform?: NodeJS.Platform } = around) =>
+    (await checkClaudeCode(root, surroundings)).notes.find((note) => note.includes("disableAllHooks")) ?? null;
+
+  assert.equal((await checkClaudeCode(linked.dir, around)).installed, true, "the committed settings and bundle are checked out in the worktree");
+  assert.equal(await off(main.dir), null);
+  assert.equal(await off(linked.dir), null);
+
+  const mainLocal = join(main.dir, ".claude", "settings.local.json");
+  await writeFile(mainLocal, '{ "disableAllHooks": true }');
+  assert.match((await off(main.dir)) ?? "", /is true in \.claude\/settings\.local\.json\./);
+  assert.equal(await off(linked.dir), `Hooks are turned off for Claude Code here: "disableAllHooks" is true in ${mainLocal}. huddle's hooks will not run until that is removed.`);
+
+  // A file left in the worktree by an older Claude Code is still read, below the main checkout's.
+  const linkedLocal = join(linked.dir, ".claude", "settings.local.json");
+  await writeFile(linkedLocal, '{ "disableAllHooks": false }');
+  assert.match((await off(linked.dir)) ?? "", new RegExp(`is true in ${mainLocal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`), "the main checkout's value applies");
+  await writeFile(mainLocal, '{ "disableAllHooks": false }');
+  await writeFile(linkedLocal, '{ "disableAllHooks": true }');
+  assert.equal(await off(linked.dir), null);
+  await writeFile(mainLocal, '{ "model": "sonnet" }');
+  assert.match((await off(linked.dir)) ?? "", /is true in \.claude\/settings\.local\.json\./, "says nothing, so the worktree's own file decides");
+
+  // On Windows the file stays in the directory the session starts in.
+  await writeFile(mainLocal, '{ "disableAllHooks": true }');
+  await rm(linkedLocal);
+  assert.equal(await off(linked.dir, { ...around, platform: "win32" }), null);
+  assert.match((await off(linked.dir, { ...around, platform: "linux" })) ?? "", /disableAllHooks/);
+});
+
+test("check: says so when the Claude Code on this machine is too old for exec-form hooks", async (t) => {
+  // CHANGELOG, 2.1.139: "Added hook `args: string[]` field (exec form)".
+  const home = await emptyHome(t);
+  const { root } = await scratchRepo(t);
+  await claudeCode.install({ repoRoot: root, bundle: BUNDLE });
+  await withBundle(root);
+  const notesWith = async (printed: string | null): Promise<string[]> => (await checkClaudeCode(root, { env: {}, home, claudeVersion: async () => printed })).notes;
+
+  for (const fine of ["2.1.139 (Claude Code)", "2.1.140 (Claude Code)", "2.1.322 (Claude Code)", "2.2.0 (Claude Code)", "3.0.1 (Claude Code)", "10.0.0"]) {
+    assertStandingNotes(await notesWith(fine));
+  }
+  // Unknown is not old: no claude on the PATH, or output that is not a version.
+  for (const unknown of [null, "", "claude: command not found", "v-next"]) assertStandingNotes(await notesWith(unknown));
+
+  for (const old of ["2.1.138 (Claude Code)", "2.1.9 (Claude Code)", "2.0.76 (Claude Code)", "1.0.128 (Claude Code)"]) {
+    const notes = await notesWith(old);
+    assert.equal(notes.length, 4, old);
+    assert.equal(notes[0], `Claude Code ${old.split(" ")[0]} on this machine is older than 2.1.139, the first release that can run the hooks huddle installs. Update Claude Code.`);
+    assertStandingNotes(notes.slice(1));
+  }
+
+  // Not asked at all when the surroundings give no way to ask.
+  assertStandingNotes((await checkClaudeCode(root, { env: {}, home })).notes);
+  // With hooks turned off as well, that comes first: it stops everything.
+  await mkdir(join(root, ".claude"), { recursive: true });
+  await writeFile(join(root, ".claude", "settings.local.json"), '{ "disableAllHooks": true }');
+  const both = await notesWith("2.0.0 (Claude Code)");
+  assert.equal(both.length, 5);
+  assert.match(both[0] ?? "", /disableAllHooks/);
+  assert.match(both[1] ?? "", /older than 2\.1\.139/);
 });
 
 // ---------------------------------------------------------------------------
