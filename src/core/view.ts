@@ -54,6 +54,13 @@ function compareText(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
+/**
+ * How far ahead of this machine's clock a teammate's seenAt may be and still
+ * count as "just seen". Clocks that are set by hand drift by minutes; beyond
+ * this the stamp says nothing about when the session was last alive.
+ */
+export const MAX_CLOCK_SKEW_MS = 5 * 60_000;
+
 function sessionKey(actor: string, session: string): string {
   return `${actor}/${session}`;
 }
@@ -62,7 +69,11 @@ function sessionKey(actor: string, session: string): string {
  * Builds the view from the last fetched team state.
  *
  * Live: `now - seenAt < ttlMinutes`. A session last seen exactly ttlMinutes
- * ago is not live; a seenAt in the future (clock skew) counts as just seen.
+ * ago is not live. A seenAt up to MAX_CLOCK_SKEW_MS in the future counts as
+ * just seen. One further ahead than that is not live at all: taken at its
+ * word, a session with a clock an hour fast would stay live for an hour after
+ * it ended, and one stamped with next year would never leave. The price is
+ * that a teammate whose clock is that wrong is not shown until it is fixed.
  *
  * The cache holds what the remote had at the last sync, including this
  * clone's own ActorDoc as last published. A caller that wants this clone's
@@ -106,6 +117,9 @@ export function buildView(cache: Cache, self: Self, now: Date, opts: ViewOptions
       // One entry per session id; if a doc repeats an id, the most recently seen wins.
       const latest = new Map<string, Session>();
       for (const session of doc.sessions) {
+        // Skipped here, not below, so that a stamp from the far future cannot
+        // win over a believable entry for the same id.
+        if (Date.parse(session.seenAt) - nowMs > MAX_CLOCK_SKEW_MS) continue;
         const previous = latest.get(session.id);
         if (previous === undefined || Date.parse(session.seenAt) > Date.parse(previous.seenAt)) latest.set(session.id, session);
       }
