@@ -19,6 +19,8 @@ import type { Ctx } from "../src/core/context.ts";
 import { addTask, claimTask, dropTask, finishTask } from "../src/core/tasks.ts";
 import type { TaskResult } from "../src/core/tasks.ts";
 import { parseRef } from "../src/core/types.ts";
+import type { ActorDoc, Cache, TaskDoc } from "../src/core/types.ts";
+import { buildView } from "../src/core/view.ts";
 import { BUNDLE, createHarness } from "./harness.ts";
 import type { Clone, Harness } from "./harness.ts";
 
@@ -111,6 +113,48 @@ describe("A05: a task change whose answer was lost", () => {
     const clash = await alice.huddle(["task", "add", "--id", id, "Something else"], { now: at(3), session: "alice-1" });
     assert.equal(clash.code, 3, clash.stdout + clash.stderr);
     assert.equal((await remoteTasks(h)).get(id)?.title, "Exactly once", "an id that is taken by another title is left alone");
+  });
+
+  test("a lost race whose read-back fails reports no stale task as where it stands now", async () => {
+    const carol = await h.clone("carol");
+    const id = /added \[([a-z2-7]{8})\]/.exec((await alice.huddle(["task", "add", "Raced, then offline"], { now: at(5) })).stdout)?.[1];
+    assert.ok(id);
+
+    /** Runs `first` just before this context's first task push, then fails every network read after it. */
+    const raceThenOffline = (ctx: Ctx, first: () => Promise<void>): void => {
+      const transport = ctx.transport;
+      const publish = transport.publish.bind(transport);
+      const fetchAll = transport.fetchAll.bind(transport);
+      let raced = false;
+      transport.publish = async (ref, doc, expect) => {
+        if (ref.startsWith("refs/huddle/tasks/") && !raced) {
+          raced = true;
+          await first();
+        }
+        return publish(ref, doc, expect);
+      };
+      transport.fetchAll = async (known) => (raced ? { ok: false, reason: "offline" } : fetchAll(known));
+    };
+
+    // Claim: carol wins between bob's read and bob's push. Bob's cache still says "open", which is not where the task is.
+    const claimer = await context(bob, at(6), "bob-1");
+    raceThenOffline(claimer, async () => {
+      assert.equal((await claimTask(await context(carol, at(6), "carol-1"), id, { session: "carol-1", agent: "manual" })).ok, true);
+    });
+    const lost = failure(await claimTask(claimer, id, { session: "bob-1", agent: "manual" }));
+    assert.equal(lost.reason, "lost-race");
+    assert.equal(lost.task, undefined, `bob's stale copy must not be reported as the task now: ${JSON.stringify(lost.task)}`);
+    assert.equal((await remoteTasks(h)).get(id)?.owner?.session, "carol-1");
+
+    // Create under an id: the id is taken, and whose task holds it cannot be read back.
+    const creator = await context(bob, at(7), "bob-1");
+    raceThenOffline(creator, async () => {
+      assert.equal((await carol.huddle(["task", "add", "--id", "offrace2", "Carol's task"], { now: at(7), session: "carol-1" })).code, 0);
+    });
+    const taken = failure(await addTask(creator, "Bob's task", { session: "bob-1", agent: "manual" }, { id: "offrace2" }));
+    assert.equal(taken.reason, "lost-race");
+    assert.equal(taken.task, undefined);
+    assert.equal((await remoteTasks(h)).get("offrace2")?.title, "Carol's task");
   });
 
   test("claim, done and drop: unknown with the id when nothing can be checked, and a rerun is safe", async () => {
@@ -220,6 +264,25 @@ describe("A12: an owner nobody can see is not an owner who is gone", () => {
     const attempt = await bob.huddle(["task", "claim", id], { now: at(160), session: "bob-1" });
     assert.equal(attempt.code, 1, attempt.stdout + attempt.stderr);
     assert.equal((await remoteTasks(h)).get(id)?.owner?.session, "alice-1");
+  });
+
+  test("an owner document written before the claim does not say the claiming session is over (pure)", () => {
+    // A sync can leave a ref that kept moving at its old copy for the next round (transport fetchAll),
+    // so a reader can hold the claimed task and an owner document from before the claim's session.
+    // Both stamps come from the owner's clone: comparing them involves no other machine's clock.
+    const owner = { actor: "aaaaaaaa", user: "alice", session: "alice-9", agent: "manual" };
+    const task: TaskDoc = { v: 0, kind: "task", id: "tttttttt", title: "T", status: "claimed", owner, createdBy: owner, createdAt: at(300), updatedAt: at(301) };
+    const actorDoc = (updatedAt: string): ActorDoc => ({ v: 0, kind: "actor", actor: owner.actor, user: "alice", host: "h", updatedAt, sessions: [] });
+    const presenceWith = (updatedAt: string): unknown => {
+      const cache: Cache = {
+        fetchedAt: at(302),
+        refs: { "refs/huddle/actors/aaaaaaaa": { sha: "1", doc: actorDoc(updatedAt) }, "refs/huddle/tasks/tttttttt": { sha: "2", doc: task } },
+      };
+      return buildView(cache, { actor: "bbbbbbbb", session: "bob-1" }, new Date(at(302))).tasks[0]?.ownerPresence;
+    };
+    assert.equal(presenceWith(at(300)), "unknown", "a document from before the claim cannot list the session yet");
+    assert.equal(presenceWith(at(301)), "expired", "the claim's own sync or later: a session missing from it is over");
+    assert.equal(presenceWith(at(320)), "expired");
   });
 
   test("a readable owner document whose session expired: activity-based takeover still works", async () => {

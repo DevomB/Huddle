@@ -117,7 +117,14 @@ async function add(args: string[], io: Io): Promise<number> {
       throw new CliError(uncertain(ctx, "add", result.task));
     case "lost-race":
       if (id !== undefined) {
-        io.out(result.task ? `task id ${id} is taken by another task: ${label(result.task)}. Nothing was added` : `task id ${id} is taken. Nothing was added`);
+        // Whose task holds the id could not be read back: it may be this very task, from an earlier run whose answer was lost.
+        if (!result.task) {
+          throw new CliError(
+            `task id ${id} is already on the remote, and huddle could not read it back to see whether it is this task (an earlier run may have created it). ` +
+              `Nothing was added now. Do not add it under a new id: check with "huddle sync" and then "huddle task list"`,
+          );
+        }
+        io.out(`task id ${id} is taken by another task: ${label(result.task)}. Nothing was added`);
         return EXIT.CONFLICT;
       }
       throw new CliError("could not find a free task id; nothing was added. Run the command again");
@@ -223,7 +230,7 @@ function refused(ctx: Ctx, verb: Verb, id: string, result: Extract<TaskResult, {
     case "owner-unknown":
       throw new CliError(
         `${task ? label(task) : `task ${id}`} is held by ${task?.owner ? name(task.owner) : "another session"}, and whether that session is still active cannot be seen from here ` +
-          "(its clone's published state is missing or unreadable, or this clone has no team state yet). It was NOT taken over. " +
+          "(its clone's published state is missing, unreadable or older than the claim, or this clone has no team state yet). It was NOT taken over. " +
           `Run "huddle sync" and try again; if it stays unclear, ask the holder to run "huddle task drop ${id}". ` +
           "A huddle task is reclaimed only on observed inactivity; it is not an execution lock",
       );
@@ -235,7 +242,7 @@ function refused(ctx: Ctx, verb: Verb, id: string, result: Extract<TaskResult, {
       }
       return EXIT.CONFLICT;
     case "lost-race":
-      if (!task) io.out(`task ${id} was changed by someone else at the same moment and is gone now`);
+      if (!task) io.out(`task ${id} was changed by another command at the same moment, so this one changed nothing. Run "huddle sync" and then "huddle task list" to see where it stands`);
       else if (verb === "claim" && task.status === "claimed" && task.owner) io.out(`${label(task)} was claimed first by ${name(task.owner)}`);
       else io.out(`${label(task)} was changed by someone else at the same moment; it is now ${describe(task)}. Nothing was changed`);
       return EXIT.CONFLICT;

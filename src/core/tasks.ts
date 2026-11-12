@@ -211,11 +211,11 @@ async function swap(ctx: Ctx, who: Who, next: TaskDoc, expect: Sha, made: (now: 
   if (published.reason === "offline" && !notSent(published)) return reconcile(ctx, who, next, expect, made);
   if (published.reason !== "lost-race") return { ok: false, reason: published.reason };
 
-  await refresh(ctx); // if this fails, the task below is the best we know
+  await refresh(ctx); // a refresh that fails may still have fetched the task: the sha below says whether it did
   const now = await lookup(ctx, next.id, who.session);
-  return now
-    ? { ok: false, reason: "lost-race", task: stored(now.task), ownerLive: now.task.ownerLive, ownerPresence: now.task.ownerPresence }
-    : { ok: false, reason: "lost-race" };
+  // Still at the sha the push expected: the cache never caught up, so the copy here is not where the task stands now.
+  if (!now || now.sha === expect) return { ok: false, reason: "lost-race" };
+  return { ok: false, reason: "lost-race", task: stored(now.task), ownerLive: now.task.ownerLive, ownerPresence: now.task.ownerPresence };
 }
 
 /**
