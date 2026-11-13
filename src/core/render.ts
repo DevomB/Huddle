@@ -185,6 +185,10 @@ function conflictNote(decision: ViewDecision): string {
   const others = decision.conflictsWith ?? [];
   if (others.length === 0) return "";
   const ids = others.map((id) => `[${shownText(id, 40)}]`).join(", ");
+  // A ring (view.ts closedRings): what this one replaces is one of the others.
+  if (decision.supersedes !== undefined && others.includes(decision.supersedes)) {
+    return ` CONFLICT: this and ${ids} replace one another in a ring, and huddle does not pick one. Settle it together, then record the rule that holds in place of any one of them: huddle decide --supersedes <its id> "<the rule>"`;
+  }
   const replaced = shownText(decision.supersedes ?? "", 40);
   return ` CONFLICT: this and ${ids} both replace [${replaced}], and huddle does not pick one. Settle it together, then replace the one that should go: huddle decide --supersedes <its id> "<the rule>"`;
 }

@@ -28,7 +28,8 @@ export interface ViewDecision extends Decision {
    * each author's log is compare-and-swapped on its own). Those are its ids.
    * huddle does not pick one: both stay listed, each marked as conflicting.
    * The team settles it with the existing `huddle decide --supersedes` on the
-   * one that should go.
+   * one that should go. Also set on the members of a ring that replace one
+   * another (closedRings): then `supersedes` is one of these ids.
    */
   conflictsWith?: string[];
 }
@@ -112,6 +113,44 @@ function sessionKey(actor: string, session: string): string {
  * The view shares no arrays or objects with the cache, so either may be
  * edited afterwards without changing the other.
  */
+/**
+ * Decisions that replace one another in a ring (B replaces C, C replaces B)
+ * that no decision outside it replaces: by the rule "replaced means hidden"
+ * every member would be hidden and nothing would stand in their place (audit
+ * A04-1). `decide` only replaces a decision it can see, so only a damaged or
+ * hand-made log holds one. Each member maps to the others; they stay in force,
+ * marked as conflicting, and a decision that replaces any one of them settles
+ * the ring. A ring that something outside replaces is left to the usual rule.
+ */
+function closedRings(decisions: Decision[]): Map<string, string[]> {
+  const byId = new Map(decisions.map((decision) => [decision.id, decision]));
+  const replacedBy = new Map<string, string[]>();
+  for (const decision of decisions) {
+    const target = decision.supersedes;
+    if (target !== undefined && target !== decision.id) replacedBy.set(target, [...(replacedBy.get(target) ?? []), decision.id]);
+  }
+  const rings = new Map<string, string[]>();
+  const walked = new Set<string>();
+  for (const start of decisions) {
+    // Follow `supersedes` from here until a decision walked before: back on this walk is a ring.
+    const walk: string[] = [];
+    let id: string | undefined = start.id;
+    while (id !== undefined && byId.has(id) && !walked.has(id)) {
+      walked.add(id);
+      walk.push(id);
+      const target: string | undefined = byId.get(id)?.supersedes;
+      id = target === id ? undefined : target;
+    }
+    const from = id === undefined ? -1 : walk.indexOf(id);
+    if (from < 0) continue;
+    const members = walk.slice(from);
+    const inside = new Set(members);
+    if (!members.every((member) => (replacedBy.get(member) ?? []).every((other) => inside.has(other)))) continue;
+    for (const member of members) rings.set(member, members.filter((other) => other !== member));
+  }
+  return rings;
+}
+
 export function buildView(cache: Cache, self: Self, now: Date, opts: ViewOptions = {}): TeamView {
   const nowMs = now.getTime();
   if (Number.isNaN(nowMs)) throw new TypeError("buildView: `now` is not a valid date");
@@ -193,8 +232,9 @@ export function buildView(cache: Cache, self: Self, now: Date, opts: ViewOptions
   for (const decision of decisions) {
     if (decision.supersedes !== undefined && decision.supersedes !== decision.id) superseded.add(decision.supersedes);
   }
+  const rings = closedRings(decisions);
   view.decisions = decisions
-    .filter((decision) => !superseded.has(decision.id))
+    .filter((decision) => !superseded.has(decision.id) || rings.has(decision.id))
     .sort((a, b) => Date.parse(b.at) - Date.parse(a.at) || compareText(a.actor, b.actor) || compareText(a.id, b.id));
   // Decisions in force that replace the same decision compete: mark each with the others. No clock picks one.
   const rivals = new Map<string, ViewDecision[]>();
@@ -203,9 +243,9 @@ export function buildView(cache: Cache, self: Self, now: Date, opts: ViewOptions
     rivals.set(decision.supersedes, [...(rivals.get(decision.supersedes) ?? []), decision]);
   }
   view.decisions = view.decisions.map((decision) => {
-    const group = decision.supersedes === undefined ? undefined : rivals.get(decision.supersedes);
-    if (group === undefined || group.length < 2) return decision;
-    return { ...decision, conflictsWith: group.filter((other) => other !== decision).map((other) => other.id).sort(compareText) };
+    const group = decision.supersedes === undefined ? [] : (rivals.get(decision.supersedes) ?? []);
+    const others = rings.get(decision.id) ?? group.filter((other) => other !== decision).map((other) => other.id);
+    return others.length === 0 ? decision : { ...decision, conflictsWith: [...others].sort(compareText) };
   });
 
   const presence = (task: TaskDoc): OwnerPresence | null => {
