@@ -389,7 +389,8 @@ export function teamCompleteness(cache: Cache, view: TeamView): Completeness {
   let unreadableActors = 0;
   for (const [ref, entry] of Object.entries(cache.refs ?? {})) {
     const where = parseRef(ref);
-    if (where?.kind !== "actor") continue;
+    // This clone's own entry is not read from the remote: the view shows its local sessions instead.
+    if (where?.kind !== "actor" || where.id === view.self.actor) continue;
     const doc = entry?.doc;
     if (doc === null || doc === undefined || doc.kind !== "actor" || doc.actor !== where.id) unreadableActors++;
   }

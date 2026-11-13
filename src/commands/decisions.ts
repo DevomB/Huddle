@@ -31,6 +31,6 @@ export async function run(args: string[], io: Io): Promise<number> {
   const view = team.view;
   if (values.json) io.out(JSON.stringify({ fetchedAt: view.fetchedAt, decisions: view.decisions, ...envelope(team) }, null, 2));
   else io.out(renderDecisions(view));
-  for (const warning of team.warnings) io.err(`huddle: ${warning}`);
+  if (team.line !== "") io.err(`huddle: ${team.line}`);
   return EXIT.OK;
 }

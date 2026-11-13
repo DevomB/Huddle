@@ -11,8 +11,9 @@ import { after, before, describe, test } from "node:test";
 import { openContext } from "../src/core/context.ts";
 import { actorRef } from "../src/core/types.ts";
 import type { ActorDoc } from "../src/core/types.ts";
-import { freshnessWarnings } from "../src/core/render.ts";
+import { TEAM_STATE_MAX, teamStateLine } from "../src/core/render.ts";
 import { classifyFreshness, staleAfterSeconds } from "../src/core/view.ts";
+import type { Completeness, FreshnessInput } from "../src/core/view.ts";
 import { BUNDLE, createHarness } from "./harness.ts";
 import type { Clone, Harness, RunResult } from "./harness.ts";
 
@@ -290,14 +291,74 @@ describe("classifyFreshness (pure)", () => {
     assert.equal(classifyFreshness({ ...base, fetchedAt: at(3600), refresh: "none" }).freshness, "stale", "a fetch stamped an hour ahead says nothing");
     assert.equal(classifyFreshness({ ...base, fetchedAt: at(-90) }).ageSeconds, 90);
   });
+});
 
-  test("the warning for a fetch stamped ahead of this clock does not call it recent", () => {
-    const complete = { complete: true, unreadableActors: 0, uncovered: 0 };
-    const ahead = freshnessWarnings(classifyFreshness({ ...base, fetchedAt: at(3600) }), complete, "origin");
-    assert.equal(ahead.length, 1, ahead.join("\n"));
-    assert.doesNotMatch(ahead[0]!, /just now|older than/);
-    assert.match(ahead[0]!, /later than this machine's clock.*huddle sync/);
-    const old = freshnessWarnings(classifyFreshness({ ...base, fetchedAt: at(-90) }), complete, "origin");
-    assert.match(old[0] ?? "", /older than 60s/);
+describe("teamStateLine (pure, CONTRACT 3.2)", () => {
+  const base = { cacheState: "ok" as const, now: new Date(T0), syncIntervalSeconds: 15, fetchedAt: at(-1) };
+  const complete: Completeness = { complete: true, unreadableActors: 0, uncovered: 0 };
+  const line = (input: Partial<FreshnessInput>, completeness = complete, remote = "origin"): string =>
+    teamStateLine(classifyFreshness({ ...base, ...input }), completeness, remote);
+
+  test("empty when the state is fresh and complete, whether or not the command refreshed", () => {
+    assert.equal(line({}), "");
+    assert.equal(line({ refresh: "ok" }), "");
+  });
+
+  test("the words for each state, with what to run", () => {
+    const cases: [Partial<FreshnessInput>, string][] = [
+      [{ fetchedAt: at(-90) }, 'the team state is from 1m ago, older than 60s. Run "huddle sync"'],
+      [{ fetchedAt: at(3600) }, `the team state is stamped later than this machine's clock. Run "huddle sync"`],
+      [{ fetchedAt: null }, 'no team state yet: this clone has never synced. Run "huddle sync"'],
+      [{ cacheState: "unreadable", fetchedAt: null }, `this clone's cache.json could not be read. Run "huddle sync"`],
+      [{ fetchedAt: at(-180), refresh: "offline" }, 'could not reach remote "origin"; showing the last known state from 3m ago. Run "huddle sync"'],
+      [{ fetchedAt: at(-180), refresh: "denied" }, 'remote "origin" refused a push to refs/huddle/*; showing the last known state from 3m ago. Run "huddle doctor"'],
+      [{ fetchedAt: at(-180), refresh: "busy" }, 'another huddle sync in this clone was still running; showing the last known state from 3m ago. Run "huddle sync"'],
+      [{ fetchedAt: at(-180), refresh: "failed" }, 'the refresh did not finish (the huddle log says why); showing the last known state from 3m ago. Run "huddle sync"'],
+      [{ fetchedAt: null, refresh: "offline" }, 'could not reach remote "origin"; no team state yet: this clone has never synced. Run "huddle sync"'],
+      // A fetch stamped ahead of this clock reads as age 0: no "from just now".
+      [{ fetchedAt: at(3600), refresh: "offline" }, 'could not reach remote "origin"; showing the last known state. Run "huddle sync"'],
+    ];
+    for (const [input, expected] of cases) assert.equal(line(input), expected, JSON.stringify(input));
+    // Only completeness is wrong: nothing this clone can run fixes it.
+    assert.equal(line({}, { complete: false, unreadableActors: 1, uncovered: 0 }), "1 teammate's state could not be read by this version of huddle");
+    assert.equal(line({}, { complete: false, unreadableActors: 0, uncovered: 2 }), "2 teammate sessions have more files in flight than they published");
+    assert.equal(
+      line({ fetchedAt: at(-90) }, { complete: false, unreadableActors: 2, uncovered: 0 }),
+      `the team state is from 1m ago, older than 60s; 2 teammates' states could not be read by this version of huddle. Run "huddle sync"`,
+    );
+    // Too much at once for one line: the completeness clauses become one.
+    assert.equal(
+      line({ fetchedAt: at(-90) }, { complete: false, unreadableActors: 1, uncovered: 1 }),
+      'the team state is from 1m ago, older than 60s; the team picture is incomplete. Run "huddle sync"',
+    );
+  });
+
+  test(`at most ${TEAM_STATE_MAX} characters on one line, whatever the remote's name and however much is wrong`, () => {
+    assert.equal(TEAM_STATE_MAX, 160);
+    const remotes = ["origin", `${"r".repeat(150)}\u001b[31m<x>\n${"s".repeat(60)}`];
+    const fetched = [null, at(-1), at(-90), at(-200 * 86400), "1970-01-01T00:00:00.000Z", at(3600)];
+    const refreshes = ["none", "ok", "offline", "denied", "busy", "failed"] as const;
+    const parts: Completeness[] = [
+      complete,
+      { complete: false, unreadableActors: 1, uncovered: 0 },
+      { complete: false, unreadableActors: 0, uncovered: 1 },
+      { complete: false, unreadableActors: 12345, uncovered: 12345 },
+    ];
+    let seen = 0;
+    for (const remote of remotes)
+      for (const cacheState of ["ok", "missing", "unreadable"] as const)
+        for (const fetchedAt of fetched)
+          for (const refresh of refreshes)
+            for (const completeness of parts) {
+              const report = classifyFreshness({ ...base, cacheState, fetchedAt, refresh });
+              const text = teamStateLine(report, completeness, remote);
+              const where = JSON.stringify({ remote: remote.length, cacheState, fetchedAt, refresh, completeness, text });
+              assert.equal(text === "", report.freshness === "fresh" && completeness.complete, where);
+              assert.ok(Array.from(text).length <= TEAM_STATE_MAX, `${Array.from(text).length} characters: ${where}`);
+              assert.doesNotMatch(text, /[\u0000-\u001f\u007f<>]/, where);
+              assert.ok(!text.endsWith("…"), `cut short instead of fitted: ${where}`);
+              seen++;
+            }
+    assert.equal(seen, 2 * 3 * 6 * 6 * 4);
   });
 });

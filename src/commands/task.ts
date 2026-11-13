@@ -182,7 +182,7 @@ async function list(args: string[], io: Io): Promise<number> {
   const team = await readTeam(ctx, me.id, refresh);
   const view = team.view;
   io.out(values.json ? JSON.stringify({ fetchedAt: view.fetchedAt, tasks: view.tasks, ...envelope(team) }, null, 2) : renderTasks(view));
-  for (const warning of team.warnings) io.err(`huddle: ${warning}`);
+  if (team.line !== "") io.err(`huddle: ${team.line}`);
   return EXIT.OK;
 }
 

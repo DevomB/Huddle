@@ -506,48 +506,63 @@ export function renderOverlaps(path: string, found: Overlap[], now: Date): strin
 
 // ---------------------------------------------------------------- freshness
 
+/** CONTRACT 3.2: the most a hook adds to an agent's context about the team state. */
+export const TEAM_STATE_MAX = 160;
+
 /**
- * The sentences that say how far the team picture can be trusted (CONTRACT
- * 4.2): the same words in text output, on stderr and in JSON `warnings`.
- * Empty when the picture is fresh and complete.
+ * One line that says how far the team state can be trusted and what to run
+ * about it: the same words on stderr after status, check, decisions and task
+ * list, in their JSON `warnings`, and in the agents' hook context. "" when
+ * the state is fresh and complete. Pure. At most TEAM_STATE_MAX characters:
+ * when several things are wrong at once the completeness clauses become one,
+ * then the remote's name is shortened.
  */
-export function freshnessWarnings(report: FreshnessReport, completeness: Completeness, remote: string): string[] {
-  const warnings: string[] = [];
-  const name = `"${shownText(remote, 80)}"`;
-  const age = report.ageSeconds === null ? "" : ` from ${formatAge(report.ageSeconds * 1000)}`;
+export function teamStateLine(report: FreshnessReport, completeness: Completeness, remote: string): string {
+  let line = "";
+  for (const [nameMax, merged] of [[40, false], [40, true], [12, true]] as const) {
+    line = stateLine(report, completeness, remote, nameMax, merged);
+    if (Array.from(line).length <= TEAM_STATE_MAX) return line;
+  }
+  return cleanText(line, TEAM_STATE_MAX); // not reached for any state (test/mvp-coordination-freshness.test.ts)
+}
+
+function stateLine(report: FreshnessReport, completeness: Completeness, remote: string, nameMax: number, merged: boolean): string {
+  const name = `"${shownText(remote, nameMax)}"`;
+  // No "from just now": an age under a second is a fetch stamped ahead of this clock as often as a recent one.
+  const age = report.ageSeconds === null || report.ageSeconds < 1 ? "" : ` from ${formatAge(report.ageSeconds * 1000)}`;
+  const lastKnown = report.freshness === "stale" ? `; showing the last known state${age}` : "";
+  const clauses: string[] = [];
+  let remedy = 'Run "huddle sync"';
   switch (report.refresh) {
     case "offline":
-      warnings.push(`could not reach remote ${name}; showing the last known state${age}`);
+      clauses.push(`could not reach remote ${name}${lastKnown}`);
       break;
     case "denied":
-      warnings.push(`remote ${name} refused a push to refs/huddle/*; run "huddle doctor". Showing the last known state${age}`);
+      clauses.push(`remote ${name} refused a push to refs/huddle/*${lastKnown}`);
+      remedy = 'Run "huddle doctor"';
       break;
     case "busy":
-      warnings.push(`another huddle sync in this clone was still running, so this is the last known state${age}`);
+      clauses.push(`another huddle sync in this clone was still running${lastKnown}`);
       break;
     case "failed":
-      warnings.push(`the refresh from remote ${name} did not finish (the reason is in the huddle log); showing the last known state${age}`);
+      clauses.push(`the refresh did not finish (the huddle log says why)${lastKnown}`);
       break;
     default:
-      break;
+      if (report.freshness !== "stale") break;
+      // Stale and younger than the limit: the last fetch is stamped ahead of this clock (classifyFreshness), so its age is unknown.
+      if (report.ageSeconds !== null && report.ageSeconds < report.staleAfterSeconds) clauses.push("the team state is stamped later than this machine's clock");
+      else clauses.push(`the team state is${age}, older than ${report.staleAfterSeconds}s`);
   }
-  if (report.freshness === "never") warnings.push(`no team state yet: this clone has never synced with remote ${name}. Run "huddle sync"`);
-  else if (report.freshness === "unreadable") warnings.push(`this clone's team state (cache.json) could not be read. Run "huddle sync" to rebuild it`);
-  else if (report.freshness === "stale" && (report.refresh === "none" || report.refresh === "ok")) {
-    // Stale and younger than the limit: the last fetch is stamped ahead of this clock (classifyFreshness), so its age is unknown.
-    if (report.ageSeconds !== null && report.ageSeconds < report.staleAfterSeconds) {
-      warnings.push(`the team state is stamped later than this machine's clock, so how old it is cannot be told. Run "huddle sync" for a current picture`);
-    } else {
-      warnings.push(`the team state is${age}, older than ${report.staleAfterSeconds}s. Run "huddle sync" for a current picture`);
-    }
+  if (report.freshness === "never") clauses.push("no team state yet: this clone has never synced");
+  else if (report.freshness === "unreadable") clauses.push("this clone's cache.json could not be read");
+  // Only completeness is wrong: no command of this clone's fixes it.
+  if (clauses.length === 0) remedy = "";
+  const { unreadableActors: hidden, uncovered } = completeness;
+  if (merged && hidden + uncovered > 0) clauses.push("the team picture is incomplete");
+  else {
+    if (hidden > 0) clauses.push(`${hidden} ${plural(hidden, "teammate's state", "teammates' states")} could not be read by this version of huddle`);
+    if (uncovered > 0) clauses.push(`${uncovered} teammate ${plural(uncovered, "session has", "sessions have")} more files in flight than ${plural(uncovered, "it", "they")} published`);
   }
-  if (completeness.unreadableActors > 0) {
-    const n = completeness.unreadableActors;
-    warnings.push(`${n} ${plural(n, "teammate's state", "teammates' states")} could not be read by this version of huddle, so ${plural(n, "its sessions are", "their sessions are")} not shown`);
-  }
-  if (completeness.uncovered > 0) {
-    const n = completeness.uncovered;
-    warnings.push(`${n} teammate ${plural(n, "session has", "sessions have")} more files in flight than ${plural(n, "it", "they")} published`);
-  }
-  return warnings;
+  const line = clauses.join("; ");
+  return remedy === "" ? line : `${line}. ${remedy}`;
 }

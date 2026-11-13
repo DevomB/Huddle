@@ -22,6 +22,8 @@ const USAGE = "huddle check [--json] [--refresh] [<path>...]   (no path: this wo
 
 export type Verdict = "overlap" | "clear" | "unknown";
 
+const UNLISTED = "this worktree's own files in flight could not be listed (git failed), so some of them may not have been checked";
+
 export async function run(args: string[], io: Io): Promise<number> {
   const { values, positionals } = parse(
     args,
@@ -54,7 +56,8 @@ export async function run(args: string[], io: Io): Promise<number> {
   const team = await readTeam(ctx, me.id, refresh);
   const view = team.view;
   const found = targets.map((path) => ({ path, overlaps: overlaps(view, path) })).filter((entry) => entry.overlaps.length > 0);
-  const warnings = listed ? team.warnings : ["this worktree's own files in flight could not be listed (git failed), so some of them may not have been checked", ...team.warnings];
+  // What makes the verdict "unknown", as the stderr lines and JSON `warnings` say it: this worktree's listing, then the team state (teamStateLine).
+  const warnings = [...(listed ? [] : [UNLISTED]), ...(team.line === "" ? [] : [team.line])];
   const trusted = listed && team.freshness.freshness === "fresh" && team.completeness.complete;
   const verdict: Verdict = found.length > 0 ? "overlap" : trusted ? "clear" : "unknown";
 
@@ -90,11 +93,10 @@ export async function run(args: string[], io: Io): Promise<number> {
   } else {
     const what = `${targets.length} path${targets.length === 1 ? "" : "s"} against ${view.sessions.length} other session${view.sessions.length === 1 ? "" : "s"}`;
     if (verdict === "clear") io.out(`no overlap: checked ${what}`);
-    else if (!listed) {
-      const refresh = team.warnings.length > 0 ? ', and "huddle check --refresh" (or "huddle sync")' : "";
-      io.out(`unknown: checked ${what}, but ${warnings.join("; ")}. Run "git status" to see why${refresh}, then check again`);
+    else {
+      const reasons = [...(listed ? [] : [`${UNLISTED}. Run "git status" to see why`]), ...(team.line === "" ? [] : [team.line])];
+      io.out(`unknown: checked ${what}, but ${reasons.join(". Also, ")}.`);
     }
-    else io.out(`unknown: checked ${what}, but the team picture cannot be trusted: ${warnings.join("; ")}. Run "huddle check --refresh" (or "huddle sync") and check again`);
   }
   for (const warning of warnings) io.err(`huddle: ${warning}`);
   return verdict === "overlap" ? EXIT.CONFLICT : verdict === "clear" ? EXIT.OK : EXIT.ERROR;
