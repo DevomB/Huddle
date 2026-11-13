@@ -29,6 +29,10 @@
 // - It reads .claude/settings.local.json from the repository root, and in a
 //   linked worktree from the main checkout's root.
 //
+// A huddle command that the agent runs in its shell is known to be this
+// session's by CLAUDE_CODE_SESSION_ID (sessionVariable, below, and
+// core/acting.ts). Nothing is written to CLAUDE_ENV_FILE.
+//
 // Cursor loads this file's hooks as well. They do nothing there, and this
 // version of huddle has no adapter for Cursor: see parsePayload().
 
@@ -84,8 +88,6 @@ const EVENT_OF_TYPE = new Map<HookEventType, string>(REGISTRATIONS.map((registra
 /** What format() needs back from parse(). */
 interface Native {
   event: string;
-  /** CLAUDE_ENV_FILE, which Claude Code gives a SessionStart hook: lines appended to it run before every later shell command. */
-  envFile?: string;
 }
 
 /**
@@ -198,8 +200,6 @@ function parsePayload(input: HookInput): HookEvent | null {
   if (type === undefined || sessionId === "") return null;
 
   const native: Native = { event: nativeEvent };
-  const envFile = asText(input.env.CLAUDE_ENV_FILE);
-  if (envFile !== "") native.envFile = envFile;
 
   const event: HookEvent = {
     type,
@@ -254,24 +254,6 @@ function parse(input: HookInput): HookEvent | null {
  */
 const MAX_CONTEXT_CHARS = 9000;
 
-// The env file is run by a shell. Nothing is quoted or escaped: a name or a
-// value is written only if every character in it is inert in a shell
-// (no space, quote, $, `, \, ;, &, |, <, >, (, ), *, ?, [, ~, #, ! or newline),
-// and is dropped otherwise.
-const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
-const ENV_VALUE = /^[A-Za-z0-9_@%+=:,./-]{1,256}$/;
-
-function envLines(event: HookEvent, outcome: HookOutcome): Array<{ path: string; line: string }> {
-  const file = asText(asRecord(event.native)?.envFile);
-  if (file === "" || outcome.env === undefined) return [];
-  const lines: Array<{ path: string; line: string }> = [];
-  for (const [name, value] of Object.entries(outcome.env)) {
-    if (typeof value !== "string" || !ENV_NAME.test(name) || !ENV_VALUE.test(value)) continue;
-    lines.push({ path: file, line: `export ${name}=${value}` });
-  }
-  return lines;
-}
-
 function format(event: HookEvent, outcome: HookOutcome): HookOutput {
   // Never print on Stop: output there tells Claude Code to keep the agent
   // going. SessionEnd output is thrown away.
@@ -280,19 +262,12 @@ function format(event: HookEvent, outcome: HookOutcome): HookOutput {
   if (nativeEvent === undefined) return SILENT;
 
   const context = typeof outcome.context === "string" && outcome.context.trim() !== "" ? clip(outcome.context, MAX_CONTEXT_CHARS) : "";
-  const appendLines = envLines(event, outcome);
-  if (context === "" && appendLines.length === 0) return SILENT;
-
-  const output: HookOutput = { stdout: "", stderr: "", exitCode: 0 };
-  if (context !== "") {
-    // One JSON object and nothing else on stdout. additionalContext is the
-    // only channel that reaches the model on all of these events (plain
-    // stdout on PreToolUse goes to the debug log), and it is advisory: there
-    // is no permissionDecision, so huddle never allows or blocks a tool call.
-    output.stdout = contextOutput(nativeEvent, context);
-  }
-  if (appendLines.length > 0) output.appendLines = appendLines;
-  return output;
+  if (context === "") return SILENT;
+  // One JSON object and nothing else on stdout. additionalContext is the
+  // only channel that reaches the model on all of these events (plain
+  // stdout on PreToolUse goes to the debug log), and it is advisory: there
+  // is no permissionDecision, so huddle never allows or blocks a tool call.
+  return { stdout: contextOutput(nativeEvent, context), stderr: "", exitCode: 0 };
 }
 
 // ---------------------------------------------------------------------------
@@ -481,6 +456,15 @@ export async function detectClaudeCode(repoRoot: string, around: Surroundings): 
 export const claudeCode: Adapter = {
   name: NAME,
   title: "Claude Code",
+  // "Set automatically to the current session ID in Bash and PowerShell tool
+  // subprocesses ... this matches the session_id field in the hook JSON input
+  // and is updated on /clear" (code.claude.com/docs/en/env-vars, read
+  // 2026-11-13). In the Bash tool since 2.1.132, which is older than the
+  // exec-form hooks these registrations need (2.1.139). Before this was used,
+  // the session-start hook wrote HUDDLE_SESSION into CLAUDE_ENV_FILE instead;
+  // that file went stale after /resume and /clear in some releases (fixed in
+  // 2.1.136 and 2.1.295), which this variable does not.
+  sessionVariable: "CLAUDE_CODE_SESSION_ID",
   detect: (repoRoot) => detectClaudeCode(repoRoot, here()),
   install,
   check: (repoRoot) => checkClaudeCode(repoRoot, here()),

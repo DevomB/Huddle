@@ -83,7 +83,7 @@ test("an event that names no session becomes the worktree's own session, with th
   assert.deepEqual(asked.waited, []);
 });
 
-test("where an agent's session is live, a git hook in that worktree counts as that session and changes nothing about it", async (t) => {
+test("where an agent's session is live, a git hook with nothing to say whose it is belongs to nobody: no session is kept alive or made", async (t) => {
   const { bob } = await aliceBuildsAuth(t);
   await fire(bob, "session-start", 20);
   await fire(bob, "prompt", 22, { prompt: "Add the login page" });
@@ -91,14 +91,16 @@ test("where an agent's session is live, a git hook in that worktree counts as th
   assert.ok(before);
   const asked = record(t);
 
-  // Whatever the event is called, and whatever session the adapter put in: it is a sign of life for the session that is here.
+  // Whoever ran git here may be the agent, a second agent, or a person at a prompt. Being the session that was active
+  // last proves nothing, so it is none of them: whatever the event is called, and whatever session the adapter put in.
   const types: HookEventType[] = ["post-edit", "prompt", "turn-end", "session-start", "session-end"];
   for (const [index, type] of types.entries()) {
     const outcome = await ambient(bob, type, 30 + index, { sessionId: "from-the-adapter", prompt: "Rewrite all of it", source: "startup", reason: "other" });
     assert.deepEqual(outcome, {}, type);
   }
-  assert.deepEqual(await sessionsOf(bob), [{ ...before, seenAt: at(34) }]);
+  assert.deepEqual(await sessionsOf(bob), [before], "not kept alive, not renamed, and no second session beside it");
   assert.ok((await seenKeys(bob)).includes("briefed"), "what the agent's session was shown is not forgotten");
+  // The clone still syncs: that publishes what is there and refreshes the team state, and keeps nobody alive.
   assert.deepEqual(
     asked.background,
     types.map(() => throttled(bob)),
@@ -106,10 +108,78 @@ test("where an agent's session is live, a git hook in that worktree counts as th
   assert.deepEqual(asked.waited, []);
 });
 
+test("a git hook run from an agent's shell is that agent's session: the agent's own variable says so", async (t) => {
+  const { bob } = await aliceBuildsAuth(t);
+  await fire(bob, "session-start", 20);
+  await fire(bob, "prompt", 22, { prompt: "Add the login page" });
+  const before = await sessionOf(bob);
+  assert.ok(before);
+
+  // Claude Code gives every shell command it runs its session id. A commit made there keeps that session alive and changes nothing else about it.
+  assert.deepEqual(await ambient(bob, "post-edit", 30, {}, { CLAUDE_CODE_SESSION_ID: "s-bob" }), {});
+  assert.deepEqual(await sessionsOf(bob), [{ ...before, seenAt: at(30) }]);
+
+  // Codex does the same. Its session is not on record here (its hooks are not trusted yet, say): the commit makes it, as Codex's.
+  const codexSession = "0199a213-81c0-7800-8aa1-bbab2a035a53";
+  assert.deepEqual(await ambient(bob, "post-edit", 40, {}, { CODEX_SESSION_ID: codexSession }), {});
+  assert.deepEqual(
+    (await sessionsOf(bob)).map((session) => [session.id, session.agent, session.seenAt]),
+    [
+      ["s-bob", "claude-code", at(30)],
+      [codexSession, "codex", at(40)],
+    ],
+  );
+
+  // An agent started from inside another one inherits the outer one's variable next to its own. Two names prove nothing.
+  assert.deepEqual(await ambient(bob, "post-edit", 50, {}, { CLAUDE_CODE_SESSION_ID: "s-bob", CODEX_SESSION_ID: codexSession }), {});
+  // So does a HUDDLE_SESSION that was inherited from somewhere else.
+  assert.deepEqual(await ambient(bob, "post-edit", 51, {}, { HUDDLE_SESSION: "s-terminal", CLAUDE_CODE_SESSION_ID: "s-bob" }), {});
+  assert.deepEqual(
+    (await sessionsOf(bob)).map((session) => [session.id, session.seenAt]),
+    [
+      ["s-bob", at(30)],
+      [codexSession, at(40)],
+    ],
+    "nobody was kept alive and nobody was made",
+  );
+  // When they agree there is nothing to doubt.
+  assert.deepEqual(await ambient(bob, "post-edit", 52, {}, { HUDDLE_SESSION: "s-bob", CLAUDE_CODE_SESSION_ID: "s-bob" }), {});
+  assert.equal((await sessionOf(bob))?.seenAt, at(52));
+});
+
+test("a commit that is nobody's is still checked, as seen from no session, and touches none", async (t) => {
+  const { bob } = await aliceBuildsAuth(t);
+  await fire(bob, "session-start", 20);
+  // The agent's session here has claimed the docs.
+  const claimed = await bob.huddle(["claim", "docs/**"], { env: { CLAUDE_CODE_SESSION_ID: "s-bob" }, now: at(21) });
+  assert.equal(claimed.code, 0, claimed.stderr);
+  const before = await sessionOf(bob);
+  assert.deepEqual(before?.claims, ["docs/**"]);
+  await publish(bob, 22);
+  const asked = record(t);
+
+  // Alice's work in another clone is warned about, whoever is committing.
+  assert.deepEqual(await ambient(bob, "pre-edit", 25, { paths: ["src/auth.ts"], native: { hook: "pre-commit" } }), { context: authWarning(25) });
+  // And the claim of the session in this very worktree is not left out as "mine": nothing says this commit is that session's.
+  const docs = await ambient(bob, "pre-edit", 26, { paths: ["docs/guide.md"], native: { hook: "pre-commit" } });
+  assert.match(docs.context ?? "", /docs\/guide\.md/);
+  assert.match(docs.context ?? "", /claude-code/);
+  // The same commit from that session's own shell has nothing to be told about its own claim.
+  assert.deepEqual(await ambient(bob, "pre-edit", 27, { paths: ["docs/guide.md"], native: { hook: "pre-commit" } }, { CLAUDE_CODE_SESSION_ID: "s-bob" }), {});
+
+  const after = await sessionsOf(bob);
+  assert.deepEqual(
+    after.map((session) => [session.id, session.seenAt]),
+    [["s-bob", at(27)]],
+    "only the commit that was the session's own kept it alive; no session was made for the others",
+  );
+  assert.deepEqual(asked.waited, []);
+});
+
 test("HUDDLE_SESSION says which session a git hook belongs to, also from another worktree, without moving it", async (t) => {
   const { bob } = await team(t);
   await publish(bob, 0);
-  // The session-start hook sets it in the agent's shell, so a commit the agent makes carries it.
+  // Someone set it in the shell git is run from, to say which session that shell is.
   await ambient(bob, "post-edit", 10, {}, { HUDDLE_SESSION: "s-terminal" });
   assert.deepEqual(
     (await sessionsOf(bob)).map((session) => [session.id, session.agent, session.worktree]),
@@ -135,24 +205,23 @@ test("HUDDLE_SESSION says which session a git hook belongs to, also from another
   );
 });
 
-test("a session that has been quiet for longer than the TTL is no longer the worktree's session", async (t) => {
+test("a session that has been quiet for the TTL no longer stands between a commit and the worktree's own session", async (t) => {
   const { bob } = await team(t);
   await fire(bob, "session-start", 0);
   await ambient(bob, "post-edit", 14 * MIN + 59);
   assert.deepEqual(
-    (await sessionsOf(bob)).map((session) => session.id),
-    ["s-bob"],
-    "one second short of the TTL the agent's session is still the one",
+    (await sessionsOf(bob)).map((session) => [session.id, session.seenAt]),
+    [["s-bob", at(0)]],
+    "one second short of the TTL the agent's session is live, so the commit could be its and is nobody's: it kept nothing alive",
   );
 
-  // Its last sign of life was that commit. Fifteen minutes later it has aged out, and a commit is somebody new.
-  const later = 14 * MIN + 59 + 15 * MIN;
-  await ambient(bob, "post-edit", later);
+  // At the TTL that session has aged out. Nobody else is here, so a commit is the worktree's own session.
+  await ambient(bob, "post-edit", 15 * MIN);
   assert.deepEqual(
     (await sessionsOf(bob)).map((session) => [session.id, session.agent, session.seenAt]),
     [
-      ["s-bob", "claude-code", at(14 * MIN + 59)],
-      [await ownSession(bob), "git", at(later)],
+      ["s-bob", "claude-code", at(0)],
+      [await ownSession(bob), "git", at(15 * MIN)],
     ],
   );
 });

@@ -53,9 +53,11 @@ export interface HookEvent {
   /**
    * The event names no session: it comes from the worktree itself (a git
    * hook). `sessionId` is ignored. The engine acts as the session a CLI
-   * command typed in the same place would act as (session.resolveSession),
-   * and treats the event like a subagent's: it keeps that session alive and
-   * is warned before an edit, and nothing else.
+   * command run in the same place and environment would act as
+   * (acting.resolveActing), and treats the event like a subagent's: it keeps
+   * that session alive and is warned before an edit, and nothing else. When
+   * nothing proves which session that is, it keeps no session alive and is
+   * warned as seen from none.
    */
   ambient?: boolean;
   /** Whatever the adapter needs to get back in format(), such as the native event name. The engine ignores it. */
@@ -73,13 +75,6 @@ export interface HookEvent {
 export interface HookOutcome {
   /** Text to put in front of the agent: a briefing or an overlap warning. Absent or "" means print nothing. */
   context?: string;
-  /**
-   * Variables the agent's later shell commands should see. The engine sets
-   * HUDDLE_SESSION on session-start, so that `huddle intent` typed by the agent
-   * lands in the session its hooks created. An adapter whose agent has no way
-   * to set environment ignores this.
-   */
-  env?: Record<string, string>;
 }
 
 /** A raw hook invocation: `huddle hook <agent> [args...]` with the payload on stdin. */
@@ -96,14 +91,6 @@ export interface HookOutput {
   stdout: string;
   stderr: string;
   exitCode: number;
-  /**
-   * Lines to append to files, for agents that take environment through a file
-   * the hook writes to (Claude Code's CLAUDE_ENV_FILE). format() stays pure:
-   * runHook does the appending, skips a line the file already contains, and
-   * swallows errors. Such a file is executed as shell code by the agent, so the
-   * adapter must build each line from values it has validated.
-   */
-  appendLines?: Array<{ path: string; line: string }>;
   /**
    * format() was given a context and this agent offers a hook no way to show
    * it on this event (Cursor's beforeSubmitPrompt can only let a prompt pass
@@ -161,6 +148,13 @@ export interface Adapter {
   name: string;
   /** Human name for init and doctor output. */
   title: string;
+  /**
+   * The environment variable in which this agent gives every shell command it
+   * runs the id of its session: the same id its hook payloads carry. It is
+   * how a huddle command the agent runs is known to come from that session
+   * (core/acting.ts). Absent for an adapter with no such variable.
+   */
+  sessionVariable?: string;
   /** Should `huddle init` install this adapter in this repo without being asked? */
   detect(repoRoot: string): Promise<boolean>;
   /** Writes the agent's hook config. Merges with what is there and is idempotent: a second run changes nothing. */

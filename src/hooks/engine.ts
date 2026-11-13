@@ -65,10 +65,11 @@
 // is not repeated before every edit of the same file.
 
 import { createHash } from "node:crypto";
-import { appendFile, mkdir, readFile, rm } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { readFile, rm } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import { ADAPTERS, getAdapter } from "../adapters/index.ts";
-import type { HookEvent, HookEventType, HookOutcome, HookOutput } from "../adapters/types.ts";
+import type { HookEvent, HookEventType, HookOutcome } from "../adapters/types.ts";
+import { MANUAL, resolveActing, sessionIdOf } from "../core/acting.ts";
 import { now as clockNow } from "../core/clock.ts";
 import type { Ctx } from "../core/context.ts";
 import { LIMITS, cleanText } from "../core/docs.ts";
@@ -80,7 +81,7 @@ import { log } from "../core/log.ts";
 import { ensureStateDir, isSetUp, loadConfig, locateRepo, sameDirectory } from "../core/paths.ts";
 import type { RepoPaths } from "../core/paths.ts";
 import { DEFAULT_BRIEFING_CHARS, formatAge, renderBriefing, renderOverlaps, shownText } from "../core/render.ts";
-import { currentView, resolveSession } from "../core/session.ts";
+import { currentView } from "../core/session.ts";
 import { readCache, readLocal, readSeen, removeSeen, removeSession, updateLocal, writeFileAtomic, writeSeen } from "../core/store.ts";
 import { spawnBackgroundSync, syncWithin } from "../core/sync.ts";
 import { createTransport } from "../core/transport.ts";
@@ -255,21 +256,6 @@ function before<T>(deadline: Deadline, work: Promise<T>): Promise<Settled<T>> {
 // Which repository, which session
 // ---------------------------------------------------------------------------
 
-/**
- * A session id the store accepts, the same one for the same input every time.
- * Ids come from agents: anything that is not one clean line is made one, and
- * an id over the limit keeps its start and gets a hash of the whole in place
- * of the rest, so that two long ids stay two sessions. "" when there is
- * nothing to use.
- */
-export function sessionIdOf(raw: unknown): string {
-  const flat = cleanText(raw, Number.MAX_SAFE_INTEGER);
-  const chars = Array.from(flat);
-  if (chars.length <= LIMITS.sessionId) return flat;
-  const hash = createHash("sha256").update(flat).digest("hex").slice(0, 16);
-  return `${chars.slice(0, LIMITS.sessionId - 17).join("").trimEnd()}-${hash}`;
-}
-
 interface Where {
   /** The worktree the event is about: where the session is, and what the event's paths are checked against. */
   paths: RepoPaths;
@@ -319,8 +305,17 @@ async function locate(event: HookEvent, io: Io): Promise<Where | null> {
 interface Run {
   event: HookEvent;
   io: Io;
-  /** The session id, cleaned. */
+  /** The session id, cleaned. "" when `unbound`. */
   id: string;
+  /**
+   * The event names no session, and nothing proves which session of this
+   * worktree it comes from (acting.resolveActing). It keeps no session alive
+   * and creates none, and what it is warned about is the team as seen from no
+   * session: nobody is left out as "this one".
+   */
+  unbound: boolean;
+  /** Session.agent for a session this event creates. */
+  label: string;
   /** The worktree the event is about (Where.paths). */
   paths: RepoPaths;
   /** The set-up checkout the event goes by (Where.home). Both share one state directory. */
@@ -410,7 +405,8 @@ function isNews(touched: Touched | null): boolean {
  * Creates the session or marks it as just seen, in one locked update.
  * `intent`, when not empty, becomes the session's intent. Null when the
  * session could not be recorded (the store is busy or broken): that is
- * logged, and the caller carries on without it.
+ * logged, and the caller carries on without it. Null as well, and nothing
+ * logged, for an event that is nobody's (Run.unbound).
  *
  * With prompt capture off, an intent that was taken from a prompt is taken
  * back here, at whatever event of the session comes first. Capture can be
@@ -420,8 +416,10 @@ function isNews(touched: Touched | null): boolean {
  */
 async function touch(run: Run, intent = ""): Promise<Touched | null> {
   const { event, id, paths, now, passive } = run;
+  // Not this event's to keep alive: it could be anyone's.
+  if (run.unbound) return null;
   const at = now.toISOString();
-  const agent = cleanText(event.agent, LIMITS.name) || "unknown";
+  const agent = run.label;
   let created = false;
   let moved = false;
   let intentChanged = false;
@@ -567,8 +565,7 @@ function dueUpdate(view: TeamView, since: Seen | null, room?: number): { text: s
 
 async function sessionStart(run: Run): Promise<Prepared> {
   const { id, paths, io, deadline } = run;
-  // Set whatever happens below: `huddle intent` typed by the agent should land in this session.
-  const outcome: HookOutcome = { env: { HUDDLE_SESSION: id } };
+  const outcome: HookOutcome = {};
   // What the session was shown before means nothing to a context that is new,
   // cleared or compacted. Forgotten first, so that a briefing that fails below
   // is made up for by a full one at the next prompt.
@@ -970,40 +967,52 @@ async function sessionEnd(run: Run): Promise<Prepared> {
 }
 
 /**
- * The session of an event that names none: the one a CLI command typed in the
- * same worktree would act as (HUDDLE_SESSION, else the session last active in
- * this worktree, else the worktree's manual session).
+ * Whose an event is that names no session: the session a command run in the
+ * same worktree and environment would act as (core/acting.ts). A commit made
+ * by an agent's shell carries that agent's variable and is its session's; a
+ * commit in a worktree nobody else is in is the worktree's own; and where
+ * another session is live and nothing says the commit is its, the event is
+ * nobody's (Run.unbound). It is never the session that happened to be active
+ * last.
  */
-async function ambientSession(run: Run): Promise<string> {
-  const ctx = contextFor(run, await getIdentityFast(run.home));
+async function ambient(run: Run): Promise<void> {
   // "This worktree" is the one the event happened in.
-  return (await resolveSession({ ...ctx, paths: run.paths })).id;
+  const acting = await resolveActing({ io: run.io, paths: run.paths, config: run.config, now: run.now });
+  if (acting.id === null) {
+    run.unbound = true;
+    return;
+  }
+  run.id = acting.id;
+  // A session this event creates is the agent's whose variable named it. Otherwise it is the worktree's own, made by a git hook.
+  if (acting.agent !== MANUAL) run.label = acting.agent;
 }
 
 async function prepare(event: HookEvent, io: Io, deadline: Deadline, patience: number, trace: Trace): Promise<Prepared> {
   if (typeof event.type !== "string" || !Object.hasOwn(DEADLINE_MS, event.type)) return { outcome: {} };
-  const ambient = event.ambient === true;
-  const named = ambient ? "" : sessionIdOf(event.sessionId);
-  if (!ambient && named === "") return { outcome: {} };
+  const nameless = event.ambient === true;
+  const named = nameless ? "" : sessionIdOf(event.sessionId);
+  if (!nameless && named === "") return { outcome: {} };
   const where = await locate(event, io);
   // An event that names no session says nothing about the sessions of a repository it did not happen in.
-  if (where === null || (ambient && where.away)) return { outcome: {} };
+  if (where === null || (nameless && where.away)) return { outcome: {} };
   trace.paths = where.paths;
   const run: Run = {
     event,
     io,
     id: named,
+    unbound: false,
+    label: cleanText(event.agent, LIMITS.name) || "unknown",
     paths: where.paths,
     home: where.home,
     config: await loadConfig(where.home),
     away: where.away,
-    passive: ambient || event.subagent === true,
+    passive: nameless || event.subagent === true,
     now: clockNow(io.env),
     deadline,
     patience,
   };
-  if (ambient) run.id = await ambientSession(run);
-  if (run.id === "") return { outcome: {} };
+  if (nameless) await ambient(run);
+  if (run.id === "" && !run.unbound) return { outcome: {} };
 
   if (run.passive && event.type !== "pre-edit") return heartbeat(run);
   switch (event.type) {
@@ -1065,33 +1074,6 @@ export async function handleEvent(event: HookEvent, io: Io): Promise<HookOutcome
 // The hook command
 // ---------------------------------------------------------------------------
 
-/**
- * Appends each line to its file unless the file already has that line. Such a
- * file is run as shell code by the agent, so a "line" with a line break in it
- * is refused here whatever the adapter checked. Errors are swallowed.
- * Exported for tests.
- */
-export async function appendLines(entries: HookOutput["appendLines"]): Promise<void> {
-  if (!Array.isArray(entries)) return;
-  for (const entry of entries) {
-    try {
-      if (typeof entry?.path !== "string" || typeof entry.line !== "string") continue;
-      if (entry.path === "" || entry.line === "" || /[\r\n]/.test(entry.line)) continue;
-      let existing = "";
-      try {
-        existing = await readFile(entry.path, "utf8");
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      }
-      if (existing.split(/\r?\n/).includes(entry.line)) continue;
-      await mkdir(dirname(entry.path), { recursive: true });
-      await appendFile(entry.path, `${existing !== "" && !existing.endsWith("\n") ? "\n" : ""}${entry.line}\n`);
-    } catch {
-      // The agent goes without the variable; nothing here depends on it.
-    }
-  }
-}
-
 function exitCodeOf(code: unknown): number {
   return typeof code === "number" && Number.isInteger(code) && code >= 0 && code <= 255 ? code : EXIT.OK;
 }
@@ -1135,7 +1117,6 @@ export async function runHook(args: string[], io: Io): Promise<number> {
     }
 
     const output = adapter.format(event, prepared.value.outcome);
-    await before(deadline, appendLines(output.appendLines));
     if (typeof output.stdout === "string" && output.stdout !== "") io.out(output.stdout);
     if (typeof output.stderr === "string" && output.stderr !== "") io.err(output.stderr);
     // What the adapter had no way to show is not recorded as shown: it comes up again at the next event.

@@ -90,9 +90,17 @@ test("a snapshot is stable across reads and changes when the clone changes", asy
   assert.deepEqual({ ...reconfigured, config: null }, { ...configured, config: null }, "and nothing else changed");
 });
 
-test("what the shell that runs the tests carries does not reach them: git's variables, a session id, an agent's env file", () => {
+test("what the shell that runs the tests carries does not reach them: git's variables, a session id, an agent's own session", () => {
   // In a process of its own: this one was cleaned when it loaded the harness.
-  const carried = { CLAUDE_ENV_FILE: "/somewhere/real", GIT_DIR: "/somewhere/.git", HUDDLE_SESSION: "the-agent", HUDDLE_NOW: "2001-01-01T00:00:00Z" };
+  const carried = {
+    CLAUDE_CODE_SESSION_ID: "6835a033-358b-4497-a94e-356ac1bac1e3",
+    CLAUDE_ENV_FILE: "/somewhere/real",
+    CODEX_SESSION_ID: "0199a213-81c0-7800-8aa1-bbab2a035a53",
+    CODEX_THREAD_ID: "0199a213-81c0-7800-8aa1-bbab2a035a54",
+    GIT_DIR: "/somewhere/.git",
+    HUDDLE_SESSION: "the-agent",
+    HUDDLE_NOW: "2001-01-01T00:00:00Z",
+  };
   const script = `await import(${JSON.stringify(pathToFileURL(join(import.meta.dirname, "harness.ts")).href)}); console.log(JSON.stringify(Object.keys(${JSON.stringify(carried)}).filter((name) => name in process.env)));`;
   const run = spawnSync(process.execPath, ["--input-type=module", "-e", script], { env: { ...process.env, ...carried }, encoding: "utf8" });
   assert.equal(run.status, 0, run.stderr);

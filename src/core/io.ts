@@ -14,6 +14,14 @@ export interface Io {
   env: NodeJS.ProcessEnv;
   /** Absolute path of the running huddle script, for vendoring and for spawning a background sync. */
   self: string;
+  /**
+   * The global option `--session <id>`, when it was given: the session this
+   * one command says it is (core/acting.ts). cli.ts takes it off the command
+   * line, so no command sees or parses it.
+   */
+  session?: string;
+  /** This run's arguments, the command name first, without the global options. For a message that shows the command line again. */
+  argv?: string[];
   /** Write one line to stdout. A trailing newline is added. */
   out(text: string): void;
   /** Write one line to stderr. A trailing newline is added. */

@@ -26,8 +26,9 @@
 //   and Linux, cmd.exe on Windows. There is no exec form. Since it is a shell
 //   command anyway, it starts with checks that node and the bundle exist.
 // - SessionEnd hooks get three seconds at most.
-// - There is no way for a hook to set a variable in the agent's shell, so
-//   HUDDLE_SESSION is not passed on.
+// - A hook cannot set a variable in the agent's shell. It does not need to:
+//   Codex gives every shell command CODEX_SESSION_ID, the id its hooks get as
+//   session_id (sessionVariable, below).
 // - Project hooks run only in a trusted project, and only once each hook has
 //   been reviewed in /hooks. A changed hook definition has to be reviewed again.
 
@@ -352,6 +353,14 @@ export async function detectCodex(repoRoot: string, around: Surroundings): Promi
 export const codex: Adapter = {
   name: NAME,
   title: "Codex",
+  // Codex's own source at rust-v0.167.0: core/src/exec_env.rs sets
+  // CODEX_SESSION_ID in a shell command's environment from
+  // session.session_id(), and core/src/hook_runtime.rs sends that same value
+  // to every hook as session_id. It is "the identity shared by the root thread
+  // and all descendant threads" (core/src/session/session.rs), so a subagent's
+  // commands and hooks carry the parent session's id alike. CODEX_THREAD_ID is
+  // the subagent's own thread and names no session of huddle's.
+  sessionVariable: "CODEX_SESSION_ID",
   detect: (repoRoot) => detectCodex(repoRoot, here()),
   install,
   check: (repoRoot) => checkCodex(repoRoot, here()),

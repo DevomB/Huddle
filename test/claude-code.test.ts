@@ -288,10 +288,16 @@ test("parse: a subagent is known by agent_id; agent_type alone is a session star
   assert.equal(stopInside?.subagent, true);
 });
 
-test("parse: remembers the env file a SessionStart hook is given", () => {
+test("parse: the env file a SessionStart hook is given is not huddle's to write, and nothing of it is kept", () => {
   const event = parse(fixtureText("session-start.startup"), { CLAUDE_ENV_FILE: ENV_FILE });
-  assert.deepEqual(event?.native, { event: "SessionStart", envFile: ENV_FILE });
-  assert.deepEqual(parse(fixtureText("session-start.startup"), { CLAUDE_ENV_FILE: "" })?.native, { event: "SessionStart" });
+  assert.deepEqual(event?.native, { event: "SessionStart" });
+  assert.equal(JSON.stringify(event).includes(ENV_FILE), false);
+});
+
+test("the session variable is the one Claude Code gives its shell commands, and a payload's session id is that session", () => {
+  // code.claude.com/docs/en/env-vars: "this matches the session_id field in the hook JSON input".
+  assert.equal(claudeCode.sessionVariable, "CLAUDE_CODE_SESSION_ID");
+  assert.equal(parse(fixtureText("session-start.startup"))?.sessionId, RUN1);
 });
 
 test("parse: session-start and session-end pass on Claude Code's own word for why", () => {
@@ -354,7 +360,7 @@ test("format: context goes out as one JSON object with additionalContext under t
     const output = claudeCode.format(eventOf(type), { context: BRIEFING });
     assert.equal(output.exitCode, 0);
     assert.equal(output.stderr, "");
-    assert.equal(output.appendLines, undefined);
+    assert.deepEqual(Object.keys(output).sort(), ["exitCode", "stderr", "stdout"], "a hook prints, and writes no file");
     assert.equal(output.stdout.includes("\n"), false, "a single line");
     assert.deepEqual(JSON.parse(output.stdout), { hookSpecificOutput: { hookEventName: native, additionalContext: BRIEFING } });
   }
@@ -362,7 +368,7 @@ test("format: context goes out as one JSON object with additionalContext under t
 
 test("format: huddle never decides a permission or blocks anything", () => {
   for (const [type] of NATIVE_NAME) {
-    const output = claudeCode.format(eventOf(type), { context: "src/auth.ts overlaps alice's work", env: { HUDDLE_SESSION: RUN1 } });
+    const output = claudeCode.format(eventOf(type), { context: "src/auth.ts overlaps alice's work" });
     const printed = JSON.parse(output.stdout) as Json;
     assert.deepEqual(Object.keys(printed), ["hookSpecificOutput"]);
     assert.deepEqual(Object.keys(printed.hookSpecificOutput as Json).sort(), ["additionalContext", "hookEventName"]);
@@ -375,16 +381,15 @@ test("format: nothing to say prints nothing", () => {
     assert.equal(claudeCode.format(eventOf(type), {}), SILENT);
     assert.equal(claudeCode.format(eventOf(type), { context: "" }), SILENT);
     assert.equal(claudeCode.format(eventOf(type), { context: "  \n\t " }), SILENT);
-    assert.equal(claudeCode.format(eventOf(type), { env: { HUDDLE_SESSION: RUN1 } }), SILENT, "no env file to write to");
   }
   assert.deepEqual(SILENT, { stdout: "", stderr: "", exitCode: 0 });
 });
 
 test("format: turn-end and session-end print nothing, whatever the outcome says", () => {
   // Output on Stop makes Claude Code keep the agent going instead of stopping.
-  const native = { event: "Stop", envFile: ENV_FILE };
+  const native = { event: "Stop" };
   for (const type of ["turn-end", "session-end"] as const) {
-    assert.equal(claudeCode.format(eventOf(type, native), { context: BRIEFING, env: { HUDDLE_SESSION: RUN1 } }), SILENT);
+    assert.equal(claudeCode.format(eventOf(type, native), { context: BRIEFING }), SILENT);
     assert.equal(claudeCode.format(eventOf(type), {}), SILENT);
   }
 });
@@ -404,68 +409,14 @@ test("format: every recorded payload goes in and comes out under the same event 
   }
 });
 
-test("format: session-start hands HUDDLE_SESSION to the agent's shell through the env file", () => {
+test("format: a session-start with an env file prints its context and asks for nothing else", () => {
   const event = parse(fixtureText("session-start.startup"), { CLAUDE_ENV_FILE: ENV_FILE });
   assert.ok(event);
-  const output = claudeCode.format(event, { context: BRIEFING, env: { HUDDLE_SESSION: event.sessionId } });
-  assert.deepEqual(output.appendLines, [{ path: ENV_FILE, line: `export HUDDLE_SESSION=${RUN1}` }]);
+  const output = claudeCode.format(event, { context: BRIEFING });
+  assert.deepEqual(Object.keys(output).sort(), ["exitCode", "stderr", "stdout"]);
   assert.equal((JSON.parse(output.stdout) as { hookSpecificOutput: Json }).hookSpecificOutput.hookEventName, "SessionStart");
-
-  const quiet = claudeCode.format(event, { env: { HUDDLE_SESSION: event.sessionId } });
-  assert.deepEqual(quiet, { stdout: "", stderr: "", exitCode: 0, appendLines: [{ path: ENV_FILE, line: `export HUDDLE_SESSION=${RUN1}` }] });
-
-  const noFile = parse(fixtureText("session-start.startup"));
-  assert.ok(noFile);
-  assert.equal(claudeCode.format(noFile, { context: BRIEFING, env: { HUDDLE_SESSION: RUN1 } }).appendLines, undefined);
-  assert.equal(claudeCode.format(event, { context: BRIEFING }).appendLines, undefined);
-  assert.equal(claudeCode.format(event, { context: BRIEFING, env: {} }).appendLines, undefined);
-});
-
-test("format: the env file is shell code, so a value that a shell would act on is dropped, not quoted", () => {
-  const event = eventOf("session-start", { event: "SessionStart", envFile: ENV_FILE });
-  const lines = (env: Record<string, string>) => (claudeCode.format(event, { env }).appendLines ?? []).map((item) => item.line);
-
-  const unsafe = [
-    "",
-    "two words",
-    "$(touch /tmp/pwned)",
-    "`touch /tmp/pwned`",
-    "$HOME",
-    "a;touch /tmp/pwned",
-    "a&&b",
-    "a|b",
-    "a>b",
-    "a<b",
-    "a\nexport PATH=/evil",
-    "a\rb",
-    "a\tb",
-    "it's",
-    'say "hi"',
-    "back\\slash",
-    "~/x",
-    "*",
-    "a?b",
-    "[ab]",
-    "{a,b}",
-    "#comment",
-    "!history",
-    "(sub)",
-    "caf" + String.fromCodePoint(0xe9),
-    "x".repeat(257),
-  ];
-  for (const value of unsafe) assert.deepEqual(lines({ HUDDLE_SESSION: value }), [], JSON.stringify(value));
-
-  for (const name of ["", "1ST", "WITH-DASH", "WITH SPACE", "A=B", "A;B", "A$B", "caf" + String.fromCodePoint(0xe9), "X".repeat(65)]) {
-    assert.deepEqual(lines({ [name]: "fine" }), [], JSON.stringify(name));
-  }
-
-  assert.deepEqual(lines({ HUDDLE_SESSION: "sess_01.A-b:c/d@e%f+g=h,i", _x9: "1", BAD: "no good", ALSO: "x".repeat(256) }), [
-    "export HUDDLE_SESSION=sess_01.A-b:c/d@e%f+g=h,i",
-    "export _x9=1",
-    `export ALSO=${"x".repeat(256)}`,
-  ]);
-  // A value that is not a string cannot be trusted to print as one.
-  assert.deepEqual(lines({ HUDDLE_SESSION: 12345 as unknown as string }), []);
+  assert.equal(output.stdout.includes("HUDDLE_SESSION"), false);
+  assert.equal(claudeCode.format(event, {}), SILENT);
 });
 
 test("format: context too long for Claude Code is cut at a line, with a pointer to the rest", () => {

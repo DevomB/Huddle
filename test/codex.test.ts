@@ -265,17 +265,21 @@ test("format: nothing to say prints nothing", () => {
 test("format: turn-end and session-end print nothing, whatever the outcome says", () => {
   // Stop accepts JSON only, and a decision there makes Codex start another turn.
   for (const type of ["turn-end", "session-end"] as const) {
-    assert.equal(codex.format(eventOf(type), { context: BRIEFING, env: { HUDDLE_SESSION: SESSION } }), SILENT);
+    assert.equal(codex.format(eventOf(type), { context: BRIEFING }), SILENT);
   }
 });
 
-test("format: Codex has no way to set the agent's environment, so env is never acted on", () => {
+test("format: a hook prints, and writes no file", () => {
   for (const [type] of NATIVE_NAME) {
-    assert.equal(codex.format(eventOf(type), { env: { HUDDLE_SESSION: SESSION } }), SILENT);
-    const output = codex.format(eventOf(type), { context: BRIEFING, env: { HUDDLE_SESSION: SESSION } });
-    assert.equal(output.appendLines, undefined);
+    const output = codex.format(eventOf(type), { context: BRIEFING });
+    assert.deepEqual(Object.keys(output).sort(), ["exitCode", "stderr", "stdout"]);
     assert.equal(output.stdout.includes("HUDDLE_SESSION"), false);
   }
+});
+
+test("the session variable is the one Codex gives every shell command: the id its hooks get as session_id", () => {
+  // rust-v0.167.0: core/src/exec_env.rs (CODEX_SESSION_ID) and core/src/hook_runtime.rs (session_id), both from session.session_id().
+  assert.equal(codex.sessionVariable, "CODEX_SESSION_ID");
 });
 
 test("format: every fixture goes in and comes out under the same event name", () => {

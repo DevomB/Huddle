@@ -9,8 +9,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { chmod, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { delimiter, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -19,7 +18,7 @@ import type { Adapter, HookEvent, HookEventType } from "../src/adapters/types.ts
 import { run as hookCommand, limitLifetime } from "../src/commands/hook.ts";
 import { seenFile } from "../src/core/paths.ts";
 import { OVERLAP_HINT } from "../src/core/render.ts";
-import { DEADLINE_MS, appendLines, lifetimeMs, runHook } from "../src/hooks/engine.ts";
+import { DEADLINE_MS, lifetimeMs, runHook } from "../src/hooks/engine.ts";
 import { toIntent } from "../src/hooks/intent.ts";
 import {
   ALONE,
@@ -220,9 +219,10 @@ test("Claude Code, from its recorded payloads: a briefing at the start, one warn
   const claude = (name: string, seconds: number, env: NodeJS.ProcessEnv = {}, over: Json = {}): Promise<Ran> =>
     hook(bob, "claude-code", recorded("claude-code", name, bob, over), seconds, env);
 
-  // SessionStart: the briefing goes to the model, and HUDDLE_SESSION to the agent's shell.
+  // SessionStart: the briefing goes to the model. Nothing goes into the env file: the agent's shell has Claude Code's own
+  // CLAUDE_CODE_SESSION_ID, which is how a huddle command run there is known to be this session's.
   assert.deepEqual(await claude("session-start.startup", 20, { CLAUDE_ENV_FILE: envFile }), says("SessionStart", text(FULL_HEAD, notesLine(20), FULL_FOOT)));
-  assert.equal(await readFile(envFile, "utf8"), `export HUDDLE_SESSION=${CLAUDE_SESSION}\n`);
+  assert.equal(existsSync(envFile), false);
   assert.deepEqual(
     (await sessionsOf(bob)).map((session) => [session.id, session.agent, session.worktree]),
     [[CLAUDE_SESSION, "claude-code", bob.dir]],
@@ -259,10 +259,10 @@ test("Claude Code, from its recorded payloads: a briefing at the start, one warn
   assert.equal(asked.waited.length, 1);
   assert.deepEqual(asked.background, [forced(bob), throttled(bob), forced(bob), forced(bob)]);
 
-  // The session starts again (a resume, /clear, a compaction). Claude Code names the same file, and the line is in it once.
+  // The session starts again (a resume, /clear, a compaction): briefed again, and the file is still not written.
   const again = await claude("session-start.startup", 50, { CLAUDE_ENV_FILE: envFile }, { source: "clear" });
   assert.deepEqual(again, says("SessionStart", text(FULL_HEAD, notesLine(50), FULL_FOOT)));
-  assert.equal(await readFile(envFile, "utf8"), `export HUDDLE_SESSION=${CLAUDE_SESSION}\n`);
+  assert.equal(existsSync(envFile), false);
 });
 
 test("Codex, from its recorded payloads: the paths in a patch count from where the command runs", async (t) => {
@@ -464,8 +464,8 @@ test("an adapter that throws, or answers with nonsense, costs the output and nev
     codex.format = () => nonsense as never;
     assert.deepEqual(await run(22), SILENT, JSON.stringify(nonsense));
   }
-  // What is printed has to be text, and the lines for a file a list.
-  codex.format = () => ({ stdout: 42, stderr: { text: "x" }, exitCode: 0, appendLines: "export A=1" }) as never;
+  // What is printed has to be text.
+  codex.format = () => ({ stdout: 42, stderr: { text: "x" }, exitCode: 0 }) as never;
   assert.deepEqual(await run(23), SILENT);
 
   // The exit code is the adapter's to ask for, where its agent's protocol needs one: a whole number from 0 to 255. Anything else is 0.
@@ -631,57 +631,6 @@ test("an adapter with no way to show a context says so, and the news is kept for
   assert.deepEqual(await run("post-tool-use.apply-patch", 58, edit), SILENT);
 });
 
-test("appendLines adds a line to a file once, makes the directory, and refuses a line that is more than one", async (t) => {
-  const dir = await mkdtemp(join(tmpdir(), "huddle-hook-"));
-  t.after(() => rm(dir, { recursive: true, force: true }));
-  const line = "export HUDDLE_SESSION=abc";
-
-  const file = join(dir, "not", "there", "yet", "env.sh");
-  await appendLines([{ path: file, line }]);
-  assert.equal(await readFile(file, "utf8"), `${line}\n`);
-  await appendLines([
-    { path: file, line },
-    { path: file, line },
-  ]);
-  assert.equal(await readFile(file, "utf8"), `${line}\n`, "a line the file has is not added again");
-  await appendLines([
-    { path: file, line: "export A=1" },
-    { path: file, line: "export B=2" },
-    { path: file, line: "export A=1" },
-  ]);
-  assert.equal(await readFile(file, "utf8"), `${line}\nexport A=1\nexport B=2\n`);
-
-  // A file somebody else wrote: without a newline at its end, with Windows line ends, with the line as part of another.
-  const theirs = join(dir, "theirs.sh");
-  await writeFile(theirs, "export X=1");
-  await appendLines([{ path: theirs, line }]);
-  assert.equal(await readFile(theirs, "utf8"), `export X=1\n${line}\n`);
-  await writeFile(theirs, `export X=1\r\n${line}\r\n`);
-  await appendLines([{ path: theirs, line }]);
-  assert.equal(await readFile(theirs, "utf8"), `export X=1\r\n${line}\r\n`);
-  await writeFile(theirs, `# ${line}\n`);
-  await appendLines([{ path: theirs, line }]);
-  assert.equal(await readFile(theirs, "utf8"), `# ${line}\n${line}\n`);
-
-  // The agent runs the file as shell code: a "line" with a line break in it would be a second command.
-  const never = join(dir, "never.sh");
-  await appendLines([
-    { path: never, line: "export A=1\nrm -rf ~" },
-    { path: never, line: "export A=1\rrm -rf ~" },
-    { path: never, line: "" },
-    { path: "", line },
-  ]);
-  assert.equal(existsSync(never), false);
-
-  // Entries that are none are skipped, a file that cannot be written is given up on, and what comes after still counts.
-  const odd = [null, 42, "export A=1", { path: never }, { line }, { path: 7, line }, { path: dir, line }, { path: join(file, "below-a-file.sh"), line }, { path: never, line: "export OK=1" }];
-  await appendLines(odd as never);
-  assert.equal(await readFile(never, "utf8"), "export OK=1\n");
-
-  // And what is not a list is nothing.
-  for (const entries of [undefined, null, "export A=1", 7, {}, { length: 1 }]) await appendLines(entries as never);
-});
-
 // ---------------------------------------------------------------------------
 // The hook command
 // ---------------------------------------------------------------------------
@@ -773,7 +722,7 @@ test("through the bundle: two Claude Code sessions on two clones, from the first
   // Alice starts. Nobody else is here.
   const aliceEnv = join(h.root, "alice-env.sh");
   assert.deepEqual(await claude(alice, ALICE, "session-start.startup", 0, {}, { CLAUDE_ENV_FILE: aliceEnv }), prints("SessionStart", ALONE));
-  assert.equal(await readFile(aliceEnv, "utf8"), `export HUDDLE_SESSION=${ALICE}\n`);
+  assert.equal(existsSync(aliceEnv), false, "huddle writes nothing into the agent's shell environment");
   assert.deepEqual(await claude(alice, ALICE, "user-prompt-submit.typed", 5, { prompt: AUTH_PROMPT }), QUIET);
   await alice.write("src/auth.ts", "export const auth = true;\n");
   assert.deepEqual(await claude(alice, ALICE, "post-tool-use.write", 10, writes(alice, "src/auth.ts")), QUIET);
@@ -786,10 +735,10 @@ test("through the bundle: two Claude Code sessions on two clones, from the first
   assert.deepEqual(await claude(bob, BOB, "pre-tool-use.write", 25, writes(bob, "src/auth.ts")), prints("PreToolUse", authWarning(25)));
   assert.deepEqual(await claude(bob, BOB, "pre-tool-use.edit", 26, writes(bob, "src/auth.ts")), QUIET);
 
-  // His agent says so, as the warning asks, from its shell: the variable from the SessionStart hook makes it the same session.
-  const exported = /^export HUDDLE_SESSION=(\S+)$/m.exec(await readFile(bobEnv, "utf8"))?.[1];
-  assert.equal(exported, BOB);
-  const stated = await bob.huddle(["intent", "Pair with alice on the auth module"], { session: exported, now: at(27) });
+  // His agent says so, as the warning asks, from its shell. Claude Code gives that shell the session's id in
+  // CLAUDE_CODE_SESSION_ID, and that makes the command the same session as the hooks'.
+  assert.equal(existsSync(bobEnv), false);
+  const stated = await bob.huddle(["intent", "Pair with alice on the auth module"], { env: { CLAUDE_CODE_SESSION_ID: BOB }, now: at(27) });
   assert.deepEqual([stated.code, stated.stderr], [0, ""]);
   assert.deepEqual(
     (await sessionsOf(bob)).map((session) => [session.id, session.agent, session.intent, session.intentSource]),

@@ -11,8 +11,6 @@ import { ADAPTERS, getAdapter } from "../src/adapters/index.ts";
 import { SILENT } from "../src/adapters/types.ts";
 import type { HookInput } from "../src/adapters/types.ts";
 import type { GitResult } from "../src/core/git.ts";
-import { manualSessionId } from "../src/core/identity.ts";
-import { pathsFor } from "../src/core/paths.ts";
 import { BUNDLE as BUILT_BUNDLE, BUNDLE_NODE, createHarness } from "./harness.ts";
 import type { Clone, Harness } from "./harness.ts";
 
@@ -253,21 +251,20 @@ test("git block: the command lines, word for word", () => {
 // ---------------------------------------------------------------------------
 
 const CWD = "/home/dev/acme";
-const MANUAL = manualSessionId(pathsFor(CWD, CWD, CWD), {});
 
 function input(args: string[], stdin = "", env: NodeJS.ProcessEnv = {}, cwd = CWD): HookInput {
   return { args, stdin, env, cwd };
 }
 
-test("git parse: the post hooks are signs of life in the worktree's own session", () => {
+test("git parse: the post hooks are signs of life that name no session", () => {
   for (const hook of ["post-commit", "post-checkout", "post-merge"]) {
-    assert.deepEqual(gitHooks.parse(input([hook])), { type: "post-edit", agent: "git", sessionId: MANUAL, cwd: CWD, ambient: true, native: { hook } });
+    assert.deepEqual(gitHooks.parse(input([hook])), { type: "post-edit", agent: "git", sessionId: "", cwd: CWD, ambient: true, native: { hook } });
   }
   // Whatever git hands a hook as arguments or input is not huddle's business.
   assert.deepEqual(gitHooks.parse(input(["post-checkout", "abc", "def", "1"], "junk")), {
     type: "post-edit",
     agent: "git",
-    sessionId: MANUAL,
+    sessionId: "",
     cwd: CWD,
     ambient: true,
     native: { hook: "post-checkout" },
@@ -278,7 +275,7 @@ test("git parse: pre-commit carries the staged paths", () => {
   assert.deepEqual(gitHooks.parse(input(["pre-commit"], "src/a.ts\0docs/read me.md\0we\nird.ts\0")), {
     type: "pre-edit",
     agent: "git",
-    sessionId: MANUAL,
+    sessionId: "",
     cwd: CWD,
     ambient: true,
     native: { hook: "pre-commit" },
@@ -297,28 +294,15 @@ test("git parse: pre-commit carries the staged paths", () => {
   assert.equal(paths[MAX_STAGED_PATHS - 1], `src/file-${MAX_STAGED_PATHS - 1}.ts`);
 });
 
-test("git parse: a commit made from an agent's shell belongs to that agent's session, as a guest", () => {
-  const event = gitHooks.parse(input(["post-commit"], "", { HUDDLE_SESSION: "claude-7f3a" }));
-  assert.equal(event?.sessionId, "claude-7f3a");
-  assert.equal(event?.subagent, true, "it must not relabel or move the agent's session");
-  assert.equal(event?.ambient, true);
-  // An empty or blank variable is no session.
-  for (const blank of ["", "   "]) {
-    const own = gitHooks.parse(input(["post-commit"], "", { HUDDLE_SESSION: blank }));
-    assert.equal(own?.sessionId, MANUAL);
-    assert.equal(own?.subagent, undefined);
+test("git parse: whose the commit is, is not the adapter's to say, whatever the environment holds", () => {
+  // The engine works it out, the way a command in the same place and environment would (core/acting.ts, test/engine-ambient.test.ts).
+  const bare = gitHooks.parse(input(["post-commit"]));
+  for (const env of [{ HUDDLE_SESSION: "claude-7f3a" }, { CLAUDE_CODE_SESSION_ID: "6835a033-358b-4497-a94e-356ac1bac1e3" }, { CODEX_SESSION_ID: "0199a213-81c0-7800-8aa1-bbab2a035a53" }]) {
+    assert.deepEqual(gitHooks.parse(input(["post-commit"], "", env)), bare, JSON.stringify(env));
   }
-});
-
-test("git parse: the session id is the one the CLI uses in the same worktree", async (t) => {
-  const h = await createHarness(t);
-  const alice = await h.clone("alice");
-  const tree = await alice.addWorktree("side");
-  const inMain = gitHooks.parse(input(["post-commit"], "", {}, alice.dir));
-  const inTree = gitHooks.parse(input(["post-commit"], "", {}, tree.dir));
-  assert.equal(inMain?.sessionId, manualSessionId(await alice.paths(), {}));
-  assert.equal(inTree?.sessionId, manualSessionId(await tree.paths(), {}));
-  assert.notEqual(inMain?.sessionId, inTree?.sessionId);
+  assert.equal(bare?.sessionId, "");
+  assert.equal(bare?.ambient, true);
+  assert.equal(bare !== null && "subagent" in bare, false);
 });
 
 test("git parse: null for everything that is not one of the four hooks with something to say, and never a throw", () => {
@@ -347,7 +331,6 @@ test("git format: an overlap warning goes to the terminal and the commit goes ah
   });
   assert.equal(gitHooks.format(pre, {}), SILENT);
   assert.equal(gitHooks.format(pre, { context: "  \n" }), SILENT);
-  assert.equal(gitHooks.format(pre, { env: { HUDDLE_SESSION: "x" } }), SILENT, "a git hook cannot set anyone's environment");
   // The post hooks run with no terminal: nothing is ever printed for them.
   assert.equal(gitHooks.format(post, { context: warning }), SILENT);
 });

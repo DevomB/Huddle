@@ -61,10 +61,8 @@
 
 import { chmod, lstat, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { cleanText, LIMITS } from "../core/docs.ts";
 import { git } from "../core/git.ts";
-import { manualSessionId } from "../core/identity.ts";
-import { locateRepo, pathsFor } from "../core/paths.ts";
+import { locateRepo } from "../core/paths.ts";
 import { bundlePath, exists } from "./json-hooks.ts";
 import { SILENT } from "./types.ts";
 import type { Adapter, CheckResult, HookEvent, HookInput, HookOutcome, HookOutput, InstallOptions, InstallResult } from "./types.ts";
@@ -106,11 +104,10 @@ function stagedPaths(stdin: string): string[] {
 }
 
 /**
- * A git hook has no session of its own, so the event is marked `ambient`: the
- * engine picks the session the way CLI commands do, and treats the event as a
- * sign of life that never renames, moves or ends that session. The id given
- * here says the same thing for a reader of the event alone: HUDDLE_SESSION
- * when an agent's shell ran git, otherwise the worktree's manual session.
+ * A git hook has no session of its own, so the event is marked `ambient` and
+ * names none: the engine works out whose it is the way a command run in the
+ * same place and environment would (core/acting.ts), and treats the event as
+ * a sign of life that never renames, moves or ends that session.
  */
 function parseHook(input: HookInput): HookEvent | null {
   const hook = input.args[0];
@@ -119,17 +116,14 @@ function parseHook(input: HookInput): HookEvent | null {
   const cwd = input.cwd;
   if (typeof cwd !== "string" || cwd === "") return null;
 
-  const fromAgent = cleanText(input.env.HUDDLE_SESSION, LIMITS.sessionId);
   const event: HookEvent = {
     type: hook === "pre-commit" ? "pre-edit" : "post-edit",
     agent: NAME,
-    sessionId: fromAgent || manualSessionId(pathsFor(cwd, cwd, cwd), {}),
+    sessionId: "",
     cwd,
     ambient: true,
     native: { hook },
   };
-  // The session is the agent's: this event keeps it alive and must not relabel or move it.
-  if (fromAgent !== "") event.subagent = true;
 
   if (hook === "pre-commit") {
     const paths = stagedPaths(typeof input.stdin === "string" ? input.stdin : "");

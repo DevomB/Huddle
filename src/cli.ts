@@ -21,6 +21,7 @@ import * as release from "./commands/release.ts";
 import * as status from "./commands/status.ts";
 import * as sync from "./commands/sync.ts";
 import * as task from "./commands/task.ts";
+import { takeSession } from "./core/args.ts";
 import { CliError, EXIT, HelpRequested, processIo } from "./core/io.ts";
 import type { Command, Io } from "./core/io.ts";
 
@@ -55,14 +56,25 @@ function usage(): string {
     ...Object.entries(COMMANDS).map(([name, command]) => `  ${name.padEnd(width)}  ${command.summary}`),
     "",
     "Options:",
-    "  -h, --help     Show this help; after a command, that command's usage",
-    "  -V, --version  Show the version",
+    "  -h, --help          Show this help; after a command, that command's usage",
+    "  -V, --version       Show the version",
+    '      --session <id>  Say which session this command is, when huddle cannot tell: an id it lists, or "manual"',
     "",
     "Exit codes: 0 ok, 1 error, 2 usage, 3 overlap or lost race",
   ].join("\n");
 }
 
-async function main(argv: string[], io: Io): Promise<number> {
+async function main(line: string[], terminal: Io): Promise<number> {
+  let argv: string[];
+  let io = terminal;
+  try {
+    const taken = takeSession(line);
+    argv = taken.argv;
+    io = { ...terminal, argv, ...(taken.session === undefined ? {} : { session: taken.session }) };
+  } catch (error) {
+    terminal.err(`huddle: ${error instanceof Error ? error.message : String(error)}`);
+    return error instanceof CliError ? error.exitCode : EXIT.USAGE;
+  }
   const [name, ...args] = argv;
   if (name === undefined) {
     io.err(usage());

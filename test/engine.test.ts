@@ -13,7 +13,8 @@ import type { HookEvent, HookEventType } from "../src/adapters/types.ts";
 import type { Io } from "../src/core/io.ts";
 import { OVERLAP_HINT, shownText } from "../src/core/render.ts";
 import type { ActorDoc } from "../src/core/types.ts";
-import { DEADLINE_MS, handleEvent, lifetimeMs, sessionIdOf } from "../src/hooks/engine.ts";
+import { sessionIdOf } from "../src/core/acting.ts";
+import { DEADLINE_MS, handleEvent, lifetimeMs } from "../src/hooks/engine.ts";
 import { readCache, writeCache } from "../src/core/store.ts";
 import { REDACTED } from "../src/hooks/intent.ts";
 import {
@@ -80,8 +81,8 @@ test("session-start records the session, waits for one sync and gives the full b
   const asked = record(t);
   const outcome = await fire(alice, "session-start", 0, { source: "startup" }, ON_THE_CLOCK);
 
-  // HUDDLE_SESSION is for the agent's shell: `huddle intent` typed there lands in this session.
-  assert.deepEqual(outcome, { env: { HUDDLE_SESSION: "s-alice" }, context: ALONE });
+  // A briefing and nothing else: nothing is handed to the agent's shell, whose own variable says which session it is.
+  assert.deepEqual(outcome, { context: ALONE });
   assert.deepEqual(await sessionsOf(alice), [
     { id: "s-alice", agent: "claude-code", branch: "main", intent: "", intentSource: "none", files: [], claims: [], startedAt: at(0), seenAt: at(0), worktree: alice.dir },
   ]);
@@ -98,7 +99,7 @@ test("session-start records the session, waits for one sync and gives the full b
 test("session-start names each teammate with branch, intent and files in flight", async (t) => {
   const { bob } = await aliceBuildsAuth(t);
   const outcome = await fire(bob, "session-start", 20);
-  assert.deepEqual(outcome, { env: { HUDDLE_SESSION: "s-bob" }, context: text(FULL_HEAD, aliceLine(20), FULL_FOOT) });
+  assert.deepEqual(outcome, { context: text(FULL_HEAD, aliceLine(20), FULL_FOOT) });
 });
 
 test("every session-start briefs in full again and forgets the warnings, but the session stays the same one", async (t) => {
@@ -111,7 +112,7 @@ test("every session-start briefs in full again and forgets the warnings, but the
 
   // The context was compacted: what the session was shown is no longer in it.
   const again = await fire(bob, "session-start", 30, { source: "compact" });
-  assert.deepEqual(again, { env: { HUDDLE_SESSION: "s-bob" }, context: text(FULL_HEAD, aliceLine(30), FULL_FOOT) });
+  assert.deepEqual(again, { context: text(FULL_HEAD, aliceLine(30), FULL_FOOT) });
   assert.equal((await fire(bob, "pre-edit", 35, edit)).context, authWarning(35));
 
   const session = await sessionOf(bob);
@@ -130,7 +131,7 @@ test("session-start says so when the team state could not be refreshed, or was n
   const late = 20 + 9 * MIN;
   const stale = await fire(bob, "session-start", late, { source: "resume" });
   assert.equal(stale.context, text(FULL_HEAD, aliceLine(late), FULL_FOOT, staleNote("9m ago")));
-  assert.deepEqual(stale.env, { HUDDLE_SESSION: "s-bob" });
+  assert.deepEqual(Object.keys(stale), ["context"], "a briefing, and nothing for the agent's shell: its own variable says which session it is");
 
   const carol = await h.clone("carol");
   await carol.git("remote", "set-url", "origin", join(h.root, "gone.git"));
@@ -143,7 +144,7 @@ test("session-start does not wait for a sync that never comes back: the briefing
   const asked = record(t, never);
   const { ms, value } = await timed(() => fire(alice, "session-start", 0, {}, ON_THE_CLOCK));
 
-  assert.deepEqual(value, { env: { HUDDLE_SESSION: "s-alice" }, context: text(ALONE, NEVER_FETCHED) });
+  assert.deepEqual(value, { context: text(ALONE, NEVER_FETCHED) });
   assert.ok(ms >= 3500 && ms < DEADLINE_MS["session-start"], `took ${Math.round(ms)} ms`);
   assert.equal(asked.waited.length, 1);
   assert.equal((await sessionOf(alice))?.seenAt, at(0), "the session is recorded before the wait");
@@ -1159,8 +1160,7 @@ test("an event without a usable session id is ignored; one with an overlong id i
   assert.deepEqual(await sessionsOf(alice), []);
 
   const long = "y".repeat(300);
-  const started = await fire(alice, "session-start", 1, { sessionId: long });
-  assert.deepEqual(started.env, { HUDDLE_SESSION: sessionIdOf(long) });
+  await fire(alice, "session-start", 1, { sessionId: long });
   await fire(alice, "prompt", 2, { sessionId: long, prompt: "Build it" });
   assert.deepEqual(
     (await sessionsOf(alice)).map((session) => [session.id, session.intent]),
@@ -1259,8 +1259,7 @@ test("a state directory that cannot be used costs the briefing, never the hook",
   const { alice } = await team(t);
   await writeFile((await alice.paths()).stateDir, "in the way\n");
 
-  // The variable for the agent's shell needs no state, so it is still set.
-  assert.deepEqual(await fire(alice, "session-start", 0), { env: { HUDDLE_SESSION: "s-alice" } });
+  assert.deepEqual(await fire(alice, "session-start", 0), {});
   for (const type of ALL_TYPES.filter((type) => type !== "session-start")) {
     assert.deepEqual(await fire(alice, type, 1, { prompt: "Build it", paths: [join(alice.dir, "a.ts")] }), {}, type);
   }
@@ -1472,7 +1471,7 @@ test("what is kept back for the work after a sync grows with patience: after a s
   // Two seconds in, each of them has less left than the longest wait and what it keeps back.
   await sleep(2000);
   await Promise.all(releases.map((release) => release()));
-  assert.deepEqual(await start, { env: { HUDDLE_SESSION: "s-alice" }, context: text(ALONE, NEVER_FETCHED) });
+  assert.deepEqual(await start, { context: text(ALONE, NEVER_FETCHED) });
   assert.deepEqual(await commit, {});
 
   /** When the wait the event was given runs out, counted from when the event began. */
