@@ -13,7 +13,7 @@ import { log } from "./log.ts";
 import { ensureStateDir } from "./paths.ts";
 import type { RepoPaths } from "./paths.ts";
 import { toActorDoc } from "./session.ts";
-import { readCache, readLocal, removeSeen, updateLocal, withLock, writeCache } from "./store.ts";
+import { readCache, readLocal, removeSeen, updateLocal, withLock, writeCache, writeFileAtomic } from "./store.ts";
 import type { LockResult } from "./store.ts";
 import { actorRef } from "./types.ts";
 import type { ActorDoc, CacheEntry, Config, Doc, FailReason, LocalState, PublishResult, SessionPartial } from "./types.ts";
@@ -33,6 +33,12 @@ export interface SyncResult {
   published: boolean;
   /** Why the fetch or the publish failed, if either did; "internal" for a bug on our side. */
   error?: FailReason | "internal";
+  /**
+   * The round that answered was another process's: one that began after this
+   * sync was asked for, or (for "offline" and "denied") one that ended after.
+   * See roundFile.
+   */
+  shared?: true;
 }
 
 /** A forced sync waits this long for a round that is already running. */
@@ -105,19 +111,122 @@ export async function sync(ctx: Ctx, opts: SyncOptions = {}): Promise<SyncResult
   try {
     await ensureStateDir(ctx.paths);
     if (!opts.force && throttledAt(readStamp(ctx.paths), ctx.config, ctx.now)) return skipped("throttled");
+    // Read after everything the caller wrote before asking: see roundFile.
+    const asked = opts.force ? readRound(ctx.paths) : null;
     const locked = await withSyncLock(ctx.paths, opts.force ? FORCED_LOCK_WAIT_MS : 0, async () => {
       // Another process may have synced while we waited for the lock.
       if (!opts.force && throttledAt(readStamp(ctx.paths), ctx.config, ctx.now)) return skipped("throttled");
+      const last = readRound(ctx.paths);
+      const answered = asked && last ? sharedResult(asked, last) : null;
+      if (answered) return answered;
+      // Numbered before the round reads local state. A round whose number did
+      // not reach the disk records no outcome, so it is never taken for a later one.
+      const gen = (last?.gen ?? 0) + 1;
+      const numbered = await writeRound(ctx.paths, { gen, done: false, outcome: "running", published: false });
       await writeFile(stampFile(ctx.paths), ctx.now.toISOString());
       // After the stamp and before the round reads local state: see pendingFile.
       clearPending(ctx.paths);
-      return round(ctx);
+      const result = await round(ctx);
+      if (numbered) await writeRound(ctx.paths, { gen, done: true, outcome: outcomeOf(result), published: result.published });
+      return result;
     });
     return locked.acquired ? locked.value : skipped("locked");
   } catch (error) {
     log(ctx.paths, "sync", "sync failed", error);
     return { ran: false, fetched: false, published: false, error: "internal" };
   }
+}
+
+/**
+ * The last round of this clone: its number and how it ended. Written only
+ * under sync.lock: a round numbers itself before it reads local state, and
+ * records its outcome when it is done.
+ *
+ * A forced sync reads this record when it is asked for, after whatever its
+ * caller wrote (a claim records its session first). Once it holds the lock it
+ * may be answered by another process's round instead of running its own:
+ *
+ * - as a success, by a round with a higher number that is done, fetched the
+ *   remote, and pushed this clone's document or had nothing to push. That round
+ *   numbered itself after the caller's read, so it read local state after the
+ *   caller's write and published it; its fetch is as fresh as a round of the
+ *   caller's own begun at that moment.
+ * - as the same failure, "offline" or "denied", by a round that ended after
+ *   the caller's read (a higher number, or the round that was running then).
+ *   That round was trying the remote while the caller waited, and nothing of
+ *   the caller's has been sent, so "could not reach remote; nothing was
+ *   changed" is the caller's own truth too.
+ *
+ * Never by anything else: a lower number (it may have read local state before
+ * the caller wrote), a round that did not finish, any other failure (a lost or
+ * failed push of this clone's document, an error on our side), or a record
+ * that cannot be read, on either side.
+ */
+function roundFile(paths: RepoPaths): string {
+  return join(paths.stateDir, "sync-round");
+}
+
+type RoundOutcome = "running" | "ok" | "offline" | "denied" | "failed";
+
+interface RoundRecord {
+  gen: number;
+  done: boolean;
+  outcome: RoundOutcome;
+  /** This clone's document was pushed in that round. */
+  published: boolean;
+}
+
+const OUTCOMES: ReadonlySet<string> = new Set<RoundOutcome>(["running", "ok", "offline", "denied", "failed"]);
+
+/** Null when there is no record, or none that can be trusted: nothing is shared then. */
+function readRound(paths: RepoPaths): RoundRecord | null {
+  try {
+    const parsed = JSON.parse(readFileSync(roundFile(paths), "utf8")) as Partial<RoundRecord> | null;
+    if (
+      parsed !== null &&
+      typeof parsed === "object" &&
+      Number.isSafeInteger(parsed.gen) &&
+      (parsed.gen as number) > 0 &&
+      typeof parsed.done === "boolean" &&
+      typeof parsed.outcome === "string" &&
+      OUTCOMES.has(parsed.outcome) &&
+      typeof parsed.published === "boolean"
+    ) {
+      return { gen: parsed.gen as number, done: parsed.done, outcome: parsed.outcome, published: parsed.published };
+    }
+  } catch {
+    // Missing, unreadable, or being replaced at this moment.
+  }
+  return null;
+}
+
+/** False when the record could not be written; the round then records nothing. */
+async function writeRound(paths: RepoPaths, record: RoundRecord): Promise<boolean> {
+  try {
+    await writeFileAtomic(roundFile(paths), JSON.stringify(record));
+    return true;
+  } catch (error) {
+    log(paths, "sync", "could not record the round", error);
+    return false;
+  }
+}
+
+function outcomeOf(result: SyncResult): RoundOutcome {
+  if (result.fetched && result.error === undefined) return "ok";
+  if (result.error === "offline" || result.error === "denied") return result.error;
+  return "failed";
+}
+
+/** What another process's round says for this caller (see roundFile), or null when the caller must run its own. */
+function sharedResult(asked: RoundRecord, last: RoundRecord): SyncResult | null {
+  if (!last.done) return null;
+  const later = last.gen > asked.gen;
+  if (last.outcome === "ok") return later ? { ran: true, shared: true, fetched: true, published: last.published } : null;
+  const endedSince = later || (last.gen === asked.gen && !asked.done);
+  if ((last.outcome === "offline" || last.outcome === "denied") && endedSince) {
+    return { ran: true, shared: true, fetched: false, published: false, error: last.outcome };
+  }
+  return null;
 }
 
 async function round(ctx: Ctx): Promise<SyncResult> {
