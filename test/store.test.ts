@@ -11,6 +11,7 @@ import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, utimes, writeFil
 import { hostname, tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { after, afterEach, describe, test } from "node:test";
+import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { pathsFor, seenFile } from "../src/core/paths.ts";
 import type { RepoPaths } from "../src/core/paths.ts";
@@ -509,6 +510,12 @@ describe("local.json across processes", () => {
       assert.equal(parsed.v, 0);
       assert.equal(parsed.sessions.length, 1);
       reads++;
+      // A real reader (a hook, a command) opens the file once and does other work in between.
+      // One that reopens it the moment it closed holds it almost all the time on a loaded
+      // machine, and Windows refuses to rename over a file that is open: the writer's bounded
+      // retries (replaceFile) would be racing a reader that never lets go. A millisecond
+      // between reads keeps hundreds of reads overlapping the writer.
+      await sleep(1);
     }
     assertOk(await writer.done);
     assert.ok(reads > 20, `only ${reads} reads overlapped the writer`);
