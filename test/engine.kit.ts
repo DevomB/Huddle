@@ -81,11 +81,15 @@ export interface Team {
 /**
  * A remote and two clones of it that are set up for huddle as far as a hook
  * can tell: .huddle/ is committed on main, with `config` as the team's config.
+ *
+ * The team shares prompts unless `config` says otherwise: most of these tests
+ * are about what a prompt's intent sets off, and they say so here instead of
+ * leaning on whatever the default happens to be.
  */
 export async function team(t: CleanupHost, config: Record<string, unknown> = {}): Promise<Team> {
   const h = await createHarness(t);
   const alice = await h.clone("alice");
-  await alice.write(".huddle/config.json", `${JSON.stringify(config)}\n`);
+  await alice.write(".huddle/config.json", `${JSON.stringify({ captureIntent: true, ...config })}\n`);
   await alice.commit("Set up huddle");
   await alice.push();
   const bob = await h.clone("bob");
