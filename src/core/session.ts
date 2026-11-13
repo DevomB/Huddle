@@ -10,7 +10,7 @@ import { cleanText, LIMITS, normalizeDoc } from "./docs.ts";
 import { manualSessionId } from "./identity.ts";
 import { readCache, readCacheStatus, readLocal, updateLocal } from "./store.ts";
 import type { CacheState } from "./store.ts";
-import { freshnessWarnings } from "./render.ts";
+import { teamStateLine } from "./render.ts";
 import type { SyncResult } from "./sync.ts";
 import { actorRef } from "./types.ts";
 import type { ActorDoc, Cache, Identity, LocalSession, LocalState, Session } from "./types.ts";
@@ -164,31 +164,25 @@ export interface TeamRead {
   cacheState: CacheState;
   freshness: FreshnessReport;
   completeness: Completeness;
-  /** freshnessWarnings: the same sentences for text, stderr and JSON. */
-  warnings: string[];
+  /** teamStateLine: "" when fresh and complete. The same words on stderr, in JSON `warnings` and in hook context. */
+  line: string;
 }
 
 /**
  * currentView, plus the freshness and completeness of what it shows. `refresh`
- * is what this command's own sync did, "none" when it did not run one.
+ * is what this command's own sync did, "none" when it did not run one. Reads
+ * cache.json and local.json only: no git, no network, so the hook engine can
+ * call it on every event, with the same `state` and `worktree` as currentView.
  */
-export async function readTeam(ctx: Ctx, sessionId: string, refresh: RefreshOutcome = "none"): Promise<TeamRead> {
-  const [{ cache, state: cacheState }, local] = await Promise.all([readCacheStatus(ctx.paths), readLocal(ctx.paths)]);
+export async function readTeam(ctx: Ctx, sessionId: string, refresh: RefreshOutcome = "none", state?: LocalState, worktree?: string): Promise<TeamRead> {
+  const [{ cache, state: cacheState }, local] = await Promise.all([readCacheStatus(ctx.paths), state ?? readLocal(ctx.paths)]);
   const freshness = classifyFreshness({ cacheState, fetchedAt: cache.fetchedAt, now: ctx.now, syncIntervalSeconds: ctx.config.syncIntervalSeconds, refresh });
-  // Completeness is judged on the remote's documents, before this clone's own entry is replaced.
-  const snapshot: Cache = { fetchedAt: cache.fetchedAt, refs: { ...cache.refs } };
-  const view = viewFrom(ctx, cache, local, sessionId);
-  const completeness = teamCompleteness(snapshot, view);
-  // This clone's own actor ref is judged by local state, which can always be read.
-  const ownRef = actorRef(ctx.identity.actor);
-  if (snapshot.refs[ownRef] !== undefined && snapshot.refs[ownRef]?.doc === null) {
-    completeness.unreadableActors--;
-    completeness.complete = completeness.unreadableActors === 0 && completeness.uncovered === 0;
-  }
-  return { view, cacheState, freshness, completeness, warnings: freshnessWarnings(freshness, completeness, ctx.config.remote) };
+  const view = viewFrom(ctx, cache, local, sessionId, worktree);
+  const completeness = teamCompleteness(cache, view);
+  return { view, cacheState, freshness, completeness, line: teamStateLine(freshness, completeness, ctx.config.remote) };
 }
 
 /** The keys CONTRACT 4.2 adds to every JSON read, next to the command's own. */
 export function envelope(team: TeamRead): { schemaVersion: 1; freshness: FreshnessReport["freshness"]; complete: boolean; ageSeconds: number | null; warnings: string[] } {
-  return { schemaVersion: 1, freshness: team.freshness.freshness, complete: team.completeness.complete, ageSeconds: team.freshness.ageSeconds, warnings: team.warnings };
+  return { schemaVersion: 1, freshness: team.freshness.freshness, complete: team.completeness.complete, ageSeconds: team.freshness.ageSeconds, warnings: team.line === "" ? [] : [team.line] };
 }

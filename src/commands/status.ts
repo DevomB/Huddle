@@ -34,7 +34,7 @@ export async function run(args: string[], io: Io): Promise<number> {
 
   if (values.json) {
     io.out(JSON.stringify({ you: { actor: ctx.identity.actor, user: ctx.identity.user, session: me.session }, ...view, ...envelope(team) }, null, 2));
-    for (const warning of team.warnings) io.err(`huddle: ${warning}`);
+    if (team.line !== "") io.err(`huddle: ${team.line}`);
     return EXIT.OK;
   }
 
@@ -46,6 +46,6 @@ export async function run(args: string[], io: Io): Promise<number> {
     io.out(`You: ${ctx.identity.user}. Not announced yet: run huddle intent "<what you are doing>" or huddle sync.`);
   }
   io.out(renderStatus(view));
-  for (const warning of team.warnings) io.err(`huddle: ${warning}`);
+  if (team.line !== "") io.err(`huddle: ${team.line}`);
   return EXIT.OK;
 }
