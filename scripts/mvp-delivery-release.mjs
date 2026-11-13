@@ -47,7 +47,7 @@ function environment(extraPath) {
   const env = { ...process.env };
   for (const name of Object.keys(env)) if (name.toUpperCase() === "PATH") delete env[name];
   env.PATH = extraPath ? `${extraPath}${delimiter}${PATH}` : PATH;
-  for (const name of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "HUDDLE_SESSION", "HUDDLE_NOW"]) delete env[name];
+  for (const name of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "HUDDLE_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_SESSION_ID", "CODEX_THREAD_ID", "HUDDLE_NOW"]) delete env[name];
   return env;
 }
 

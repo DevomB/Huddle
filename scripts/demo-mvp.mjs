@@ -148,7 +148,7 @@ const PATH = process.env.PATH ?? "";
 const env = { ...process.env, HOME: home, USERPROFILE: home, GIT_CONFIG_GLOBAL: gitconfig, GIT_CONFIG_NOSYSTEM: "1", GIT_TERMINAL_PROMPT: "0" };
 for (const name of Object.keys(env)) if (name.toUpperCase() === "PATH") delete env[name];
 env.PATH = releaseDir ? `${releaseDir}${delimiter}${PATH}` : PATH;
-for (const name of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_CEILING_DIRECTORIES", "HUDDLE_SESSION", "HUDDLE_NOW", "HUDDLE_DEBUG", "CLAUDE_PROJECT_DIR"]) delete env[name];
+for (const name of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_CEILING_DIRECTORIES", "HUDDLE_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_SESSION_ID", "CODEX_THREAD_ID", "HUDDLE_NOW", "HUDDLE_DEBUG", "CLAUDE_PROJECT_DIR"]) delete env[name];
 
 const remote = join(base, "remote.git");
 const node = process.execPath;

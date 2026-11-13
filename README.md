@@ -308,7 +308,10 @@ npm test            # builds first; node --test on real git clones in a temp dir
 npm run demo        # the two-clone demo against dist/huddle.mjs
 npm run release     # dist/huddle-<version>.tar.gz and .sha256: the archive users get
 node scripts/mvp-delivery-release.mjs   # the archive from a clean copy, unpacked and run, with the demo
+node scripts/measure.mjs > measure.json # git processes and wall time per command and hook, bundle and archive bytes
 ```
+
+`scripts/measure.mjs` sets up one bare remote and four clones in a temporary directory and prints JSON. For each command and hook it gives the median wall time and the number of git processes huddle starts (counted with git's trace2 events, on every platform). On Linux it adds a second column with 60 ms added to every git start, a model of process start on Windows. The counts are exact; the wall times are only comparable on an otherwise idle machine, which is why the report includes the load average.
 
 npm is development tooling here; users of the archive never need it. The same commands run in PowerShell 7 on Windows. The archive is reproducible: the tar inside is the same bytes for the same source on Linux and Windows, and so is the `.tar.gz` when Node uses the same zlib (the official Node 22 builds do; a distribution's Node linked against zlib-ng compresses it differently). `npm run release` prints both checksums. The tests import TypeScript directly, so they need Node 22 with type stripping (22.18 or later); the bundle they test also runs on Node 20. CI runs all of it on Linux and native Windows for every push to `main` and to the MVP branches.
 
